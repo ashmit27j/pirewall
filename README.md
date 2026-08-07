@@ -1,4 +1,4 @@
-````markdown
+
 <p align="center">
   <img src="docs/images/pirewall-banner.png" alt="pirewall banner" width="100%">
 </p>
@@ -258,4 +258,4 @@ PiReWall is developed for educational and research purposes as part of an underg
 # License
 
 This project is licensed under the MIT License.
-````
+

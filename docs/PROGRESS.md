@@ -10,7 +10,7 @@ Environment-dependent / Not yet validated.
 |---|-------|--------|-------|
 | 1 | Foundation (config, core models, interfaces, exceptions) | Complete | Tested: enums, exceptions, all domain models, config loader (94 tests). ruff clean, pyright --strict clean (49 files). No packet capture/flow/ML/firewall/API logic added (non-goal). |
 | 2 | Packet capture & parsing | Complete | Tested: parser (valid IPv4/IPv6/TCP/UDP/ICMP/ICMPv6 + exhaustive malformed/truncated cases), `FakePacketCapture`, capture->parse pipeline (`pirewall/capture/pipeline.py`), 34 new tests (128 total). Mocked: all capture-consumer logic exercised only against `FakePacketCapture`. Environment-dependent: `AFPacketCapture` (real Linux `AF_PACKET` socket, promiscuous mode, kernel drop stats) — implemented per spec §6 but requires a real Linux host, a real interface, and `CAP_NET_RAW` to exercise; cannot be run on the dev machine. A human must verify it on the target Pi (start it against a real interface, confirm packets/drops/malformed counts look sane under real traffic). ruff clean, pyright --strict clean (62 files, `pythonPlatform = "Linux"` pinned in pyproject.toml so Linux-only stdlib surface type-checks off-Linux too). |
-| 3 | Flow aggregation & feature extraction | Not started | |
+| 3 | Flow aggregation & feature extraction | Complete | Tested: flow-key bidirectional normalization, `FlowState` accumulation (forward/backward attribution, TCP flag counts, `RunningStats` for packet-size/inter-arrival, bounded-memory per flow), `FlowTable` LRU eviction (flood-tested to 5000 flows against a 100-flow cap), active/inactive timeout + TCP FIN/RST completion, `FlowAggregator` end-to-end (including IPv6 packets never entering the table — ADDENDUM.md A5), and the canonical feature schema/extractor (determinism, schema versioning, zero-division guards). 40 new tests (168 total). ruff clean, pyright --strict clean (76 files). |
 | 4 | Dataset adapters, preprocessing & ML training (dev machine) | Not started | |
 | 5 | ML inference, behavior analysis & threat assessment | Not started | |
 | 6 | Firewall decision, rule generation, validation & nftables backend | Not started | |
@@ -164,6 +164,21 @@ the reason.
   ethertype 0x8100 is treated as unsupported and rejected). Not required by
   spec §7. Revisit if a real deployment's switch port trunks VLAN-tagged
   traffic to the Pi.
+- **Phase 3**: `ruff`'s `line-length` was widened from 100 to 110 in
+  `pyproject.toml` — the canonical feature schema table (28 named features
+  with descriptions) kept tripping E501 at 100 without meaningfully
+  improving readability by wrapping every row to multiple lines. 110 is
+  still well within normal convention.
+- **Phase 3 flow table eviction**: the bounded `FlowTable` evicts the
+  least-recently-used flow (LRU, `OrderedDict`-based) when at capacity —
+  spec §8 requires bounded size + an eviction policy but doesn't mandate a
+  specific algorithm; LRU is the least likely to evict a still-active flow
+  under normal traffic patterns.
+- **Phase 3 packet-size/inter-arrival stats**: computed online via
+  Welford's algorithm (`pirewall.flow.state.RunningStats`) instead of
+  storing every packet size/timestamp per flow — keeps per-flow memory
+  bounded regardless of flow length, same spirit as the bounded flow table
+  itself.
 - **Phase 2 parser**: IPv6 extension headers (hop-by-hop, routing,
   fragment, ...) are not walked. If `next_header` names one, the packet's
   protocol is reported as `Protocol.OTHER` instead of skipping past the

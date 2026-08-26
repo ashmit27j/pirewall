@@ -8,7 +8,7 @@ Environment-dependent / Not yet validated.
 
 | # | Phase | Status | Notes |
 |---|-------|--------|-------|
-| 1 | Foundation (config, core models, interfaces, exceptions) | Not started | |
+| 1 | Foundation (config, core models, interfaces, exceptions) | Complete | Tested: enums, exceptions, all domain models, config loader (94 tests). ruff clean, pyright --strict clean (49 files). No packet capture/flow/ML/firewall/API logic added (non-goal). |
 | 2 | Packet capture & parsing | Not started | |
 | 3 | Flow aggregation & feature extraction | Not started | |
 | 4 | Dataset adapters, preprocessing & ML training (dev machine) | Not started | |
@@ -25,14 +25,14 @@ you go since they land across several phases.
 
 | Item | Status | Notes |
 |------|--------|-------|
-| A1 Shadow / dry-run enforcement mode | Not started | |
-| A2 Static allowlist (outranks adaptive rules) | Not started | |
-| A3 Rate cap on rule creation | Not started | |
-| A4 Privileged/unprivileged process split | Not started | |
-| A5 IPv4-only v1 scope | Not started | |
-| A6 Fail-open default + systemd watchdog | Not started | |
-| A7 Assisted mode / BLOCK approval queue | Not started | |
-| A8 Emergency kill-switch | Not started | |
+| A1 Shadow / dry-run enforcement mode | Implemented (Phase 1 groundwork) | `EnforcementMode` enum, `RuleStatus.SHADOWED`, `firewall.enforcement_mode` config (default `shadow`). Manager branching is Phase 6. |
+| A2 Static allowlist (outranks adaptive rules) | Implemented (Phase 1 groundwork) | `AllowlistEntry` model, `firewall.allowlist` config (seed, empty by default). Validator stage + storage is Phase 6. |
+| A3 Rate cap on rule creation | Implemented (Phase 1 groundwork) | `firewall.max_adaptive_rules_per_window` / `rate_window_seconds` config fields. Validator stage + counter state is Phase 6. |
+| A4 Privileged/unprivileged process split | Not started | Socket protocol is Phase 7; systemd units are Phase 8. |
+| A5 IPv4-only v1 scope | Implemented (Phase 1 groundwork) | `Flow`, `CandidateRule`/`FirewallRule`, `AllowlistEntry`, `BehaviorAssessment`, `ThreatAssessment` all use `IPv4Address`/`IPv4Network` fields — an IPv6 value cannot be constructed at all. Parser-level IPv6 handling is Phase 2. |
+| A6 Fail-open default + systemd watchdog | Implemented (Phase 1 groundwork) | `FailureMode` enum, `failure.mode` config (default `fail_open`), `failure.watchdog_sec`/crash-loop fields. Watchdog wiring is Phase 8. |
+| A7 Assisted mode / BLOCK approval queue | Implemented (Phase 1 groundwork) | `RuleStatus.PENDING_APPROVAL`, `firewall.assisted_review_threshold` config. Manager logic is Phase 6. |
+| A8 Emergency kill-switch | Not started | Depends on `firewall/manager.py` (Phase 6) and the API (Phase 7). |
 
 ## Acceptance criteria reconciliation (spec §50)
 

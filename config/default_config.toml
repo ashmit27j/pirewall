@@ -1,0 +1,113 @@
+# pirewall default configuration (spec §37)
+#
+# This file ships with placeholder values only. Anything marked CHANGE_ME or
+# using an obviously-placeholder value ("eth0", "192.0.2.x" test-net-1
+# addresses, etc.) MUST be replaced with your real network layout before
+# deployment. Do not commit real Admin PC IPs, real interface names, or any
+# secret to this file — use `config/local_config.toml` (gitignored) or an
+# environment-specific copy instead.
+
+[network]
+# Real interface names go here once you know your Pi's actual NIC layout.
+wan_interface = "eth0"          # CHANGE_ME — placeholder only
+lan_interface = "eth1"          # CHANGE_ME — placeholder only
+protected_network = "192.0.2.0/24"   # CHANGE_ME — TEST-NET-1 placeholder, not a real LAN
+upstream_gateway = "192.0.2.1"       # CHANGE_ME — placeholder only
+
+[capture]
+interface = "eth1"              # CHANGE_ME — must match the interface facing the protected LAN
+snap_len = 65535
+promiscuous = true
+buffer_size_bytes = 2097152
+
+[flow]
+active_timeout_seconds = 1800
+inactive_timeout_seconds = 60
+max_flows = 100000
+cleanup_interval_seconds = 30
+
+[features]
+# Pinned schema version — bump only when pirewall/features/schema.py changes
+# in a way that alters feature names/order/count (spec §11, §15).
+schema_version = "1.0.0"
+
+[detection]
+known_attack_confidence_threshold = 0.8
+anomaly_score_threshold = 0.0
+behavior_window_seconds = 300
+
+[ml]
+lightgbm_model_path = "pirewall/ml/artifacts/lightgbm_model.txt"
+isolation_forest_model_path = "pirewall/ml/artifacts/isolation_forest_model.joblib"
+feature_schema_version = "1.0.0"
+
+[threat]
+low_threshold = 25.0
+medium_threshold = 50.0
+high_threshold = 75.0
+critical_threshold = 90.0
+
+[firewall]
+# See docs/ADDENDUM.md for the letter references below.
+enforcement_mode = "shadow"              # A1 — SHADOW is the required default for a first deployment.
+assisted_review_threshold = 75.0         # A7 — BLOCK candidates >= this score need human approval in ASSISTED mode.
+max_adaptive_rules_per_window = 20       # A3 — rule-creation rate cap.
+rate_window_seconds = 60                 # A3 — window the cap above applies over.
+default_rule_ttl_seconds = 3600
+max_active_rules = 500
+
+# A2 — static allowlist. Adaptive BLOCK/RATE_LIMIT rules can never target
+# these entries, regardless of threat score or enforcement mode. Empty by
+# default; add entries for devices that must never be adaptively blocked
+# (e.g. your own Admin PC, a home server).
+allowlist = []
+# Example entry (uncomment and fill in for real use):
+# [[firewall.allowlist]]
+# target = "192.0.2.50/32"
+# reason = "CHANGE_ME — why this target is exempt"
+# created_by = "CHANGE_ME"
+# created_at = "2026-01-01T00:00:00Z"
+
+[api]
+host = "127.0.0.1"
+port = 8443
+tls_cert_path = "deploy/certificates/CHANGE_ME.crt"  # CHANGE_ME — real cert path
+tls_key_path = "deploy/certificates/CHANGE_ME.key"   # CHANGE_ME — real key path, never commit the real file
+cors_origins = []
+
+[authentication]
+admin_username = "CHANGE_ME"
+# Store a securely hashed password (spec §29), never plaintext. Generate
+# this with the Phase 7 admin-password tooling — never hand-write a hash here.
+admin_password_hash = "CHANGE_ME"
+token_expiry_seconds = 3600
+
+[admin]
+# The single PC allowed to reach administrative endpoints (spec §29).
+admin_pc_ip = "192.0.2.10"   # CHANGE_ME — placeholder only
+
+[logging]
+level = "INFO"
+log_dir = "/var/log/pirewall"
+max_bytes = 10485760
+backup_count = 5
+
+[integration]
+wazuh_enabled = false
+wazuh_host = "CHANGE_ME"
+wazuh_port = 1514
+netdata_enabled = false
+netdata_port = 19999
+
+[security]
+min_tls_version = "TLSv1.3"
+restrict_to_admin_pc = true
+session_timeout_seconds = 1800
+
+[failure]
+# ADDENDUM.md A6 — fail-open by default for home use, with a systemd
+# watchdog to detect (not silently paper over) a crash-loop.
+mode = "fail_open"
+watchdog_sec = 30
+crash_loop_restart_count = 3
+crash_loop_window_seconds = 300

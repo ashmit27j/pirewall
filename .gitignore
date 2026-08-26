@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.pyright/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Virtual environments / uv
+.venv/
+venv/
+uv.lock.bak
+
+# Datasets — never commit raw dataset files
+data/
+datasets/
+*.csv
+*.pcap
+*.pcapng
+
+# Model artifacts (trained locally, not checked in)
+pirewall/ml/artifacts/*.pkl
+pirewall/ml/artifacts/*.joblib
+pirewall/ml/artifacts/*.txt
+pirewall/ml/artifacts/*.bin
+!pirewall/ml/artifacts/.gitkeep
+
+# Secrets / certificates
+*.pem
+*.key
+*.crt
+*.p12
+.env
+.env.*
+deploy/certificates/*
+!deploy/certificates/.gitkeep
+secrets/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local config overrides
+config/local_config.toml

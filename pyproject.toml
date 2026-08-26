@@ -40,6 +40,10 @@ known-first-party = ["pirewall"]
 include = ["pirewall", "tests", "scripts"]
 exclude = ["**/__pycache__", "pirewall/ml/artifacts"]
 pythonVersion = "3.12"
+# pirewall only ever runs on Linux (Raspberry Pi, spec §3/§4); pin this so
+# Linux-only stdlib surface (e.g. socket.AF_PACKET in pirewall/capture/af_packet.py)
+# type-checks correctly regardless of the developer's own OS.
+pythonPlatform = "Linux"
 typeCheckingMode = "strict"
 reportMissingTypeStubs = false
 

@@ -9,7 +9,7 @@ Environment-dependent / Not yet validated.
 | # | Phase | Status | Notes |
 |---|-------|--------|-------|
 | 1 | Foundation (config, core models, interfaces, exceptions) | Complete | Tested: enums, exceptions, all domain models, config loader (94 tests). ruff clean, pyright --strict clean (49 files). No packet capture/flow/ML/firewall/API logic added (non-goal). |
-| 2 | Packet capture & parsing | Not started | |
+| 2 | Packet capture & parsing | Complete | Tested: parser (valid IPv4/IPv6/TCP/UDP/ICMP/ICMPv6 + exhaustive malformed/truncated cases), `FakePacketCapture`, capture->parse pipeline (`pirewall/capture/pipeline.py`), 34 new tests (128 total). Mocked: all capture-consumer logic exercised only against `FakePacketCapture`. Environment-dependent: `AFPacketCapture` (real Linux `AF_PACKET` socket, promiscuous mode, kernel drop stats) — implemented per spec §6 but requires a real Linux host, a real interface, and `CAP_NET_RAW` to exercise; cannot be run on the dev machine. A human must verify it on the target Pi (start it against a real interface, confirm packets/drops/malformed counts look sane under real traffic). ruff clean, pyright --strict clean (62 files, `pythonPlatform = "Linux"` pinned in pyproject.toml so Linux-only stdlib surface type-checks off-Linux too). |
 | 3 | Flow aggregation & feature extraction | Not started | |
 | 4 | Dataset adapters, preprocessing & ML training (dev machine) | Not started | |
 | 5 | ML inference, behavior analysis & threat assessment | Not started | |
@@ -29,7 +29,7 @@ you go since they land across several phases.
 | A2 Static allowlist (outranks adaptive rules) | Implemented (Phase 1 groundwork) | `AllowlistEntry` model, `firewall.allowlist` config (seed, empty by default). Validator stage + storage is Phase 6. |
 | A3 Rate cap on rule creation | Implemented (Phase 1 groundwork) | `firewall.max_adaptive_rules_per_window` / `rate_window_seconds` config fields. Validator stage + counter state is Phase 6. |
 | A4 Privileged/unprivileged process split | Not started | Socket protocol is Phase 7; systemd units are Phase 8. |
-| A5 IPv4-only v1 scope | Implemented (Phase 1 groundwork) | `Flow`, `CandidateRule`/`FirewallRule`, `AllowlistEntry`, `BehaviorAssessment`, `ThreatAssessment` all use `IPv4Address`/`IPv4Network` fields — an IPv6 value cannot be constructed at all. Parser-level IPv6 handling is Phase 2. |
+| A5 IPv4-only v1 scope | Implemented (Phase 1+2) | Phase 1: `Flow`, `CandidateRule`/`FirewallRule`, `AllowlistEntry`, `BehaviorAssessment`, `ThreatAssessment` all use `IPv4Address`/`IPv4Network` fields — an IPv6 value cannot be constructed at all. Phase 2: parser fully decodes both IPv4 and IPv6 (`PacketMetadata.address_family` tags which), so Phase 3's flow aggregator can filter IPv6 out before it ever reaches the adaptive pipeline. |
 | A6 Fail-open default + systemd watchdog | Implemented (Phase 1 groundwork) | `FailureMode` enum, `failure.mode` config (default `fail_open`), `failure.watchdog_sec`/crash-loop fields. Watchdog wiring is Phase 8. |
 | A7 Assisted mode / BLOCK approval queue | Implemented (Phase 1 groundwork) | `RuleStatus.PENDING_APPROVAL`, `firewall.assisted_review_threshold` config. Manager logic is Phase 6. |
 | A8 Emergency kill-switch | Not started | Depends on `firewall/manager.py` (Phase 6) and the API (Phase 7). |
@@ -159,6 +159,19 @@ Leave blank until then; don't pre-fill with guesses.
 
 List anything implemented differently than `docs/MASTER_SPEC.md` says, with
 the reason.
+
+- **Phase 2 parser**: no 802.1Q VLAN tag support (an Ethernet frame with
+  ethertype 0x8100 is treated as unsupported and rejected). Not required by
+  spec §7. Revisit if a real deployment's switch port trunks VLAN-tagged
+  traffic to the Pi.
+- **Phase 2 parser**: IPv6 extension headers (hop-by-hop, routing,
+  fragment, ...) are not walked. If `next_header` names one, the packet's
+  protocol is reported as `Protocol.OTHER` instead of skipping past the
+  extension header chain to find the real transport header. Spec §7 only
+  requires TCP/UDP/ICMP/ICMPv6 support, and IPv6 is out of the adaptive
+  pipeline for v1 anyway (ADDENDUM.md A5), so this only affects capture
+  statistics accuracy for IPv6 traffic using extension headers, not
+  detection.
 
 ## Open questions for the human
 

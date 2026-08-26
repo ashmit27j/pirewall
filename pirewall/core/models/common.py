@@ -36,6 +36,17 @@ class InterArrivalStats(PirewallModel):
     std_seconds: float = Field(ge=0.0)
 
 
+class TcpFlags(PirewallModel):
+    """The control flags set on a single TCP packet (spec §7)."""
+
+    syn: bool = False
+    ack: bool = False
+    fin: bool = False
+    rst: bool = False
+    psh: bool = False
+    urg: bool = False
+
+
 class TcpFlagCounts(PirewallModel):
     """Counts of each TCP control flag observed in a flow (spec §8)."""
 

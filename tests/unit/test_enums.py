@@ -1,6 +1,7 @@
 """Enum values match the spec/addendum vocabulary."""
 
 from pirewall.core.enums import (
+    AddressFamily,
     BehaviorPatternType,
     EnforcementMode,
     EventSeverity,
@@ -44,7 +45,7 @@ def test_rule_direction_values() -> None:
 
 
 def test_protocol_values() -> None:
-    assert {m.value for m in Protocol} == {"tcp", "udp", "icmp", "icmpv6", "any"}
+    assert {m.value for m in Protocol} == {"tcp", "udp", "icmp", "icmpv6", "other", "any"}
 
 
 def test_security_event_type_values() -> None:
@@ -92,3 +93,7 @@ def test_behavior_pattern_type_values() -> None:
 
 def test_model_type_values() -> None:
     assert {m.value for m in ModelType} == {"lightgbm", "isolation_forest"}
+
+
+def test_address_family_values() -> None:
+    assert {m.value for m in AddressFamily} == {"ipv4", "ipv6"}

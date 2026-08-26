@@ -55,12 +55,18 @@ class RuleDirection(StrEnum):
 
 
 class Protocol(StrEnum):
-    """Transport/network-layer protocol a flow or rule matches on."""
+    """Transport/network-layer protocol a flow or rule matches on.
+
+    OTHER covers an IP payload protocol pirewall doesn't decode further
+    (e.g. GRE, ESP) — the packet is still identified at L3, just without
+    port/flag information (spec §7 only requires TCP/UDP/ICMP/ICMPv6).
+    """
 
     TCP = "tcp"
     UDP = "udp"
     ICMP = "icmp"
     ICMPV6 = "icmpv6"
+    OTHER = "other"
     ANY = "any"
 
 
@@ -124,3 +130,15 @@ class ModelType(StrEnum):
 
     LIGHTGBM = "lightgbm"
     ISOLATION_FOREST = "isolation_forest"
+
+
+class AddressFamily(StrEnum):
+    """IP address family of a parsed packet (spec §7).
+
+    Both are parsed at the packet level, but only IPV4 is carried into the
+    adaptive pipeline in v1 (ADDENDUM.md A5) — this tag is what lets Phase 3
+    correctly exclude IPV6 packets from flow aggregation.
+    """
+
+    IPV4 = "ipv4"
+    IPV6 = "ipv6"

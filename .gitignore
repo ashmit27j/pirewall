@@ -25,11 +25,14 @@ datasets/
 *.pcap
 *.pcapng
 
-# Model artifacts (trained locally, not checked in)
+# Model artifacts (trained locally, not checked in) and their metadata
+# sidecars (an instance's metadata is meaningless without the binary it
+# describes, and that binary is never committed — spec §12/§35).
 pirewall/ml/artifacts/*.pkl
 pirewall/ml/artifacts/*.joblib
 pirewall/ml/artifacts/*.txt
 pirewall/ml/artifacts/*.bin
+pirewall/ml/artifacts/*.metadata.json
 !pirewall/ml/artifacts/.gitkeep
 
 # Secrets / certificates

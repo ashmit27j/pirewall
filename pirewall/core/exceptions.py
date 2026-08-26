@@ -48,6 +48,19 @@ class FeatureExtractionError(PirewallError):
     """Raised when a `Flow` cannot be turned into a valid `FeatureVector`."""
 
 
+class DatasetError(PirewallError):
+    """Raised when a dataset adapter can't produce a canonical dataset from source data.
+
+    Covers a missing required column (a structural schema mismatch — fail
+    the whole file fast) and a dataset file that can't be found/read at all.
+    A single row with an unparseable value is *not* this — see
+    `pirewall.ml.preprocessing.common.DatasetLoadResult.skipped_rows`,
+    which counts and reports those without aborting the whole load (spec
+    §13: handle missing/invalid values explicitly, don't silently drop a
+    feature the schema requires).
+    """
+
+
 class ModelLoadError(PirewallError):
     """Raised when an ML model artifact cannot be loaded or its metadata is invalid."""
 

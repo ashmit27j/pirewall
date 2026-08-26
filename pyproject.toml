@@ -6,6 +6,8 @@ requires-python = ">=3.12"
 readme = "README.md"
 dependencies = [
     "pydantic>=2.7",
+    "lightgbm>=4.3",
+    "scikit-learn>=1.4",
 ]
 
 [dependency-groups]
@@ -39,6 +41,8 @@ known-first-party = ["pirewall"]
 [tool.pyright]
 include = ["pirewall", "tests", "scripts"]
 exclude = ["**/__pycache__", "pirewall/ml/artifacts"]
+venvPath = "."
+venv = ".venv"
 pythonVersion = "3.12"
 # pirewall only ever runs on Linux (Raspberry Pi, spec §3/§4); pin this so
 # Linux-only stdlib surface (e.g. socket.AF_PACKET in pirewall/capture/af_packet.py)

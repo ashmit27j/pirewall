@@ -36,6 +36,25 @@ known_attack_confidence_threshold = 0.8
 anomaly_score_threshold = 0.0
 behavior_window_seconds = 300
 
+# Bounded state (spec §17) — caps how much memory pirewall.detection.behavior
+# can use no matter how many distinct sources/destinations/ports it sees.
+max_tracked_sources = 10000
+max_tracked_destinations_per_source = 200
+max_tracked_ports_per_source = 200
+recent_connections_window = 50
+
+# Deterministic behavioral-pattern thresholds (spec §17). Every one of
+# these exists so pirewall.detection.behavior has no inline magic numbers.
+repeated_connections_threshold = 20
+high_frequency_per_second_threshold = 2.0
+burst_window_seconds = 5.0
+burst_count_threshold = 10
+persistence_seconds_threshold = 1800.0
+destination_diversity_threshold = 15
+scanning_port_threshold = 10
+repeated_failures_threshold = 10
+temporal_pattern_cv_threshold = 0.15
+
 [ml]
 lightgbm_model_path = "pirewall/ml/artifacts/lightgbm_model.txt"
 isolation_forest_model_path = "pirewall/ml/artifacts/isolation_forest_model.joblib"
@@ -46,6 +65,14 @@ low_threshold = 25.0
 medium_threshold = 50.0
 high_threshold = 75.0
 critical_threshold = 90.0
+
+# Maximum 0-100 contribution each evidence type can add to the overall
+# threat score (pirewall.engine.scoring). Documented default split:
+# known-attack evidence is weighted highest since it comes from a
+# supervised classifier trained on labeled attacks.
+known_attack_weight = 50.0
+anomaly_weight = 25.0
+behavior_weight = 25.0
 
 [firewall]
 # See docs/ADDENDUM.md for the letter references below.

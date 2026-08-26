@@ -7,6 +7,18 @@ typed, without an untyped-library boundary.
 
 from collections.abc import Sequence
 
+from pirewall.ml.labels import is_attack_label
+
+__all__ = [
+    "accuracy",
+    "binary_confusion_counts",
+    "binary_rates",
+    "confusion_matrix",
+    "is_attack_label",
+    "macro_f1",
+    "per_class_metrics",
+]
+
 
 def _safe_ratio(numerator: float, denominator: float) -> float:
     return numerator / denominator if denominator > 0 else 0.0
@@ -50,11 +62,6 @@ def macro_f1(per_class: dict[str, dict[str, float]]) -> float:
     if not per_class:
         return 0.0
     return sum(metrics["f1"] for metrics in per_class.values()) / len(per_class)
-
-
-def is_attack_label(label: str) -> bool:
-    """Collapse a multiclass dataset label into a binary attack/normal ground truth."""
-    return label.strip().lower() not in {"benign", "normal"}
 
 
 def binary_confusion_counts(

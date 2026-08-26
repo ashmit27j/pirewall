@@ -50,11 +50,34 @@ class FeaturesConfig(PirewallModel):
 
 
 class DetectionConfig(PirewallModel):
-    """Detection-layer thresholds (spec §17, §18)."""
+    """Detection-layer thresholds (spec §17, §18).
+
+    The `behavior_*`/`*_threshold` fields below are the configurable knobs
+    for `pirewall.detection.behavior`'s deterministic pattern detection —
+    every one of them exists so no threshold is a magic number inline in
+    that module (CLAUDE.md).
+    """
 
     known_attack_confidence_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
     anomaly_score_threshold: float = 0.0
     behavior_window_seconds: int = Field(default=300, gt=0)
+
+    # Bounded state (spec §17 "behavior state must be bounded").
+    max_tracked_sources: int = Field(default=10_000, gt=0)
+    max_tracked_destinations_per_source: int = Field(default=200, gt=0)
+    max_tracked_ports_per_source: int = Field(default=200, gt=0)
+    recent_connections_window: int = Field(default=50, gt=0)
+
+    # Pattern thresholds.
+    repeated_connections_threshold: int = Field(default=20, gt=0)
+    high_frequency_per_second_threshold: float = Field(default=2.0, gt=0.0)
+    burst_window_seconds: float = Field(default=5.0, gt=0.0)
+    burst_count_threshold: int = Field(default=10, gt=0)
+    persistence_seconds_threshold: float = Field(default=1800.0, gt=0.0)
+    destination_diversity_threshold: int = Field(default=15, gt=0)
+    scanning_port_threshold: int = Field(default=10, gt=0)
+    repeated_failures_threshold: int = Field(default=10, gt=0)
+    temporal_pattern_cv_threshold: float = Field(default=0.15, gt=0.0)
 
 
 class MLConfig(PirewallModel):
@@ -66,12 +89,22 @@ class MLConfig(PirewallModel):
 
 
 class ThreatConfig(PirewallModel):
-    """Threat-score-to-level thresholds (spec §18). Must be strictly ascending."""
+    """Threat-score-to-level thresholds and evidence weights (spec §18).
+
+    Threshold fields must be strictly ascending. `*_weight` fields are the
+    maximum 0-100 contribution each evidence type can add to the overall
+    score in `pirewall.engine.scoring` — kept here, not inline, so scoring
+    has no magic constants (CLAUDE.md).
+    """
 
     low_threshold: float = Field(default=25.0, ge=0.0, le=100.0)
     medium_threshold: float = Field(default=50.0, ge=0.0, le=100.0)
     high_threshold: float = Field(default=75.0, ge=0.0, le=100.0)
     critical_threshold: float = Field(default=90.0, ge=0.0, le=100.0)
+
+    known_attack_weight: float = Field(default=50.0, ge=0.0, le=100.0)
+    anomaly_weight: float = Field(default=25.0, ge=0.0, le=100.0)
+    behavior_weight: float = Field(default=25.0, ge=0.0, le=100.0)
 
     @model_validator(mode="after")
     def _check_ascending(self) -> "ThreatConfig":

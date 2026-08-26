@@ -12,7 +12,7 @@ Environment-dependent / Not yet validated.
 | 2 | Packet capture & parsing | Complete | Tested: parser (valid IPv4/IPv6/TCP/UDP/ICMP/ICMPv6 + exhaustive malformed/truncated cases), `FakePacketCapture`, capture->parse pipeline (`pirewall/capture/pipeline.py`), 34 new tests (128 total). Mocked: all capture-consumer logic exercised only against `FakePacketCapture`. Environment-dependent: `AFPacketCapture` (real Linux `AF_PACKET` socket, promiscuous mode, kernel drop stats) — implemented per spec §6 but requires a real Linux host, a real interface, and `CAP_NET_RAW` to exercise; cannot be run on the dev machine. A human must verify it on the target Pi (start it against a real interface, confirm packets/drops/malformed counts look sane under real traffic). ruff clean, pyright --strict clean (62 files, `pythonPlatform = "Linux"` pinned in pyproject.toml so Linux-only stdlib surface type-checks off-Linux too). |
 | 3 | Flow aggregation & feature extraction | Complete | Tested: flow-key bidirectional normalization, `FlowState` accumulation (forward/backward attribution, TCP flag counts, `RunningStats` for packet-size/inter-arrival, bounded-memory per flow), `FlowTable` LRU eviction (flood-tested to 5000 flows against a 100-flow cap), active/inactive timeout + TCP FIN/RST completion, `FlowAggregator` end-to-end (including IPv6 packets never entering the table — ADDENDUM.md A5), and the canonical feature schema/extractor (determinism, schema versioning, zero-division guards). 40 new tests (168 total). ruff clean, pyright --strict clean (76 files). |
 | 4 | Dataset adapters, preprocessing & ML training (dev machine) | Complete (pipeline); model quality Environment-dependent | See detailed notes below. |
-| 5 | ML inference, behavior analysis & threat assessment | Not started | |
+| 5 | ML inference, behavior analysis & threat assessment | Complete | Tested: schema-mismatch refusal (model load-time and per-call), LightGBM/Isolation Forest loaders+predictors against real (placeholder) trained artifacts, `KnownEvidence`/`AnomalyEvidence` wrappers, deterministic behavior analysis (port-scan/SYN-flood-like/repeated-connection scenarios + bounded-state flood test to 5000 sources), scoring (hand-computed cases), and `ThreatAssessment` (determinism, explainability, level thresholds). 32 new tests (225 total). Environment-dependent: actual detection *accuracy* against real attacks — needs the spec §34 attack-lab exercise against a real-data-trained model, not this session's synthetic-fixture placeholder. ruff clean, pyright --strict clean (109 files). |
 | 6 | Firewall decision, rule generation, validation & nftables backend | Not started | |
 | 7 | API, auth, security events & control panel | Not started | |
 | 8 | Raspberry Pi hardening, deployment & integrations (Wazuh/Netdata) | Not started | |
@@ -208,6 +208,17 @@ the reason.
   ethertype 0x8100 is treated as unsupported and rejected). Not required by
   spec §7. Revisit if a real deployment's switch port trunks VLAN-tagged
   traffic to the Pi.
+- **Phase 5**: `pirewall.engine.scoring`'s combination formula (known-attack
+  weight * confidence; anomaly is a flat weight if flagged; behavior scales
+  by fraction of possible pattern types detected — all weights from
+  `config.threat`) is a deliberately simple, explainable design choice, not
+  something tuned/validated against real attack traffic. Revisit once real
+  CICIDS2017/UNSW-NB15-trained models and spec §34 attack-lab data exist.
+- **Phase 5**: moved `is_attack_label` (dataset-label -> attack/benign)
+  from `pirewall.ml.training.metrics` into a new `pirewall.ml.labels`
+  module so both training-time evaluation and runtime scoring
+  (`pirewall.engine.scoring`) share one definition instead of risking
+  drift between two copies.
 - **Phase 4**: pyright wasn't resolving the project's `.venv` at all when
   invoked as `python -m pyright` (it silently fell back to a different
   interpreter's `site-packages`, so `lightgbm` reported as unresolvable

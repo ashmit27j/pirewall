@@ -71,8 +71,17 @@ statically asserts the required directives are present in those files.
 
 - `admin_password_hash` (`config/default_config.toml` `[authentication]`) is
   a `hashlib.scrypt` hash (see `docs/ARCHITECTURE.md`), never a plaintext
-  password — generate it with the Phase 7 admin-password tooling, never
-  hand-write one.
+  password. Generate one with pirewall's own hasher, so the parameters
+  always match what `verify_password` expects — never hand-write a hash:
+
+  ```sh
+  uv run python -c "from pirewall.api.auth import hash_password; \
+      import getpass; print(hash_password(getpass.getpass()))"
+  ```
+
+  `getpass` keeps the plaintext out of shell history. (There is no
+  dedicated CLI for this; earlier drafts of this document referred to
+  "Phase 7 admin-password tooling" that was never built.)
 - TLS private keys (`api.tls_key_path`) must never be committed; `.gitignore`
   already excludes common cert/key patterns under `deploy/certificates/`.
   Real certificate files live only on the deployed Pi, with filesystem

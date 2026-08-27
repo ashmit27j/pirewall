@@ -118,8 +118,12 @@ rpc_socket_path = "/run/pirewall/core.sock"   # ADDENDUM.md A4 — pirewall-core
 
 [authentication]
 admin_username = "CHANGE_ME"
-# Store a securely hashed password (spec §29), never plaintext. Generate
-# this with the Phase 7 admin-password tooling — never hand-write a hash here.
+# Store a securely hashed password (spec §29), never plaintext. Generate a
+# hash with pirewall's own hasher — never hand-write one, and never put the
+# plaintext password here:
+#   uv run python -c "from pirewall.api.auth import hash_password; \
+#       import getpass; print(hash_password(getpass.getpass()))"
+# (getpass keeps the password out of your shell history.)
 admin_password_hash = "CHANGE_ME"
 token_expiry_seconds = 3600
 

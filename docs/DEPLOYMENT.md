@@ -53,9 +53,19 @@ uv sync --no-dev   # production install, skips pytest/ruff/pyright
 
 Copy `config/default_config.toml` to `config/local_config.toml` and fill in
 every `CHANGE_ME` with your real values: interface names (step 1.4), your
-protected network CIDR, upstream gateway, Admin PC IP, TLS cert/key paths,
-and a real `admin_password_hash` (generate with the Phase 7 tooling —
-never hand-write one). **Never commit `config/local_config.toml`.**
+protected network CIDR, upstream gateway, the Pi's own LAN address
+(`pirewall_lan_ip` — safety validation refuses to ever block it, so it must
+be accurate), Admin PC IP, and TLS cert/key paths.
+
+Generate `admin_password_hash` with pirewall's own hasher — never
+hand-write one, and never put the plaintext in the file:
+
+```sh
+uv run python -c "from pirewall.api.auth import hash_password; \
+    import getpass; print(hash_password(getpass.getpass()))"
+```
+
+**Never commit `config/local_config.toml`.**
 
 ## 4. Render and apply the network templates
 

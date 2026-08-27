@@ -8,6 +8,8 @@ control panel must not automatically provide unrestricted root access."
 """
 
 import ast
+import subprocess
+import sys
 from pathlib import Path
 
 import pirewall
@@ -62,3 +64,42 @@ def test_web_package_never_imports_capture_or_firewall_internals() -> None:
     repo_root = package_root.parent
     violations = _scan(package_root / "web", repo_root)
     assert violations == [], f"forbidden imports under pirewall/web/: {violations}"
+
+
+def test_forbidden_modules_are_not_even_transitively_loaded_in_the_api_process() -> None:
+    """The AST checks above only see *direct* imports; this sees what actually gets loaded.
+
+    Regression test for an audit finding: `pirewall/ipc/__init__.py`
+    re-exported `CoreRpcDispatcher`, so importing the pirewall-api side
+    (`pirewall.ipc.client`) executed that `__init__` and pulled
+    `pirewall.firewall.manager` into the API process. Every AST test above
+    still passed, because no file under `pirewall/api/` or `pirewall/web/`
+    contained a forbidden import *textually* — the leak was transitive.
+
+    ADDENDUM.md A4 requires the separation hold "at the code/dependency
+    level, not just by convention", which means the module must not be
+    resident in the process at all, however it got there. Runs in a
+    subprocess so the parent pytest session's already-imported modules
+    (it imports FirewallManager all over the place) can't mask a real leak.
+    """
+    probe = (
+        "import sys\n"
+        "import pirewall.api.app\n"
+        "import pirewall.web.routes\n"
+        f"forbidden = {_FORBIDDEN_PREFIXES!r}\n"
+        "leaked = sorted(m for m in sys.modules"
+        " if any(m == p or m.startswith(p + '.') for p in forbidden))\n"
+        "print(';'.join(leaked))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=Path(pirewall.__file__).resolve().parent.parent,
+    )
+    leaked = [name for name in result.stdout.strip().split(";") if name]
+    assert leaked == [], (
+        "pirewall-api process transitively loaded forbidden modules "
+        f"{leaked} — see ADDENDUM.md A4"
+    )

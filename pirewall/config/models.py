@@ -198,6 +198,7 @@ class IntegrationConfig(PirewallModel):
     wazuh_host: str | None = None
     wazuh_port: int | None = Field(default=None, gt=0, le=65535)
     netdata_enabled: bool = False
+    netdata_host: str | None = None
     netdata_port: int | None = Field(default=None, gt=0, le=65535)
 
 

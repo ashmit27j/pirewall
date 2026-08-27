@@ -1,0 +1,35 @@
+# pirewall — IP forwarding (spec §21)
+#
+# TEMPLATE — not applied automatically. Review, render (see README.md), and
+# install by hand as /etc/sysctl.d/60-pirewall-forwarding.conf, then run
+# `sudo sysctl --system` to load it.
+#
+# ADDENDUM.md A5: v1 is IPv4-only for the adaptive pipeline. IPv6 forwarding
+# is deliberately left at its distro default (disabled on most Raspberry Pi
+# OS images) rather than enabled here — enabling it would silently create a
+# forwarding path pirewall's adaptive rules can never see or restrict, since
+# no CandidateRule may target an IPv6 address/CIDR in v1.
+
+# Interfaces this applies to (informational — sysctl below is global):
+#   WAN: ${WAN_INTERFACE}
+#   LAN: ${LAN_INTERFACE}
+
+net.ipv4.ip_forward = 1
+
+# Do not enable — see ADDENDUM.md A5 above.
+# net.ipv6.conf.all.forwarding = 1
+
+# Standard hardening alongside forwarding: don't accept ICMP redirects or
+# source-routed packets on the WAN-facing interface, and don't send them
+# either (spec §27 "required kernel/network settings").
+net.ipv4.conf.${WAN_INTERFACE}.accept_redirects = 0
+net.ipv4.conf.${WAN_INTERFACE}.send_redirects = 0
+net.ipv4.conf.${WAN_INTERFACE}.accept_source_route = 0
+net.ipv4.conf.${LAN_INTERFACE}.accept_redirects = 0
+net.ipv4.conf.${LAN_INTERFACE}.send_redirects = 0
+net.ipv4.conf.${LAN_INTERFACE}.accept_source_route = 0
+
+# Reverse-path filtering: drop packets whose source address couldn't be
+# reached back out the interface they arrived on (basic anti-spoofing).
+net.ipv4.conf.${WAN_INTERFACE}.rp_filter = 1
+net.ipv4.conf.${LAN_INTERFACE}.rp_filter = 1

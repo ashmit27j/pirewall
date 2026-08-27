@@ -1,0 +1,71 @@
+#!/usr/sbin/nft -f
+# pirewall — base nftables ruleset (spec §24 "Safety", §27, ADDENDUM.md)
+#
+# TEMPLATE — not applied automatically. Review, render (see
+# ../network/README.md for the rendering command), and load by hand with
+# `sudo nft -f deploy/rendered/base.nft` *before* starting
+# `pirewall-core.service` and *before* loading
+# `../network/nat-masquerade.nft.template`.
+#
+# Establishes the default posture pirewall's adaptive rules layer on top
+# of: deny-by-default forwarding except explicitly allowed traffic, and
+# management access (SSH + the control panel/API) restricted to the Admin
+# PC. This is a *separate* table (`pirewall_base`) from the `inet pirewall`
+# table `pirewall.firewall.backend.nftables.NftablesBackend` creates and
+# manages at runtime (table `pirewall`, chain `adaptive`, hook `forward`,
+# priority 0) — never edit this file to add adaptive/threat-driven rules;
+# those only ever come from the validated rule pipeline (spec §22).
+#
+# Priority ordering at the `forward` hook is deliberate:
+#   pirewall's `adaptive` chain    priority 0   (evaluated FIRST)
+#   this file's `forward` chain    priority 10  (evaluated SECOND)
+# so a narrow adaptive BLOCK/RATE_LIMIT rule for a specific flagged flow
+# gets first say — including blocking traffic this base ruleset would
+# otherwise allow (e.g. a LAN device's outbound connection) — and only
+# traffic the adaptive chain doesn't terminally accept/drop falls through
+# to this file's broader allow/deny-by-default policy.
+
+table inet pirewall_base {
+	chain forward {
+		type filter hook forward priority 10; policy drop;
+
+		# Already-established/related connections in either direction.
+		ct state established,related accept
+		ct state invalid drop
+
+		# LAN (protected network) -> WAN: allow new + established
+		# outbound connections. NAT/masquerading for this traffic is
+		# handled separately by ../network/nat-masquerade.nft.template.
+		iifname "${LAN_INTERFACE}" oifname "${WAN_INTERFACE}" ip saddr ${PROTECTED_NETWORK} accept
+
+		# WAN -> LAN: nothing new is allowed by default (policy drop,
+		# above). Add explicit port-forward exceptions here only if a
+		# specific deployment genuinely needs inbound WAN access to a
+		# LAN host — none by default.
+
+		# Diagnostic ICMP (ping, "too big"/"unreachable" for path MTU
+		# discovery) is useful and low-risk to allow both directions.
+		ip protocol icmp icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded } accept
+	}
+
+	chain input {
+		type filter hook input priority 0; policy drop;
+
+		iifname "lo" accept
+		ct state established,related accept
+		ct state invalid drop
+
+		# Management access restricted to the Admin PC only (spec §27
+		# "Network exposure", §29, ADDENDUM.md — the control
+		# panel/API must not be reachable from the WAN or from other
+		# LAN clients, only from admin.admin_pc_ip).
+		ip saddr ${ADMIN_PC_IP} tcp dport { 22, ${API_PORT} } accept
+
+		# Diagnostic ICMP to the Pi itself.
+		ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } accept
+	}
+
+	chain output {
+		type filter hook output priority 0; policy accept;
+	}
+}

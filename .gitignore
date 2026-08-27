@@ -54,3 +54,8 @@ Thumbs.db
 
 # Local config overrides
 config/local_config.toml
+
+# scripts/deployment/render_templates.py output — real interface names/IPs
+# substituted from config/local_config.toml, never applied automatically
+# and never committed (spec §21).
+deploy/rendered/

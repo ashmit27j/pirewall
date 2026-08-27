@@ -15,7 +15,7 @@ Environment-dependent / Not yet validated.
 | 5 | ML inference, behavior analysis & threat assessment | Complete | Tested: schema-mismatch refusal (model load-time and per-call), LightGBM/Isolation Forest loaders+predictors against real (placeholder) trained artifacts, `KnownEvidence`/`AnomalyEvidence` wrappers, deterministic behavior analysis (port-scan/SYN-flood-like/repeated-connection scenarios + bounded-state flood test to 5000 sources), scoring (hand-computed cases), and `ThreatAssessment` (determinism, explainability, level thresholds). 32 new tests (225 total). Environment-dependent: actual detection *accuracy* against real attacks — needs the spec §34 attack-lab exercise against a real-data-trained model, not this session's synthetic-fixture placeholder. ruff clean, pyright --strict clean (109 files). |
 | 6 | Firewall decision, rule generation, validation & nftables backend | Complete | Tested: decision engine (threat-level -> action ladder), candidate generator (narrowest-possible /32 rules, ALLOW produces none), the full 10-stage validation chain in ADDENDUM.md order (schema/network/allowlist/safety/conflict/duplicate/rate-cap/priority/expiration/authorization — each independently tested, plus end-to-end via `FirewallManager`+`FakeFirewallBackend`), SHADOW/ASSISTED/kill-switch lifecycle branching, and backend-isolation + injection-safety security tests. 62 new tests (289 total). Environment-dependent: `NftablesBackend` against a real `nft` binary/ruleset — implemented via nft's JSON interface (spec §20) but requires a real Linux host, root/`CAP_NET_ADMIN`, and `nft` itself to exercise; a human must verify table/chain bootstrap, rule translation, and removal on the target Pi. |
 | 7 | API, auth, security events & control panel | Complete | Tested: auth (password hashing/verification, sessions, Admin-PC-IP restriction), the full RPC dispatcher (every operation via `LoopbackRpcClient`), every API endpoint end-to-end via `TestClient` (login, admin-pc restriction, session enforcement, rules disable/remove/approve/reject, allowlist CRUD, kill-switch, route-surface enumeration), the control panel's HTML rendering (every spec §30 section + addendum sections, XSS-escaping, empty-state handling), and both A4 import-isolation checks (`pirewall/api/`, `pirewall/web/` never import capture/firewall.manager/firewall.backend). 53 new tests (344 total). Environment-dependent: `UnixSocketRpcServer`/`UnixSocketRpcClient` against a real `AF_UNIX` socket, and TLS with real certificates — both require a real Linux host (`socket.AF_UNIX` doesn't exist on this Windows dev machine) and are unverified here; `LoopbackRpcClient` exercises the exact same `CoreRpcDispatcher` logic in-process for everything else. See docs/ARCHITECTURE.md for the dependency decisions this phase made (stdlib `scrypt` over bcrypt/argon2, opaque tokens over JWT, hand-rolled HTML over Jinja2, uvicorn/httpx as FastAPI companions). |
-| 8 | Raspberry Pi hardening, deployment & integrations (Wazuh/Netdata) | Not started | |
+| 8 | Raspberry Pi hardening, deployment & integrations (Wazuh/Netdata) | Complete | See detailed notes below. |
 | 9 | Security/integration testing, docs & final validation | Not started | |
 
 ### Phase 4 details
@@ -62,6 +62,98 @@ still built and verified using small synthetic fixture data:
 
 ruff clean, pyright --strict clean (93 files, 193 tests total).
 
+### Phase 8 details
+
+Goal: deployment artifacts + hardening documentation + Wazuh/Netdata
+forwarding, without touching this session's real host network config,
+systemd state, or nftables ruleset (spec §21, `CLAUDE.md`). Deliverables 1-7
+from `prompts/phase-08-hardening-deployment-integration.md`, in order:
+
+1. **Tested** — `pirewall/integration/wazuh.py` (`WazuhForwarder`,
+   `format_event`, `SyslogWazuhTransport`) + `pirewall/integration/fake.py`
+   (`FakeWazuhTransport`). Payload shaping (every populated `SecurityEvent`
+   field maps to a structured dict key; unset optional fields are omitted;
+   enabled/disabled no-op behavior; transport-failure propagation) — 5
+   tests. `SyslogWazuhTransport` itself (the real TCP-socket transport) is
+   **Environment-dependent**: it requires a real Wazuh agent/syslog
+   listener on the Admin PC; see `docs/DEPLOYMENT.md` §8.
+2. **Tested** — `pirewall/integration/netdata.py` (`NetdataExporter`,
+   `snapshot_to_metrics`, `StatsdNetdataTransport`) +
+   `pirewall/core/models/metrics.py` (`NetdataMetricsSnapshot`, a new
+   Pydantic model covering every spec §33 metric plus the ADDENDUM.md A3
+   addition: adaptive-rule creation rate and budget-fraction). Payload
+   shaping (every spec §33 metric + the A3 addition present, correctly
+   prefixed `pirewall.*`, booleans encoded 0/1; enabled/disabled;
+   transport-failure propagation) — 5 tests. `StatsdNetdataTransport` (the
+   real UDP StatsD transport) is **Environment-dependent**: requires a real
+   Netdata instance with its StatsD collector enabled on the Admin PC; see
+   `docs/DEPLOYMENT.md` §8. No running collector loop exists yet to
+   periodically *build* a `NetdataMetricsSnapshot` from live state — see
+   the "not yet built" note below.
+3. **Implemented, Environment-dependent** — `deploy/network/` (README +
+   three `${TOKEN}`-parameterized templates: IP forwarding/sysctl hardening,
+   static LAN interface config, NAT/masquerade). Token substitution itself
+   is **Tested** via `scripts/deployment/render_templates.py` (new CLI —
+   loads a real `PirewallConfig`, substitutes `${TOKEN}`s, writes to
+   `deploy/rendered/`, never applies anything) — 4 tests, including
+   end-to-end rendering of every real checked-in template file with no
+   leftover placeholders. Actually applying the rendered files to a real
+   interface/kernel is Environment-dependent.
+4. **Implemented, Environment-dependent** — `deploy/systemd/pirewall-core.service` +
+   `pirewall-api.service` + README (the two-process split, ADDENDUM.md A4:
+   dedicated non-root users, `pirewall-core`'s primary group is the shared
+   `pirewall-ipc` group + `UMask=0117` for socket permissions,
+   `pirewall-api` only holds `pirewall-ipc` as a supplementary group and
+   has an explicitly empty `CapabilityBoundingSet=`/`AmbientCapabilities=`;
+   ADDENDUM.md A6: `Type=notify`+`WatchdogSec=30s` +
+   `Restart=on-failure`+`StartLimitBurst=3`/`StartLimitIntervalSec=300` on
+   `pirewall-core`, matching `config.failure`'s defaults). **Tested**
+   (static structure only) via `tests/security/test_systemd_hardening.py`
+   — 13 tests parsing both unit files and asserting every required
+   directive is present with the right value (including the A4 "verify
+   capabilities are actually absent, not just unused" requirement). Real
+   installation, real user/group creation, and real systemd
+   capability/namespace enforcement are Environment-dependent — see
+   `docs/DEPLOYMENT.md` §5, §7.
+5. **Implemented, Environment-dependent** — `deploy/firewall/base.nft.template` +
+   README: deny-by-default `forward`/`input` chains (policy `drop`),
+   management access (SSH + the API port) scoped to `${ADMIN_PC_IP}` only,
+   a deliberate `priority 10` (evaluated *after* the adaptive backend's
+   `priority 0` `forward` chain — documented in both the template's
+   comments and the README so a narrow adaptive block/rate-limit rule
+   always gets first say). **Tested** (static structure only) via
+   `tests/security/test_firewall_base_template.py` — 5 tests. Real `nft -c
+   -f` syntax validation and real traffic filtering are Environment-dependent.
+6. **Implemented** — `docs/SECURITY.md`: consolidates spec §27/§45 hardening
+   guidance (OS, least privilege/service isolation, SSH, network exposure,
+   secrets, filesystem, updates) with a summary table of every resource-
+   exhaustion protection already built in Phases 1-7 (not new to this
+   phase — cross-referenced, not reimplemented) and an explicit threat-model
+   section for the two-process split.
+7. **Implemented** — `docs/DEPLOYMENT.md`: step-by-step real-Pi deployment
+   (OS setup -> packages -> template rendering/application -> service
+   users -> certificates -> systemd units -> Admin PC Wazuh/Netdata setup
+   -> secure update procedure), explicit about exactly which steps this
+   session's tests can and can't verify.
+
+**Known gap, intentionally not filled this phase:** `pirewall/main.py`
+(the actual running process that wires capture -> flow -> features ->
+detection -> engine -> firewall manager into one loop, sends `sd_notify`
+watchdog heartbeats, and serves the RPC socket) and `pirewall/api/__main__.py`
+(the equivalent entry point for `pirewall-api`) do not exist yet. Neither
+was in this phase's explicit deliverable list (deployment *templates* and
+hardening *documentation*, not new subsystem wiring), and Phase 9's prompt
+explicitly says "do not add new subsystems... stop and report" rather than
+improvise architecture there either. Both `.service` files' `ExecStart=`
+lines reference these modules with an explicit `NOTE:` comment that they
+don't exist yet — **do not start either systemd unit for real until they're
+built.** Flagging this now as a real, load-bearing gap rather than
+discovering it silently at Phase 9 or on real hardware.
+
+ruff clean, pyright --strict clean (166 files), 376 tests total (32 new
+this phase, up from Phase 7's 344: 5 wazuh + 5 netdata + 13
+systemd-hardening + 5 firewall-base-template + 4 render-templates).
+
 ## Addendum items (`docs/ADDENDUM.md`)
 
 Fill in as each is implemented — don't wait for Phase 9 for these, update as
@@ -71,10 +163,10 @@ you go since they land across several phases.
 |------|--------|-------|
 | A1 Shadow / dry-run enforcement mode | Implemented + Tested (Phase 6) | `FirewallManager` branches on `EnforcementMode.SHADOW`: an otherwise-approved candidate becomes `RuleStatus.SHADOWED`, never reaches the backend, and produces a "[shadow mode] would have ..." `SecurityEvent`. |
 | A2 Static allowlist (outranks adaptive rules) | Implemented + Tested (Phase 6, 7) | Phase 6: validator stage as previously noted. Phase 7: `GET/POST/DELETE /api/v1/allowlist`, admin-only, control-panel section with add/remove — tested end-to-end via `TestClient`. |
-| A3 Rate cap on rule creation | Implemented + Tested (Phase 6) | `RuleCreationRateLimiter` (fixed window) backs the `rate_cap` validator stage; rejects with `RuleRejectionReason.RATE_LIMITED` once the window's budget is spent. Detection/`SecurityEvent` generation is untouched by the cap (the cap only ever runs after a `ThreatAssessment`/`FirewallDecision` already exist). |
-| A4 Privileged/unprivileged process split | Implemented + Tested (pipeline); real transport Environment-dependent (Phase 7) | Typed RPC protocol (`pirewall.ipc`): `CoreRpcDispatcher` (all 16 operations, fully unit-tested), `UnixSocketRpcServer`/`UnixSocketRpcClient` (real Linux `AF_UNIX` transport, unverified on this Windows dev machine), `LoopbackRpcClient` (in-process test double). `pirewall/api/`+`pirewall/web/` proven to never import `pirewall.capture`/`firewall.manager`/`firewall.backend` via an AST-based import-graph test. systemd units (the actual two-process deployment + socket file permissions) are Phase 8. |
+| A3 Rate cap on rule creation | Implemented + Tested (Phase 6, 8) | `RuleCreationRateLimiter` (fixed window) backs the `rate_cap` validator stage; rejects with `RuleRejectionReason.RATE_LIMITED` once the window's budget is spent. Detection/`SecurityEvent` generation is untouched by the cap (the cap only ever runs after a `ThreatAssessment`/`FirewallDecision` already exist). Phase 8: `pirewall.core.models.metrics.NetdataMetricsSnapshot` adds `adaptive_rule_creation_rate_per_window`/`adaptive_rule_budget_fraction`, exported by `pirewall.integration.netdata` (payload shaping tested) — no live collector loop populates a snapshot from the real rate limiter yet, see Phase 8's "known gap" note above. |
+| A4 Privileged/unprivileged process split | Implemented + Tested (pipeline); real transport and real two-process deployment Environment-dependent (Phase 7, 8) | Typed RPC protocol (`pirewall.ipc`): `CoreRpcDispatcher` (all 16 operations, fully unit-tested), `UnixSocketRpcServer`/`UnixSocketRpcClient` (real Linux `AF_UNIX` transport; this session's dev machine is macOS, not Linux, so this remains unexercised at runtime — `pyright`'s `pythonPlatform=Linux` pin only confirms it type-checks, not that it works), `LoopbackRpcClient` (in-process test double). `pirewall/api/`+`pirewall/web/` proven to never import `pirewall.capture`/`firewall.manager`/`firewall.backend` via an AST-based import-graph test. Phase 8: `deploy/systemd/pirewall-core.service`/`pirewall-api.service` implement the actual two-process deployment (dedicated users, `pirewall-core`'s primary group is the shared `pirewall-ipc` group + `UMask=0117` for the socket, `pirewall-api` only a supplementary member with an explicitly empty `CapabilityBoundingSet=`/`AmbientCapabilities=`) — static structure Tested (`tests/security/test_systemd_hardening.py`), real installation/enforcement Environment-dependent. Both units' `ExecStart=` reference `pirewall.main`/`pirewall.api.__main__`, which don't exist yet (see Phase 8's "known gap" note). |
 | A5 IPv4-only v1 scope | Implemented + Tested (Phase 1, 2, 6) | Phases 1-2 as previously noted. Phase 6: the validator's `network` stage adds a belt-and-suspenders runtime check (tested via a `model_copy`-bypassed candidate, since the type system already makes a real IPv6 `CandidateRule` unconstructable). |
-| A6 Fail-open default + systemd watchdog | Implemented (Phase 1 groundwork) | `FailureMode` enum, `failure.mode` config (default `fail_open`), `failure.watchdog_sec`/crash-loop fields. Watchdog wiring is Phase 8. Phase 6: `revert_to_base()` explicitly fails open (backend removal errors are swallowed; the manager's own state still marks rules `REMOVED`). |
+| A6 Fail-open default + systemd watchdog | Implemented (Phase 1, 6 groundwork); watchdog directives Implemented + Tested (static), real enforcement Environment-dependent (Phase 8) | `FailureMode` enum, `failure.mode` config (default `fail_open`), `failure.watchdog_sec`/crash-loop fields. Phase 6: `revert_to_base()` explicitly fails open (backend removal errors are swallowed; the manager's own state still marks rules `REMOVED`). Phase 8: `deploy/systemd/pirewall-core.service` sets `Type=notify`+`WatchdogSec=30s`+`Restart=on-failure`+`StartLimitBurst=3`/`StartLimitIntervalSec=300`, matching `config.failure`'s defaults — asserted present by `tests/security/test_systemd_hardening.py`. Nothing in `pirewall/` yet actually calls `sd_notify` (no `pirewall/main.py` exists to do so — see Phase 8's "known gap" note), so the real crash-loop-detection *behavior* remains entirely Environment-dependent, not just the systemd config around it. |
 | A7 Assisted mode / BLOCK approval queue | Implemented + Tested (Phase 6, 7) | Phase 6: manager logic as previously noted. Phase 7: `POST /api/v1/rules/{id}/approve`/`/reject`, control-panel Approve/Reject buttons on `PENDING_APPROVAL` rules — tested end-to-end via `TestClient`. |
 | A8 Emergency kill-switch | Implemented + Tested (Phase 6, 7) | Phase 6: `revert_to_base()` as previously noted. Phase 7: `POST /api/v1/firewall/kill-switch` (same auth/Admin-PC path as every other write endpoint) + a control-panel button with a JS confirmation step — tested end-to-end via `TestClient`. |
 
@@ -307,6 +399,30 @@ the reason.
   statistics accuracy for IPv6 traffic using extension headers, not
   detection.
 
+- **Phase 8 `deploy/firewall/base.nft.template` table/priority design**:
+  spec §24/§27 describe the desired *posture* (deny-by-default forwarding,
+  restricted management access) but not how it should coexist with the
+  adaptive backend's own nftables table. This session's design: a separate
+  `inet pirewall_base` table (distinct from `pirewall.firewall.backend.nftables`'s
+  `inet pirewall` table) whose `forward` chain uses `priority 10` —
+  deliberately *after* the adaptive chain's `priority 0` — so a narrow,
+  evidence-scoped adaptive `BLOCK`/`RATE_LIMIT` rule always gets first say
+  over the broader base policy, including overriding traffic the base
+  ruleset would otherwise allow. Not derived from spec text or tested
+  against real conflicting traffic; documented in the template's own
+  comments and `deploy/firewall/README.md`.
+- **Phase 8 `integration.netdata_port` default changed from `19999` to
+  `8125`**: the pre-Phase-8 default config had `netdata_port = 19999`,
+  which is Netdata's *web dashboard* port, not a port anything pushes
+  metrics to. Since `pirewall.integration.netdata.StatsdNetdataTransport`
+  pushes metrics via the StatsD protocol (the standard way a non-web-server
+  process feeds Netdata without running its own scrape endpoint), the
+  default was corrected to `8125` (Netdata's StatsD listener default) and
+  a new `integration.netdata_host` field was added (mirroring the existing
+  `wazuh_host`) since a metrics push target needs a host, not just a port —
+  this field didn't exist before Phase 8 and was a genuine gap, not a
+  redesign of anything Phase 7 built.
+
 ## Open questions for the human
 
 List anything Claude Code got stuck on or needs a decision on (e.g. real
@@ -331,3 +447,22 @@ dataset file locations, Admin PC IP, actual WAN/LAN interface names).
   add it to `AdminConfig` and extend `pirewall.firewall.validator._validate_safety`
   accordingly — the validator-stage structure makes this a small, isolated
   change.
+
+- **Phase 8 — `pirewall/main.py`/`pirewall/api/__main__.py` don't exist
+  yet:** every deployment artifact this phase built (`deploy/systemd/*.service`,
+  `docs/DEPLOYMENT.md`) targets these two entry points, but building them
+  was outside both this phase's explicit deliverable list and Phase 9's
+  ("do not add new subsystems... stop and report" for anything requiring
+  real new subsystem work). Concretely still missing: a `pirewall-core`
+  main loop that wires capture -> flow -> features -> detection -> engine
+  -> firewall manager together, sends `sd_notify` watchdog heartbeats
+  (ADDENDUM.md A6), and serves the RPC socket (ADDENDUM.md A4) inside one
+  running process; and a `pirewall-api` equivalent that loads config,
+  builds a `UnixSocketRpcClient`, calls `pirewall.api.app.create_app`, and
+  serves it with uvicorn+TLS. Neither systemd unit can actually be started
+  until these land. **Provisional call made this session:** flag this
+  clearly (in both `.service` files' comments, `docs/DEPLOYMENT.md`'s
+  opening note, and here) rather than build it unasked — if you want this
+  built, it's real implementation work beyond Phase 9's "close gaps,
+  reconcile, don't add subsystems" scope, so it likely deserves being
+  scoped as its own follow-up rather than folded silently into Phase 9.

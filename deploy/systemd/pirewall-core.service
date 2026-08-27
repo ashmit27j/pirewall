@@ -1,0 +1,109 @@
+[Unit]
+Description=pirewall-core — packet capture, flow/feature/detection pipeline, firewall manager
+# TEMPLATE — must be reviewed and tested on real Pi hardware before trusting
+# it in production (spec §27 "do not apply systemd restrictions that break
+# required networking functionality without testing"). Not installed or
+# started by anything in this repository.
+Documentation=file:///opt/pirewall/docs/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+# ADDENDUM.md A6: pirewall-core sends sd_notify watchdog heartbeats; a
+# missed heartbeat within this window triggers a systemd-initiated restart.
+# Keep this value in sync with `config.failure.watchdog_sec`
+# (config/default_config.toml [failure] watchdog_sec, default 30).
+WatchdogSec=30s
+NotifyAccess=main
+
+ExecStart=/opt/pirewall/.venv/bin/python -m pirewall.main
+# NOTE: `pirewall.main` (the process that wires capture -> flow -> features
+# -> detection -> engine -> firewall manager into one running loop, sends
+# sd_notify watchdog heartbeats, and serves the RPC socket) is not yet
+# implemented — see docs/PROGRESS.md Phase 8. This unit file is a deployment
+# target for that future entry point, not proof it exists; do not start this
+# unit until `pirewall/main.py` lands.
+WorkingDirectory=/opt/pirewall
+
+# ADDENDUM.md A6: restart on crash (not on a clean exit), and detect a
+# crash-loop rather than restarting forever. Keep RestartSec/StartLimitBurst/
+# StartLimitIntervalSec in sync with `config.failure.crash_loop_restart_count`
+# / `crash_loop_window_seconds` (defaults: 3 restarts / 300s). Once the limit
+# trips, systemd leaves the unit in `failed`, which pirewall-api's
+# `/status` endpoint can observe independently (ADDENDUM.md A4 — it's a
+# separate process, so it stays up to report "core is down").
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+# --- Least privilege (spec §27, §45) ---------------------------------------
+# Dedicated, non-login service user. Its *primary* group is the shared
+# pirewall-ipc group (not a separate pirewall-core group) specifically so
+# every file this process creates — the RPC socket under RuntimeDirectory,
+# and its own log files — is automatically group-owned pirewall-ipc without
+# any application-level chown. UMask=0117 then makes every such file mode
+# 0660 (owner rw, group rw, world none): the socket becomes readable/
+# writable by pirewall-api (a member of pirewall-ipc via
+# SupplementaryGroups, see pirewall-api.service) without being world-
+# accessible. This is the "umask/group ownership approach" ADDENDUM.md A4
+# asks to be documented.
+User=pirewall-core
+Group=pirewall-ipc
+UMask=0117
+
+# Exactly what packet capture (AF_PACKET, spec §6) and nftables rule
+# management (spec §20, via the `nft` binary, spec's JSON interface) need —
+# nothing else. No CAP_SYS_ADMIN, no CAP_DAC_OVERRIDE, not root.
+#   CAP_NET_RAW   — open an AF_PACKET socket for packet capture.
+#   CAP_NET_ADMIN — modify nftables rules/tables.
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=true
+
+# --- Service isolation (spec §27) ------------------------------------------
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+# AF_PACKET (capture) + AF_UNIX (the RPC socket) + AF_INET/AF_INET6 (nft
+# talks to the kernel over netlink, address family AF_NETLINK) only.
+RestrictAddressFamilies=AF_PACKET AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @obsolete
+SystemCallErrorNumber=EPERM
+
+# The RPC socket directory (ADDENDUM.md A4). systemd creates /run/pirewall
+# owned pirewall-core:pirewall-ipc mode 0750 (group can traverse + list;
+# only pirewall-core, the owner, can create files inside without the group
+# write bit — the socket file itself gets 0660 per UMask above once bound).
+RuntimeDirectory=pirewall
+RuntimeDirectoryMode=0750
+
+# Only these paths are writable; everything else is read-only per
+# ProtectSystem=strict. Config and ML model artifacts are read-only inputs.
+ReadWritePaths=/var/log/pirewall /run/pirewall
+ReadOnlyPaths=/opt/pirewall/config /opt/pirewall/pirewall/ml/artifacts
+
+# --- Resource limits (spec §27 "Resource exhaustion") -----------------------
+# A 4GB Pi target (spec §3) running one dedicated capture/detection/firewall
+# process — generous enough not to OOM-kill under normal load, bounded
+# enough that a leak/bug in this process can't starve the rest of the host
+# (including pirewall-api, a separate process per ADDENDUM.md A4).
+MemoryMax=768M
+MemoryHigh=640M
+TasksMax=256
+CPUQuota=150%
+
+[Install]
+WantedBy=multi-user.target

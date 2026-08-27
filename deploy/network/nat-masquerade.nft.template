@@ -1,0 +1,24 @@
+#!/usr/sbin/nft -f
+# pirewall — NAT/masquerading for protected-LAN clients (spec §21)
+#
+# TEMPLATE — not applied automatically. Review, render (see README.md), and
+# load by hand with `sudo nft -f deploy/rendered/nat-masquerade.nft` *after*
+# `deploy/firewall/base.nft.template` is loaded.
+#
+# Deliberately a separate `ip` family table from both
+# `deploy/firewall/base.nft.template` (deny-by-default forwarding/management
+# posture) and the `inet pirewall` table `pirewall.firewall.backend.nftables`
+# manages at runtime — NAT is orthogonal to filtering decisions and keeping
+# it in its own table means neither the base ruleset nor the adaptive
+# backend's rule teardown/bootstrap logic can ever accidentally touch it.
+
+table ip pirewall_nat {
+	chain postrouting {
+		type nat hook postrouting priority 100; policy accept;
+
+		# Only masquerade traffic that actually originates in the
+		# protected network and is leaving via the WAN interface —
+		# never a blanket masquerade of everything.
+		ip saddr ${PROTECTED_NETWORK} oifname "${WAN_INTERFACE}" masquerade
+	}
+}

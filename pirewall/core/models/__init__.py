@@ -16,6 +16,7 @@ from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.evidence import AnomalyEvidence, KnownEvidence
 from pirewall.core.models.feature_vector import FeatureVector
 from pirewall.core.models.flow import Flow
+from pirewall.core.models.metrics import NetdataMetricsSnapshot
 from pirewall.core.models.model_metadata import ModelMetadata
 from pirewall.core.models.packet import PacketMetadata
 from pirewall.core.models.rule import CandidateRule, FirewallRule
@@ -36,6 +37,7 @@ __all__ = [
     "InterArrivalStats",
     "KnownEvidence",
     "ModelMetadata",
+    "NetdataMetricsSnapshot",
     "PacketMetadata",
     "PacketSizeStats",
     "PirewallModel",

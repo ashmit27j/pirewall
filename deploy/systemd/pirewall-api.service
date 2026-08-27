@@ -1,0 +1,90 @@
+[Unit]
+Description=pirewall-api — FastAPI control panel/API (ADDENDUM.md A4)
+# TEMPLATE — must be reviewed and tested on real Pi hardware before trusting
+# it in production (spec §27). Not installed or started by anything in this
+# repository. Start after pirewall-core so the RPC socket already exists,
+# but this unit must keep running independently of pirewall-core's health
+# (ADDENDUM.md A4/A6) — hence "After=" (ordering only), deliberately no
+# "Requires=" or "BindsTo=" that would take pirewall-api down with it.
+Documentation=file:///opt/pirewall/docs/DEPLOYMENT.md
+After=network-online.target pirewall-core.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/pirewall/.venv/bin/python -m pirewall.api.__main__
+# NOTE: this entry point (load config, build a `UnixSocketRpcClient`
+# pointed at config.api.rpc_socket_path, call
+# `pirewall.api.app.create_app`, serve it with uvicorn+TLS) is not yet
+# implemented — see docs/PROGRESS.md Phase 8. This unit file is a
+# deployment target for that future entry point, not proof it exists; do
+# not start this unit until it lands.
+WorkingDirectory=/opt/pirewall
+
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# --- Least privilege (spec §27, §45, ADDENDUM.md A4) ------------------------
+# A *different*, more restricted non-root user from pirewall-core. Its
+# primary group is dedicated (pirewall-api), not the shared pirewall-ipc
+# group — it only needs *membership* in pirewall-ipc to reach the socket
+# pirewall-core already created and group-owns, never to create files that
+# other pirewall-ipc members should read.
+User=pirewall-api
+Group=pirewall-api
+SupplementaryGroups=pirewall-ipc
+
+# ADDENDUM.md A4: "No raw-socket or firewall-related capabilities in its
+# CapabilityBoundingSet at all — verify this is actually absent, not just
+# unused." Explicitly empty, not omitted, so this is unambiguous on
+# inspection and in `tests/security/test_systemd_hardening.py`.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+
+# --- Service isolation (spec §27) ------------------------------------------
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+# AF_UNIX for the RPC socket to pirewall-core, AF_INET/AF_INET6 to serve
+# the control panel/API over TLS. No AF_PACKET (no raw capture — that's
+# exactly the point of ADDENDUM.md A4) and no AF_NETLINK (no nftables/
+# routing access either).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @obsolete
+SystemCallErrorNumber=EPERM
+
+# pirewall-core already creates and owns /run/pirewall (RuntimeDirectory in
+# pirewall-core.service) with group pirewall-ipc — this unit deliberately
+# does *not* declare its own RuntimeDirectory=pirewall (that would make
+# pirewall-api co-own/recreate a directory it shouldn't control the
+# lifecycle of). It only needs read/write access to the socket file inside,
+# which SupplementaryGroups=pirewall-ipc above + the 0660 socket permissions
+# pirewall-core sets (see pirewall-core.service's UMask=0117) already grant;
+# ReadWritePaths here is what makes that access survive ProtectSystem=strict.
+ReadWritePaths=/run/pirewall /var/log/pirewall-api
+ReadOnlyPaths=/opt/pirewall/config /opt/pirewall/deploy/certificates
+
+# --- Resource limits (spec §27 "Resource exhaustion") -----------------------
+# Deliberately smaller than pirewall-core's — this process does request
+# handling and HTML/JSON rendering only, no packet-rate-scale work.
+MemoryMax=256M
+MemoryHigh=192M
+TasksMax=128
+CPUQuota=75%
+
+[Install]
+WantedBy=multi-user.target

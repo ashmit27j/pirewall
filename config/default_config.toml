@@ -130,10 +130,11 @@ backup_count = 5
 
 [integration]
 wazuh_enabled = false
-wazuh_host = "CHANGE_ME"
-wazuh_port = 1514
+wazuh_host = "CHANGE_ME"        # CHANGE_ME — Admin PC hostname/IP running Wazuh
+wazuh_port = 1514                # Wazuh agent syslog listener default
 netdata_enabled = false
-netdata_port = 19999
+netdata_host = "CHANGE_ME"      # CHANGE_ME — Admin PC hostname/IP running Netdata
+netdata_port = 8125              # Netdata's StatsD listener default (not the 19999 dashboard port)
 
 [security]
 min_tls_version = "TLSv1.3"

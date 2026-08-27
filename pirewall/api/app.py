@@ -11,11 +11,13 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from pirewall.api.auth import Authenticator, Session, SessionStore, enforce_admin_pc_ip
 from pirewall.config.models import PirewallConfig
-from pirewall.core.exceptions import AuthenticationError
+from pirewall.core.exceptions import AuthenticationError, RpcError
 from pirewall.ipc.client import BaseRpcClient
+from pirewall.web.render import render_core_unavailable_page
 
 SESSION_COOKIE_NAME = "pirewall_session"
 
@@ -72,6 +74,25 @@ def require_session(request: Request, authenticator: AuthenticatorDep) -> Sessio
 SessionDep = Annotated[Session, Depends(require_session)]
 
 
+def _handle_core_unavailable(request: Request, exc: Exception) -> Response:
+    """An unreachable pirewall-core is a reportable state, not a 500 (ADDENDUM.md A6, spec §26).
+
+    A6's justification for the A4 process split is that pirewall-api
+    outlives a pirewall-core crash-loop and can therefore say so. Letting
+    `RpcError` escape as an unhandled 500 wastes exactly that property, and
+    surfaces a traceback where an operator needs a diagnosis.
+
+    503 rather than 500: pirewall-api itself is healthy, its dependency is
+    not — and 503 tells a polling Admin PC to retry.
+
+    Typed as `Exception` because that is the signature Starlette's handler
+    registry requires; only `RpcError` is ever routed here.
+    """
+    if request.url.path.startswith("/control-panel"):
+        return HTMLResponse(render_core_unavailable_page(str(exc)), status_code=503)
+    return JSONResponse({"detail": f"pirewall-core is unreachable: {exc}"}, status_code=503)
+
+
 def create_app(
     config: PirewallConfig,
     rpc_client: BaseRpcClient,
@@ -105,6 +126,8 @@ def create_app(
             allow_methods=["*"],
             allow_headers=["*"],
         )
+
+    app.add_exception_handler(RpcError, _handle_core_unavailable)
 
     protected = [Depends(require_admin_pc), Depends(require_session)]
     admin_pc_only = [Depends(require_admin_pc)]

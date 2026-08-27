@@ -6,6 +6,7 @@ from fastapi.routing import APIRoute
 
 from pirewall.api.app import create_app
 from pirewall.core.enums import FirewallAction, SecurityEventType, ThreatLevel
+from pirewall.core.exceptions import RpcError
 from pirewall.core.models.decision import FirewallDecision
 from pirewall.firewall.backend.fake import FakeFirewallBackend
 from pirewall.firewall.manager import FirewallManager
@@ -238,3 +239,31 @@ def test_registered_route_surface_matches_spec() -> None:
         ("/control-panel", "GET"),
     }
     assert routes == expected
+
+
+def test_unreachable_core_reports_503_instead_of_crashing() -> None:
+    """ADDENDUM.md A6 / spec §26: a dead pirewall-core is a reportable state, not a 500.
+
+    A6 justifies the A4 process split partly on pirewall-api outliving a
+    pirewall-core crash-loop so it can *say so*, and spec §26 requires
+    failures be "visible through the control panel". Before this was
+    handled, both the JSON API and the control panel returned an unhandled
+    500 with a traceback where an operator needed a diagnosis.
+    """
+    harness = make_harness(NOW)
+    token = login(harness)
+
+    def _dead(*_args: object, **_kwargs: object) -> None:
+        raise RpcError("failed to reach pirewall-core at /run/pirewall/core.sock")
+
+    harness.client.app.state.pirewall_rpc_client._call = _dead  # type: ignore[attr-defined]
+
+    api_response = harness.get("/api/v1/status", headers=auth_headers(token))
+    panel_response = harness.get("/control-panel", headers=auth_headers(token))
+
+    assert api_response.status_code == 503
+    assert "unreachable" in api_response.json()["detail"]
+    assert panel_response.status_code == 503
+    assert "pirewall-core is unreachable" in panel_response.text
+    # The operator needs the enforcement consequence, not just the error.
+    assert "fail_open" in panel_response.text

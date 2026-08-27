@@ -40,6 +40,11 @@ class Response:
         return self._raw.json()
 
     @property
+    def text(self) -> str:
+        """The raw body — for the HTML control-panel routes, which aren't JSON."""
+        return cast(str, self._raw.text)
+
+    @property
     def cookies(self) -> dict[str, str]:
         return dict(self._raw.cookies)
 

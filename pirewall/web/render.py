@@ -128,6 +128,40 @@ def render_login_page() -> str:
     return _page("pirewall — login", body)
 
 
+def render_core_unavailable_page(detail: str) -> str:
+    """The control panel when `pirewall-core` can't be reached (ADDENDUM.md A6, spec §26).
+
+    A6's whole argument for the A4 process split is that pirewall-api
+    survives a pirewall-core crash-loop and can therefore *report* it. That
+    only holds if an unreachable core renders this instead of a 500.
+
+    Deliberately states the enforcement consequence rather than just the
+    error: with core down, no adaptive rule is being evaluated, and what
+    the network is left with is whatever static base ruleset was loaded at
+    deploy time (`deploy/firewall/`) — which under the default
+    `failure.mode = "fail_open"` means traffic keeps flowing unfiltered.
+    """
+    body = f"""
+    <h1>pirewall control panel</h1>
+    <h2 class="error">pirewall-core is unreachable</h2>
+    <p class="error">{_e(detail)}</p>
+    <p>
+      The control panel process is running, but it cannot reach
+      <code>pirewall-core</code> over its local socket. While core is down
+      <strong>no adaptive rule is being evaluated</strong>: enforcement is
+      whatever the static base ruleset from <code>deploy/firewall/</code>
+      already installed. With the default <code>failure.mode =
+      "fail_open"</code> that means traffic continues to flow unfiltered.
+    </p>
+    <p>
+      Check <code>systemctl status pirewall-core</code> on the Pi. A unit
+      left in <code>failed</code> state means the crash-loop limit tripped
+      (ADDENDUM.md A6); see <code>docs/DEPLOYMENT.md</code>.
+    </p>
+    """
+    return _page("pirewall — core unreachable", body)
+
+
 def _status_badge(status: RuleStatus) -> str:
     css_class = {
         RuleStatus.ACTIVE: "badge-active",
@@ -141,7 +175,7 @@ def _render_system_section(status: StatusResult) -> str:
     return f"""
     <h2>System</h2>
     <table>
-      <tr><th>pirewall-core status</th><td>running, uptime {status.uptime_seconds:.0f}s</td></tr>
+      <tr><th>pirewall-core status</th><td>reachable, uptime {status.uptime_seconds:.0f}s</td></tr>
       <tr><th>Enforcement mode</th><td>{_e(status.enforcement_mode.value)}</td></tr>
       <tr><th>Failure mode</th><td>{_e(status.failure_mode.value)}</td></tr>
       <tr><th>Active rules</th><td>{status.active_rule_count}</td></tr>

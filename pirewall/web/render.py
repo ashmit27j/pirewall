@@ -2,7 +2,19 @@
 
 Plain HTML + CSS + minimal vanilla JS (`fetch()` for actions) — no
 frontend framework, and no templating library (`html.escape` on every
-piece of dynamic content instead; see `docs/ARCHITECTURE.md`). Read-only
+piece of dynamic content instead; see `docs/ARCHITECTURE.md`).
+
+**Escaping is per-context, and `html.escape` only covers one of them.** It
+is correct for element text and for attribute *values*, but not for a value
+landing inside a JS string literal in an inline handler: the HTML parser
+decodes `&#x27;` back to `'` before the JS engine parses the attribute, so
+an escaped quote still terminates the string. Dynamic values therefore
+reach JS through `data-` attributes read at click time (`_action_button`
+plus the delegated listener in `_SCRIPT`), never by interpolation into
+`onclick` source. Ids are additionally `urllib.parse.quote`d, since they
+are being built into a URL path.
+
+Read-only
 except for the actions already exposed by the JSON API (spec §30, §45) —
 this module never executes anything itself, it only renders links/forms
 that call the same authenticated API endpoints a script could.
@@ -10,6 +22,7 @@ that call the same authenticated API endpoints a script could.
 
 import html
 from collections.abc import Iterable
+from urllib.parse import quote
 
 from pirewall.core.enums import RuleStatus
 from pirewall.core.models.allowlist import AllowlistEntry
@@ -60,6 +73,17 @@ function addAllowlistEntry(event) {
   if (form.protocol.value) body.protocol = form.protocol.value;
   pirewallCall("POST", "/api/v1/allowlist", body);
 }
+// Rule/allowlist ids reach JS through data- attributes read at click time,
+// never interpolated into an inline handler's JS source. html.escape() is
+// correct for HTML attribute values but NOT for JS string literals: the
+// parser decodes &#x27; back to ' before the JS engine sees the attribute,
+// so an id containing a quote would break out of the string and execute.
+// Delegated listener, so it also covers rows added by a future re-render.
+document.addEventListener("click", function (event) {
+  const button = event.target.closest("button[data-action]");
+  if (!button) return;
+  pirewallCall(button.dataset.method, button.dataset.action);
+});
 </script>"""
 
 
@@ -163,17 +187,29 @@ def _render_firewall_section(rules: list[FirewallRule]) -> str:
     """
 
 
+def _action_button(label: str, method: str, url: str) -> str:
+    """An action button whose target URL travels in `data-` attributes, not inline JS.
+
+    Attribute values are the one context `html.escape` is actually correct
+    for. Interpolating the same value into an inline `onclick`'s JS source
+    is not safe even escaped — see the delegated listener in `_SCRIPT`.
+    """
+    return f'<button data-method="{_e(method)}" data-action="{_e(url)}">{_e(label)}</button>'
+
+
 def _rule_actions(rule: FirewallRule) -> str:
-    rule_id = _e(rule.id)
+    base = f"/api/v1/rules/{quote(rule.id, safe='')}"
     if rule.status is RuleStatus.PENDING_APPROVAL:
         return (
-            f'<button onclick="pirewallCall(\'POST\', \'/api/v1/rules/{rule_id}/approve\')">Approve</button> '
-            f'<button onclick="pirewallCall(\'POST\', \'/api/v1/rules/{rule_id}/reject\')">Reject</button>'
+            _action_button("Approve", "POST", f"{base}/approve")
+            + " "
+            + _action_button("Reject", "POST", f"{base}/reject")
         )
     if rule.status is RuleStatus.ACTIVE:
         return (
-            f'<button onclick="pirewallCall(\'POST\', \'/api/v1/rules/{rule_id}/disable\')">Disable</button> '
-            f'<button onclick="pirewallCall(\'POST\', \'/api/v1/rules/{rule_id}/remove\')">Remove</button>'
+            _action_button("Disable", "POST", f"{base}/disable")
+            + " "
+            + _action_button("Remove", "POST", f"{base}/remove")
         )
     return ""
 
@@ -197,8 +233,7 @@ def _render_shadow_log_section(rules: list[FirewallRule]) -> str:
 def _allowlist_row(entry: AllowlistEntry) -> str:
     port = _e(entry.port) if entry.port is not None else "&mdash;"
     protocol = _e(entry.protocol.value) if entry.protocol is not None else "&mdash;"
-    remove_url = f"/api/v1/allowlist/{_e(entry.id)}"
-    remove_button = f'<button onclick="pirewallCall(\'DELETE\', \'{remove_url}\')">Remove</button>'
+    remove_button = _action_button("Remove", "DELETE", f"/api/v1/allowlist/{quote(entry.id, safe='')}")
     return (
         f"<tr><td>{_e(entry.target)}</td><td>{port}</td><td>{protocol}</td>"
         f"<td>{_e(entry.reason)}</td><td>{_e(entry.created_by)}</td><td>{remove_button}</td></tr>"

@@ -1,6 +1,7 @@
 """`pirewall.web.render`: every control panel section renders from fixture data (spec §30)."""
 
 from datetime import UTC, datetime
+from ipaddress import IPv4Network
 
 from pirewall.core.enums import (
     EnforcementMode,
@@ -115,6 +116,54 @@ def test_dashboard_escapes_untrusted_content() -> None:
     html = render_dashboard(_status(), [], [malicious_event], [], [], [])
     assert "<script>alert" not in html
     assert "&lt;script&gt;" in html
+
+
+def test_ids_never_reach_an_inline_js_handler() -> None:
+    """Regression test: `html.escape` is not sufficient for JS-string context.
+
+    Rule/allowlist ids used to be interpolated into an inline
+    `onclick="pirewallCall('POST', '/api/v1/rules/<id>/disable')"`. The HTML
+    parser decodes the escaped `&#x27;` back to `'` before the JS engine
+    parses the attribute, so an id containing a quote broke out of the
+    string literal and executed — escaping notwithstanding. Ids now travel
+    in `data-` attributes (a context `html.escape` genuinely covers).
+
+    Not reachable today, since ids are generated UUIDs; this pins the
+    property so it stays true if an id ever becomes operator- or
+    evidence-derived.
+    """
+    hostile_id = "x')+alert(1)+('"
+    rules = [
+        make_firewall_rule(id=hostile_id, status=RuleStatus.ACTIVE),
+        make_firewall_rule(id=hostile_id, status=RuleStatus.PENDING_APPROVAL),
+    ]
+    allowlist = [
+        AllowlistEntry(
+            id=hostile_id,
+            target=IPv4Network("192.168.1.77/32"),
+            reason="test",
+            created_at=NOW,
+            created_by="admin",
+        )
+    ]
+
+    html = render_dashboard(_status(), rules, [], [], [], allowlist)
+
+    assert "alert(1)" not in html
+    # The decoded form is what the JS engine would have seen.
+    assert "&#x27;)+alert" not in html
+    assert "onclick=\"pirewallCall(" not in html
+
+
+def test_action_buttons_still_carry_their_target_url() -> None:
+    """The escaping fix must not have silently broken the buttons it protects."""
+    html = render_dashboard(
+        _status(), [make_firewall_rule(id="abc123", status=RuleStatus.ACTIVE)], [], [], [], []
+    )
+
+    assert 'data-action="/api/v1/rules/abc123/disable"' in html
+    assert 'data-action="/api/v1/rules/abc123/remove"' in html
+    assert 'data-method="POST"' in html
 
 
 def test_dashboard_handles_empty_state_gracefully() -> None:

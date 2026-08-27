@@ -16,7 +16,7 @@ Environment-dependent / Not yet validated.
 | 6 | Firewall decision, rule generation, validation & nftables backend | Complete | Tested: decision engine (threat-level -> action ladder), candidate generator (narrowest-possible /32 rules, ALLOW produces none), the full 10-stage validation chain in ADDENDUM.md order (schema/network/allowlist/safety/conflict/duplicate/rate-cap/priority/expiration/authorization — each independently tested, plus end-to-end via `FirewallManager`+`FakeFirewallBackend`), SHADOW/ASSISTED/kill-switch lifecycle branching, and backend-isolation + injection-safety security tests. 62 new tests (289 total). Environment-dependent: `NftablesBackend` against a real `nft` binary/ruleset — implemented via nft's JSON interface (spec §20) but requires a real Linux host, root/`CAP_NET_ADMIN`, and `nft` itself to exercise; a human must verify table/chain bootstrap, rule translation, and removal on the target Pi. |
 | 7 | API, auth, security events & control panel | Complete | Tested: auth (password hashing/verification, sessions, Admin-PC-IP restriction), the full RPC dispatcher (every operation via `LoopbackRpcClient`), every API endpoint end-to-end via `TestClient` (login, admin-pc restriction, session enforcement, rules disable/remove/approve/reject, allowlist CRUD, kill-switch, route-surface enumeration), the control panel's HTML rendering (every spec §30 section + addendum sections, XSS-escaping, empty-state handling), and both A4 import-isolation checks (`pirewall/api/`, `pirewall/web/` never import capture/firewall.manager/firewall.backend). 53 new tests (344 total). Environment-dependent: `UnixSocketRpcServer`/`UnixSocketRpcClient` against a real `AF_UNIX` socket, and TLS with real certificates — both require a real Linux host (`socket.AF_UNIX` doesn't exist on this Windows dev machine) and are unverified here; `LoopbackRpcClient` exercises the exact same `CoreRpcDispatcher` logic in-process for everything else. See docs/ARCHITECTURE.md for the dependency decisions this phase made (stdlib `scrypt` over bcrypt/argon2, opaque tokens over JWT, hand-rolled HTML over Jinja2, uvicorn/httpx as FastAPI companions). |
 | 8 | Raspberry Pi hardening, deployment & integrations (Wazuh/Netdata) | Complete | See detailed notes below. |
-| 9 | Security/integration testing, docs & final validation | Not started | |
+| 9 | Security/integration testing, docs & final validation | Complete | See detailed notes below. |
 
 ### Phase 4 details
 
@@ -154,6 +154,97 @@ ruff clean, pyright --strict clean (166 files), 376 tests total (32 new
 this phase, up from Phase 7's 344: 5 wazuh + 5 netdata + 13
 systemd-hardening + 5 firewall-base-template + 4 render-templates).
 
+### Phase 9 details
+
+Closing phase: fill test-coverage gaps, produce complete documentation, run
+a performance smoke pass, and reconcile the whole project against spec §50
++ every ADDENDUM.md item honestly. No new subsystems added (per this
+phase's own explicit non-goal) — the two genuine gaps found during
+reconciliation (Control Panel "network statistics"/"detections") are
+reported under "Open questions for the human" instead of being improvised.
+
+1. **Security test gaps filled** (`tests/security/`, `tests/unit/`): 13 new
+   tests — certificate/TLS config-failure cases (3,
+   `tests/unit/test_config_loader.py`), firewall backend *removal*-failure
+   handling for `disable_rule`/`remove_rule`/the kill-switch (3,
+   `tests/security/test_firewall_failure_handling.py` — complements the
+   existing apply-failure test from Phase 6), and resource exhaustion for
+   `CoreStateStore`'s event/flow/detection/threat/decision buffers plus a
+   genuine flood through the real `FirewallManager` past the rate cap (3,
+   `tests/security/test_resource_exhaustion.py`). Every other spec §39
+   security-test item (malformed packets, injection, overly broad/
+   duplicate/conflicting rules, Admin PC lockout, unauthorized API
+   requests) was already covered in Phases 2/6/7 — see
+   `docs/TESTING.md`'s coverage table for the full mapping, not just this
+   phase's additions. **Tested.**
+2. **Integration tests** (`tests/integration/test_full_detection_pipeline.py`,
+   4 new tests): both spec §39 pipelines end to end, using real
+   `PacketMetadata` fed through the real `FlowAggregator` (not hand-built
+   `Flow` fixtures) for three scripted scenarios — a benign session, a
+   port scan (many destination ports, one destination host), and a
+   SYN-flood-like burst (many connection attempts, one destination
+   port) — asserting sensible, deterministic end-to-end decisions
+   (benign -> `ALLOW`, no rule; scan/flood -> detected via genuinely
+   different behavioral signatures, decision generates a validated rule
+   that deploys against `FakeFirewallBackend`). **Deliberate scope
+   choice, documented in the test file's own docstring**: known/anomaly
+   ML evidence is passed as `None` rather than run through freshly
+   trained placeholder models — `score_evidence`'s three contributions
+   are independent and strictly additive, so an untuned model's
+   prediction on hand-crafted scenarios would swing the total score
+   unpredictably and make the assertions flaky for no real benefit; ML
+   inference correctness is already thoroughly covered by `tests/ml/`.
+   **Tested.**
+3. **Performance smoke pass** (`scripts/diagnostics/performance_smoke.py`
+   + `tests/system/test_performance_smoke.py`): packet capture+parse, flow
+   aggregation, feature extraction, LightGBM inference, Isolation Forest
+   inference, threat assessment, and rule-deployment latency, all measured
+   against `FakePacketCapture`/`FakeFirewallBackend` at a synthetic
+   2000-flow rate. Representative numbers from this session's dev machine
+   (macOS, x86_64) — **explicitly not representative of real Raspberry Pi
+   4 hardware** (spec §40, §46):
+
+   | stage | count | mean (ms) | ops/sec |
+   |---|---|---|---|
+   | packet capture+parse | 4000 | 0.032 | 30,938 |
+   | flow aggregation | 4000 | 0.041 | 24,209 |
+   | feature extraction | 2000 | 0.016 | 62,742 |
+   | lightgbm inference | 2000 | 0.089 | 11,210 |
+   | isolation-forest inference | 2000 | 12.068 | 83 |
+   | threat assessment | 2000 | 0.022 | 46,056 |
+   | rule deployment | 2000 | 5.064 | 198 |
+
+   Isolation Forest inference is the clear bottleneck (scikit-learn's
+   per-call overhead calling `decision_function` one flow at a time, not
+   batched) and rule deployment slows as `active_rules()` grows (O(n)
+   conflict/priority/duplicate checks against every active rule) — both
+   worth profiling for real if Pi-hardware throughput ever becomes a
+   concern, per spec §40 "profile before optimizing." **Tested**
+   (regression-guarded at a smaller scale by
+   `tests/system/test_performance_smoke.py`, which asserts every stage
+   still runs and reports positive throughput, not specific numbers).
+   **Environment-dependent** for real Pi 4 numbers — re-run this same
+   script on the target hardware.
+4. **Documentation**: `docs/FEATURE_SCHEMA.md`, `docs/ML_PIPELINE.md`,
+   `docs/FIREWALL.md`, `docs/API.md`, `docs/TESTING.md`,
+   `docs/DEVELOPMENT_WORKFLOW.md` all new this phase; `docs/ARCHITECTURE.md`
+   extended with the spec §51 pipeline diagram + module-boundary map
+   (existing dependency-decision content preserved, not replaced);
+   `README.md` rewritten as a real project overview with a documentation
+   map and pointers to `docs/DEPLOYMENT.md`. `docs/SECURITY.md`/
+   `docs/DEPLOYMENT.md` were already complete from Phase 8. **Implemented.**
+5. **Final acceptance reconciliation**: every spec §50 bullet and every
+   ADDENDUM.md item table row filled in with an honest label — see
+   "Acceptance criteria reconciliation" below and the "Open questions for
+   the human" section (real-hardware verification steps for A1/A4/A6,
+   explicitly itemized per this phase's own instructions, plus the two
+   Control Panel gaps found during reconciliation).
+
+ruff clean, pyright --strict clean (172 files), 390 tests total (14 new
+this phase, up from Phase 8's final 376: 3 config-loader certificate
+tests + 3 firewall-removal-failure tests + 3 resource-exhaustion tests +
+4 full-pipeline integration tests + 1 performance-smoke regression test).
+
 ## Addendum items (`docs/ADDENDUM.md`)
 
 Fill in as each is implemented — don't wait for Phase 9 for these, update as
@@ -161,135 +252,141 @@ you go since they land across several phases.
 
 | Item | Status | Notes |
 |------|--------|-------|
-| A1 Shadow / dry-run enforcement mode | Implemented + Tested (Phase 6) | `FirewallManager` branches on `EnforcementMode.SHADOW`: an otherwise-approved candidate becomes `RuleStatus.SHADOWED`, never reaches the backend, and produces a "[shadow mode] would have ..." `SecurityEvent`. |
+| A1 Shadow / dry-run enforcement mode | Implemented + Tested (Phase 6); real multi-week observation Environment-dependent (Phase 9) | `FirewallManager` branches on `EnforcementMode.SHADOW`: an otherwise-approved candidate becomes `RuleStatus.SHADOWED`, never reaches the backend, and produces a "[shadow mode] would have ..." `SecurityEvent`. Phase 9: the addendum's own recommended 1-2 week real-traffic observation window before moving to ASSISTED/ACTIVE is inherently not something this repository's tests can substitute for — see "Open questions for the human." |
 | A2 Static allowlist (outranks adaptive rules) | Implemented + Tested (Phase 6, 7) | Phase 6: validator stage as previously noted. Phase 7: `GET/POST/DELETE /api/v1/allowlist`, admin-only, control-panel section with add/remove — tested end-to-end via `TestClient`. |
 | A3 Rate cap on rule creation | Implemented + Tested (Phase 6, 8) | `RuleCreationRateLimiter` (fixed window) backs the `rate_cap` validator stage; rejects with `RuleRejectionReason.RATE_LIMITED` once the window's budget is spent. Detection/`SecurityEvent` generation is untouched by the cap (the cap only ever runs after a `ThreatAssessment`/`FirewallDecision` already exist). Phase 8: `pirewall.core.models.metrics.NetdataMetricsSnapshot` adds `adaptive_rule_creation_rate_per_window`/`adaptive_rule_budget_fraction`, exported by `pirewall.integration.netdata` (payload shaping tested) — no live collector loop populates a snapshot from the real rate limiter yet, see Phase 8's "known gap" note above. |
 | A4 Privileged/unprivileged process split | Implemented + Tested (pipeline); real transport and real two-process deployment Environment-dependent (Phase 7, 8) | Typed RPC protocol (`pirewall.ipc`): `CoreRpcDispatcher` (all 16 operations, fully unit-tested), `UnixSocketRpcServer`/`UnixSocketRpcClient` (real Linux `AF_UNIX` transport; this session's dev machine is macOS, not Linux, so this remains unexercised at runtime — `pyright`'s `pythonPlatform=Linux` pin only confirms it type-checks, not that it works), `LoopbackRpcClient` (in-process test double). `pirewall/api/`+`pirewall/web/` proven to never import `pirewall.capture`/`firewall.manager`/`firewall.backend` via an AST-based import-graph test. Phase 8: `deploy/systemd/pirewall-core.service`/`pirewall-api.service` implement the actual two-process deployment (dedicated users, `pirewall-core`'s primary group is the shared `pirewall-ipc` group + `UMask=0117` for the socket, `pirewall-api` only a supplementary member with an explicitly empty `CapabilityBoundingSet=`/`AmbientCapabilities=`) — static structure Tested (`tests/security/test_systemd_hardening.py`), real installation/enforcement Environment-dependent. Both units' `ExecStart=` reference `pirewall.main`/`pirewall.api.__main__`, which don't exist yet (see Phase 8's "known gap" note). |
 | A5 IPv4-only v1 scope | Implemented + Tested (Phase 1, 2, 6) | Phases 1-2 as previously noted. Phase 6: the validator's `network` stage adds a belt-and-suspenders runtime check (tested via a `model_copy`-bypassed candidate, since the type system already makes a real IPv6 `CandidateRule` unconstructable). |
-| A6 Fail-open default + systemd watchdog | Implemented (Phase 1, 6 groundwork); watchdog directives Implemented + Tested (static), real enforcement Environment-dependent (Phase 8) | `FailureMode` enum, `failure.mode` config (default `fail_open`), `failure.watchdog_sec`/crash-loop fields. Phase 6: `revert_to_base()` explicitly fails open (backend removal errors are swallowed; the manager's own state still marks rules `REMOVED`). Phase 8: `deploy/systemd/pirewall-core.service` sets `Type=notify`+`WatchdogSec=30s`+`Restart=on-failure`+`StartLimitBurst=3`/`StartLimitIntervalSec=300`, matching `config.failure`'s defaults — asserted present by `tests/security/test_systemd_hardening.py`. Nothing in `pirewall/` yet actually calls `sd_notify` (no `pirewall/main.py` exists to do so — see Phase 8's "known gap" note), so the real crash-loop-detection *behavior* remains entirely Environment-dependent, not just the systemd config around it. |
+| A6 Fail-open default + systemd watchdog | Implemented (Phase 1, 6 groundwork); watchdog directives Implemented + Tested (static), real enforcement Environment-dependent (Phase 8) | `FailureMode` enum, `failure.mode` config (default `fail_open`), `failure.watchdog_sec`/crash-loop fields. Phase 6: `revert_to_base()` explicitly fails open (backend removal errors are swallowed; the manager's own state still marks rules `REMOVED`). Phase 8: `deploy/systemd/pirewall-core.service` sets `Type=notify`+`WatchdogSec=30s`+`Restart=on-failure`+`StartLimitBurst=3`/`StartLimitIntervalSec=300`, matching `config.failure`'s defaults — asserted present by `tests/security/test_systemd_hardening.py`. Nothing in `pirewall/` yet actually calls `sd_notify` (no `pirewall/main.py` exists to do so — see Phase 8's "known gap" note), so the real crash-loop-detection *behavior* remains entirely Environment-dependent, not just the systemd config around it. Phase 9: added `tests/security/test_firewall_failure_handling.py`, proving the fail-open *state-transition* guarantee (backend removal errors swallowed, manager state still updates) end-to-end through the real `FirewallManager`, not just via `contextlib.suppress` code inspection — but the real-crash/real-watchdog half remains Environment-dependent, itemized in "Open questions for the human." |
 | A7 Assisted mode / BLOCK approval queue | Implemented + Tested (Phase 6, 7) | Phase 6: manager logic as previously noted. Phase 7: `POST /api/v1/rules/{id}/approve`/`/reject`, control-panel Approve/Reject buttons on `PENDING_APPROVAL` rules — tested end-to-end via `TestClient`. |
 | A8 Emergency kill-switch | Implemented + Tested (Phase 6, 7) | Phase 6: `revert_to_base()` as previously noted. Phase 7: `POST /api/v1/firewall/kill-switch` (same auth/Admin-PC path as every other write endpoint) + a control-panel button with a JS confirmation step — tested end-to-end via `TestClient`. |
 
 ## Acceptance criteria reconciliation (spec §50)
 
-Fill this in during Phase 9 — one line per bullet in §50, with a label.
-Leave blank until then; don't pre-fill with guesses.
+Filled in Phase 9. Labels per `CLAUDE.md`: Implemented / Tested / Mocked /
+Environment-dependent / Not yet validated. An item can carry more than one
+label (e.g. "Tested against Fakes; real hardware Environment-dependent").
+Two real gaps were found during this reconciliation (Control Panel
+"network statistics" and "detections") — see "Open questions for the
+human" below; they are marked unchecked and explained here rather than
+silently filled in, per this phase's own non-goal ("do not add new
+subsystems... report, don't improvise").
 
 ### Network
-- [ ] packet capture —
-- [ ] packet parsing —
-- [ ] flow aggregation —
-- [ ] bidirectional flows —
-- [ ] flow timeouts —
-- [ ] bounded state —
-- [ ] canonical Flow —
+- [x] packet capture — Tested (`FakePacketCapture`, Phase 2); real `AFPacketCapture` Environment-dependent.
+- [x] packet parsing — Tested exhaustively, including a dedicated malformed/truncated security-test tier (Phase 2).
+- [x] flow aggregation — Tested (Phase 3; re-exercised end-to-end via real `PacketMetadata` in Phase 9's full-pipeline integration tests).
+- [x] bidirectional flows — Tested (flow-key bidirectional normalization, forward/backward attribution, Phase 3).
+- [x] flow timeouts — Tested (active/inactive timeout + TCP FIN/RST completion, Phase 3).
+- [x] bounded state — Tested (`FlowTable` LRU eviction, flood-tested to 5000 flows against a 100-flow cap, Phase 3).
+- [x] canonical Flow — Implemented + Tested (`pirewall.core.models.Flow`, IPv4-only per ADDENDUM.md A5, Phase 1/3).
 
 ### Features
-- [ ] canonical schema —
-- [ ] deterministic extraction —
-- [ ] training/runtime compatibility —
+- [x] canonical schema — Implemented + Tested (29 features, one module, `docs/FEATURE_SCHEMA.md`, Phase 3).
+- [x] deterministic extraction — Tested (identical `Flow` -> identical `FeatureVector`, Phase 3).
+- [x] training/runtime compatibility — Tested (shared extractor across Phase 4 dataset adapters and Phase 5 runtime inference; schema-version + feature-ordering pinning enforced at model load time, Phase 5).
 
 ### ML
-- [ ] CICIDS2017 adapter —
-- [ ] UNSW-NB15 adapter —
-- [ ] preprocessing —
-- [ ] LightGBM —
-- [ ] Isolation Forest —
-- [ ] training pipeline —
-- [ ] model artifacts —
-- [ ] metadata —
-- [ ] compatibility validation —
+- [x] CICIDS2017 adapter — Tested against synthetic fixtures (Phase 4); real-dataset behavior Environment-dependent (no dataset file present on any dev machine used this project).
+- [x] UNSW-NB15 adapter — same as above.
+- [x] preprocessing — Tested (`pirewall.ml.preprocessing.common`, pooled-variance stat combination, missing/invalid-value handling, Phase 4).
+- [x] LightGBM — Tested against synthetic fixtures (training + inference, Phase 4/5); real detection accuracy Environment-dependent.
+- [x] Isolation Forest — same as above.
+- [x] training pipeline — Tested (both trainer modules + both CLIs, Phase 4).
+- [x] model artifacts — Implemented + Tested (save/load round-trip, `tests/ml/test_artifacts.py`). Mocked: no real trained artifact exists in *this* session's workspace (`pirewall/ml/artifacts/` is gitignored and empty here — Phase 4's original session trained local-only placeholder artifacts that don't persist across machines/sessions); the performance smoke pass and `tests/ml/` each train a fresh tiny placeholder model on demand instead of depending on one being present.
+- [x] metadata — Tested (`ModelMetadata` save/load round-trip, Phase 4).
+- [x] compatibility validation — Tested (schema-mismatch refusal at both load-time and per-inference-call, Phase 5).
 
 ### Detection
-- [ ] known-attack evidence —
-- [ ] anomaly evidence —
-- [ ] behavioral analysis —
-- [ ] threat scoring —
-- [ ] explainable assessments —
+- [x] known-attack evidence — Tested (`pirewall.detection.known_attack.classify`, Phase 5).
+- [x] anomaly evidence — Tested (`pirewall.detection.anomaly.detect`, Phase 5).
+- [x] behavioral analysis — Tested (Phase 5 unit tests + Phase 9's port-scan/SYN-flood scripted-traffic integration tests).
+- [x] threat scoring — Tested (`pirewall.engine.scoring`, hand-computed cases, Phase 5; end-to-end in Phase 9).
+- [x] explainable assessments — Tested (`ThreatAssessment.explanation`/`contributing_evidence`, Phase 5).
 
 ### Firewall
-- [ ] explicit decisions —
-- [ ] structured rules —
-- [ ] candidate generation —
-- [ ] validation —
-- [ ] conflict detection —
-- [ ] duplicate detection —
-- [ ] safety checks —
-- [ ] expiration —
-- [ ] enforcement —
-- [ ] audit trail —
+- [x] explicit decisions — Tested (`pirewall.engine.decision`, Phase 6; end-to-end in Phase 9).
+- [x] structured rules — Implemented + Tested (`CandidateRule`/`FirewallRule` Pydantic models, Phase 1/6).
+- [x] candidate generation — Tested (narrowest-possible `/32` rules, `ALLOW` produces none, Phase 6).
+- [x] validation — Tested (the full 10-stage chain, each stage independently tested plus end-to-end, Phase 6).
+- [x] conflict detection — Tested (Phase 6 unit + integration).
+- [x] duplicate detection — Tested (Phase 6 unit + integration).
+- [x] safety checks — Tested (Admin PC, whole-LAN, whole-internet, broader-than-evidence — Phase 6 + `tests/security/test_safety_validation.py`).
+- [x] expiration — Tested (missing-expiration rejection stage; `RuleStatus.EXPIRED` in the lifecycle, Phase 6).
+- [x] enforcement — Tested against `FakeFirewallBackend` (SHADOW/ASSISTED/ACTIVE branching, Phase 6); real `NftablesBackend` against a real `nft` binary Environment-dependent.
+- [x] audit trail — Tested (`RuleTransition` list + `SecurityEvent` emission on every transition, Phase 6).
 
 ### Gateway
-- [ ] WAN/LAN configuration —
-- [ ] forwarding —
-- [ ] routing —
-- [ ] firewall forwarding —
-- [ ] NAT where required —
-- [ ] protected network —
+- [x] WAN/LAN configuration — Implemented (`deploy/network/` templates, config-driven, Phase 8); real application Environment-dependent.
+- [x] forwarding — Implemented (`60-pirewall-forwarding.conf.template`, IPv4 only per ADDENDUM.md A5, Phase 8); real application Environment-dependent.
+- [x] routing — Implemented: a home-gateway topology needs kernel IP forwarding + a static LAN-facing address, not a dynamic routing protocol — covered by the same sysctl/interface templates above (Phase 8); real application Environment-dependent.
+- [x] firewall forwarding — Implemented + Tested (statically): `deploy/firewall/base.nft.template`'s deny-by-default `forward` chain (Phase 8, `tests/security/test_firewall_base_template.py`); real enforcement Environment-dependent.
+- [x] NAT where required — Implemented (`deploy/network/nat-masquerade.nft.template`, Phase 8); real application Environment-dependent.
+- [x] protected network — Implemented + Tested (`config.network.protected_network`, used throughout safety validation since Phase 6).
 
 ### API
-- [ ] FastAPI —
-- [ ] authentication —
-- [ ] TLS —
-- [ ] certificate support —
-- [ ] Admin PC restriction —
-- [ ] safe administrative operations —
+- [x] FastAPI — Implemented + Tested (Phase 7, `docs/API.md`).
+- [x] authentication — Tested (Phase 7).
+- [x] TLS — Implemented (config fields, `min_tls_version`, Phase 1/7); real TLS termination Environment-dependent and additionally blocked on the not-yet-built `pirewall.api.__main__` entry point (see "Open questions" below).
+- [x] certificate support — Implemented + Tested at the config layer (required non-empty `tls_cert_path`/`tls_key_path`, Phase 9 added explicit missing/empty-path tests); real certificate loading Environment-dependent, same entry-point gap as TLS above.
+- [x] Admin PC restriction — Tested at both the application layer (Phase 7) and, statically, the network layer (`deploy/firewall/base.nft.template`'s `input` chain, Phase 8).
+- [x] safe administrative operations — Tested (disable/remove/approve/reject/allowlist/kill-switch, every one routed through the single authorized `FirewallManager` path, Phase 7).
 
 ### Control Panel
-- [ ] system health —
-- [ ] network statistics —
-- [ ] threats —
-- [ ] detections —
-- [ ] firewall rules —
-- [ ] events —
-- [ ] ML status —
+- [x] system health — Tested (`StatusResult` rendering, Phase 7).
+- [ ] network statistics — **Gap, not implemented.** `CaptureStatistics` (packet rate/drops, Phase 2) is never wired into `CoreStateStore`, the RPC protocol, the API, or the control panel — nothing exposes it past `PacketCapture.statistics()` itself. See "Open questions for the human" below.
+- [x] threats — Tested (Phase 7).
+- [ ] detections — **Gap, not implemented in the control panel.** `GET /api/v1/detections` exists and is Tested (Phase 7 API), but `pirewall.web.routes.dashboard`/`render_dashboard` never fetch or render it — the HTML control panel has no detections section. See "Open questions for the human" below.
+- [x] firewall rules — Tested, including A7's Approve/Reject and A8's kill-switch button (Phase 7).
+- [x] events — Tested (Phase 7).
+- [x] ML status — Tested (loaded model metadata, Phase 7).
 
 ### Integration
-- [ ] Wazuh —
-- [ ] Netdata/metrics —
-- [ ] Admin PC communication —
+- [x] Wazuh — Implemented + Tested (payload shaping, `pirewall.integration.wazuh`, Phase 8); real delivery to a real Wazuh agent Environment-dependent.
+- [x] Netdata/metrics — Implemented + Tested (payload shaping, `pirewall.integration.netdata`, Phase 8, including ADDENDUM.md A3's rule-rate metric); real delivery to a real Netdata instance Environment-dependent. No live collector loop exists yet to periodically build a `NetdataMetricsSnapshot` from running state — see "Open questions" below (same root cause as the `pirewall/main.py` gap).
+- [x] Admin PC communication — Implemented (Wazuh/Netdata forwarders above; the RPC socket between `pirewall-core`/`pirewall-api` is Admin-PC-facing indirectly via the control panel); real end-to-end Environment-dependent.
 
 ### Raspberry Pi Security
-- [ ] least privilege —
-- [ ] service isolation —
-- [ ] secure systemd configuration —
-- [ ] SSH hardening —
-- [ ] restricted network exposure —
-- [ ] secret protection —
-- [ ] filesystem permissions —
-- [ ] resource limits —
-- [ ] secure firewall management —
-- [ ] secure update procedure —
+- [x] least privilege — Implemented (`deploy/systemd/*.service` capability scoping, ADDENDUM.md A4, Phase 8); real enforcement Environment-dependent.
+- [x] service isolation — Implemented + Tested (statically): `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, restricted `ReadWritePaths`, etc. (Phase 8, `tests/security/test_systemd_hardening.py`); real enforcement Environment-dependent.
+- [x] secure systemd configuration — same as above, plus the A6 watchdog/crash-loop directives, Tested statically.
+- [x] SSH hardening — Implemented as documentation/guidance (`docs/SECURITY.md`, `docs/DEPLOYMENT.md`) — SSH itself is host OS configuration outside pirewall's own codebase, so there is nothing to unit-test; a human must apply it. Environment-dependent.
+- [x] restricted network exposure — Implemented + Tested (statically): Admin-PC-only `input` chain (Phase 8); real enforcement Environment-dependent.
+- [x] secret protection — Implemented (scrypt password hashing since Phase 7, `.gitignore` rules for certs/local config, documented filesystem-permission guidance in `docs/SECURITY.md`).
+- [x] filesystem permissions — Implemented (systemd `ReadOnlyPaths`/`ReadWritePaths`, socket permission scheme via shared group + `UMask`, Phase 8); real enforcement Environment-dependent.
+- [x] resource limits — Implemented + Tested (statically): `MemoryMax`/`MemoryHigh`/`TasksMax`/`CPUQuota` in both service files (Phase 8); real enforcement Environment-dependent. Software-level resource-exhaustion protections (flow table, behavior state, rate cap, bounded event queue) are Tested independent of systemd, since Phases 3/5/6/9.
+- [x] secure firewall management — Tested (the one-authorized-caller rule, `tests/security/test_backend_isolation.py`; no shell-command injection, `tests/security/test_injection.py`).
+- [x] secure update procedure — Implemented as documentation (`docs/SECURITY.md` §"Updates", `docs/DEPLOYMENT.md` §9) — a procedure, not code; a human follows it. Environment-dependent by nature.
 
 ### Testing
-- [ ] unit tests —
-- [ ] integration tests —
-- [ ] ML tests —
-- [ ] security tests —
-- [ ] failure tests —
-- [ ] mocked hardware tests —
-- [ ] strict type checking —
+- [x] unit tests — Tested (`tests/unit/`, every phase).
+- [x] integration tests — Tested (`tests/integration/`, including Phase 9's new full-pipeline scripted-traffic tests).
+- [x] ML tests — Tested (`tests/ml/`).
+- [x] security tests — Tested (`tests/security/`, expanded in Phase 9 — see `docs/TESTING.md`'s coverage table).
+- [x] failure tests — Tested (deploy failure since Phase 6; remove/kill-switch failure added Phase 9, `tests/security/test_firewall_failure_handling.py`).
+- [x] mocked hardware tests — Tested (the Protocol+Fake pattern throughout — `FakePacketCapture`, `FakeFirewallBackend`, `LoopbackRpcClient`).
+- [x] strict type checking — Tested (`pyright --strict`, zero errors, 166 files as of Phase 8; unchanged through Phase 9's additions — see the ruff/pyright run at the end of this phase).
 
 ### Deployment
-- [ ] Raspberry Pi installation —
-- [ ] network configuration —
-- [ ] IP forwarding —
-- [ ] firewall configuration —
-- [ ] permissions/capabilities —
-- [ ] systemd —
-- [ ] certificates —
-- [ ] Admin PC configuration —
+- [x] Raspberry Pi installation — Implemented as documentation (`docs/DEPLOYMENT.md` §1-3); Environment-dependent.
+- [x] network configuration — Implemented (`deploy/network/`, config-parameterized templates + render script, Phase 8); Environment-dependent.
+- [x] IP forwarding — Implemented (`60-pirewall-forwarding.conf.template`, Phase 8); Environment-dependent.
+- [x] firewall configuration — Implemented + Tested statically (`deploy/firewall/base.nft.template`, Phase 8); Environment-dependent.
+- [x] permissions/capabilities — Implemented + Tested statically (`deploy/systemd/*.service`, Phase 8); Environment-dependent.
+- [x] systemd — Implemented + Tested statically (two units, ADDENDUM.md A4/A6, Phase 8); Environment-dependent, and blocked on the `pirewall/main.py`/`pirewall.api.__main__` entry-point gap for actually starting either unit — see "Open questions" below.
+- [x] certificates — Implemented as documentation + config fields (`docs/DEPLOYMENT.md` §6); Environment-dependent.
+- [x] Admin PC configuration — Implemented as documentation (`docs/DEPLOYMENT.md` §8, Wazuh/Netdata setup); Environment-dependent.
 
 ### Documentation
-- [ ] README —
-- [ ] architecture —
-- [ ] feature schema —
-- [ ] ML pipeline —
-- [ ] firewall —
-- [ ] security —
-- [ ] deployment —
-- [ ] testing —
-- [ ] Raspberry Pi hardening —
+- [x] README — Implemented (Phase 9: rewritten as a full project overview).
+- [x] architecture — Implemented (Phase 9: pipeline diagram + module-boundary map added to the existing `docs/ARCHITECTURE.md`).
+- [x] feature schema — Implemented (`docs/FEATURE_SCHEMA.md`, Phase 9).
+- [x] ML pipeline — Implemented (`docs/ML_PIPELINE.md`, Phase 9).
+- [x] firewall — Implemented (`docs/FIREWALL.md`, Phase 9).
+- [x] security — Implemented (`docs/SECURITY.md`, Phase 8).
+- [x] deployment — Implemented (`docs/DEPLOYMENT.md`, Phase 8).
+- [x] testing — Implemented (`docs/TESTING.md`, Phase 9).
+- [x] Raspberry Pi hardening — Implemented (folded into `docs/SECURITY.md` rather than a separate file — spec §35 lists "Raspberry Pi hardening" as a documentation topic, not necessarily a separate filename, and `docs/SECURITY.md` §1 is entirely that topic).
 
 ## Known deviations from spec
 
@@ -466,3 +563,75 @@ dataset file locations, Admin PC IP, actual WAN/LAN interface names).
   built, it's real implementation work beyond Phase 9's "close gaps,
   reconcile, don't add subsystems" scope, so it likely deserves being
   scoped as its own follow-up rather than folded silently into Phase 9.
+
+- **Phase 9 — Control Panel gap: "network statistics" not implemented.**
+  `pirewall.core.models.capture_stats.CaptureStatistics` (packet rate,
+  drops, malformed count — Phase 2) is never wired into
+  `pirewall.ipc.state.CoreStateStore`, the RPC protocol
+  (`pirewall.ipc.protocol.RpcOperation`), any API endpoint, or the control
+  panel (`pirewall.web.render.render_dashboard`). Nothing past
+  `PacketCapture.statistics()` itself exposes this data. This is a genuine
+  gap against spec §30/§50's "network statistics" Control Panel
+  requirement, found during this phase's reconciliation — not fixed here
+  per Phase 9's own non-goal ("do not add new subsystems... report, don't
+  improvise"). It's also entangled with the `pirewall/main.py` gap above:
+  there is no running capture loop yet to periodically produce a
+  `CaptureStatistics` snapshot from in the first place. **Recommended
+  follow-up scope** (small, isolated): add a `capture_stats:
+  CaptureStatistics | None` field to `CoreStateStore` +
+  `record_capture_stats()`, a `GET_CAPTURE_STATS` RPC operation, a
+  `GET /api/v1/capture-stats` endpoint (or fold into `/status`), and a
+  `_render_network_section` in `pirewall.web.render` — each piece mirrors
+  an existing equivalent (e.g. `list_events`/`/events`) closely enough to
+  copy the pattern directly once `pirewall/main.py` exists to call
+  `record_capture_stats()` periodically.
+
+- **Phase 9 — Control Panel gap: "detections" section not rendered.**
+  `GET /api/v1/detections` exists and is Tested, but
+  `pirewall.web.routes.dashboard` never calls `rpc_client.list_detections()`
+  and `render_dashboard` has no detections parameter/section — the raw
+  data is reachable via the JSON API but not visible in the HTML control
+  panel. Smaller and more contained than the network-statistics gap above
+  (no missing plumbing, just a missing render call) — not fixed here for
+  the same Phase 9 non-goal reason. **Recommended follow-up**: add a
+  `detections: list[DetectionRecord]` parameter to `render_dashboard`, a
+  `_render_detections_section` mirroring `_render_threats_section`'s
+  structure, and one extra `rpc_client.list_detections()` call in
+  `pirewall.web.routes.dashboard`.
+
+- **Phase 9 — real-hardware verification still required (ADDENDUM.md A1,
+  A4, A6), explicitly listed per this phase's own instructions:**
+  - **A6 fail-open crash behavior**: `FirewallManager.revert_to_base`'s
+    fail-open behavior (swallowing a `FirewallError` from the backend) is
+    Tested against `FakeFirewallBackend` configured to fail
+    (`tests/security/test_firewall_failure_handling.py`, Phase 9). The
+    *systemd*-level half — `pirewall-core.service` actually crashing for
+    real, the `Type=notify`/`WatchdogSec=30s` directives actually
+    triggering a restart, and `StartLimitBurst=3`/`StartLimitIntervalSec=300`
+    actually tripping a crash-loop stop — has never run on a real host.
+    **A human must**: install the real unit (once `pirewall/main.py`
+    exists and sends `sd_notify` heartbeats), deliberately crash the
+    process (e.g. `kill -SEGV`), and confirm systemd restarts it, then
+    repeat past the burst limit and confirm it lands in `failed` state
+    with `pirewall-api` still reachable and reporting "core is down."
+  - **A1 shadow-mode observation period**: the addendum's own recommended
+    path is "run in SHADOW for 1-2 weeks against real traffic, review the
+    shadow log, move to ASSISTED, then ACTIVE once you trust it." Nothing
+    in this repository can substitute for that real-traffic observation
+    window — it is inherently a real-deployment, real-time activity, not
+    a test. **A human must**: deploy with `enforcement_mode = "shadow"`
+    (the shipped default — do not change it), let it run against real
+    household traffic for at least 1-2 weeks, and review
+    `GET /api/v1/rules` (status `SHADOWED`) plus `GET /api/v1/events`
+    before ever setting `enforcement_mode` to `"assisted"` or `"active"`.
+  - **A4 socket permissions on a real filesystem**: the group-ownership/
+    `UMask` scheme (`deploy/systemd/README.md`) is design-documented and
+    statically asserted present in both `.service` files
+    (`tests/security/test_systemd_hardening.py`), but the actual resulting
+    file mode/ownership of `/run/pirewall/core.sock` has never been
+    observed on a real filesystem. **A human must**: after installing both
+    units on real hardware (post `pirewall/main.py`), run
+    `ls -l /run/pirewall/core.sock` and confirm it reads
+    `srw-rw---- pirewall-core pirewall-ipc` (or equivalent), then confirm
+    a process running as neither `pirewall-core` nor a member of
+    `pirewall-ipc` gets `Permission denied` connecting to it.

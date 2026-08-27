@@ -96,3 +96,31 @@ def test_missing_required_section_raises_configuration_error(tmp_path: Path) -> 
     config_file.write_text(broken, encoding="utf-8")
     with pytest.raises(ConfigurationError):
         load_config(config_file)
+
+
+def test_missing_tls_cert_path_raises_configuration_error(tmp_path: Path) -> None:
+    """spec §28/§29 TLS: a deployment with no certificate configured must fail loudly, not start."""
+    broken = MINIMAL_VALID_TOML.replace('tls_cert_path = "deploy/certificates/test.crt"\n', "")
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(broken, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="tls_cert_path"):
+        load_config(config_file)
+
+
+def test_missing_tls_key_path_raises_configuration_error(tmp_path: Path) -> None:
+    broken = MINIMAL_VALID_TOML.replace('tls_key_path = "deploy/certificates/test.key"\n', "")
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(broken, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="tls_key_path"):
+        load_config(config_file)
+
+
+def test_empty_tls_cert_path_raises_configuration_error(tmp_path: Path) -> None:
+    """An empty string is present-but-useless — must be rejected the same as missing entirely."""
+    broken = MINIMAL_VALID_TOML.replace(
+        'tls_cert_path = "deploy/certificates/test.crt"', 'tls_cert_path = ""'
+    )
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(broken, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="tls_cert_path"):
+        load_config(config_file)

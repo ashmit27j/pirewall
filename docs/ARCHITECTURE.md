@@ -1,5 +1,107 @@
 # pirewall — Architecture Notes
 
+## System pipeline (spec §51)
+
+The complete detection/enforcement pipeline, and the one separation the
+whole system must preserve — detection produces evidence, evidence is
+scored into a threat assessment, a decision is made, and only *then* does
+anything touch the firewall:
+
+```text
+                 NETWORK
+                    |
+                    v
+             PACKET CAPTURE           pirewall.capture (AFPacketCapture / FakePacketCapture)
+                    |
+                    v
+             FLOW AGGREGATION         pirewall.flow (FlowAggregator, bounded FlowTable)
+                    |
+                    v
+            FEATURE EXTRACTION        pirewall.features (one canonical extractor)
+                    |
+          +---------+---------+
+          |                   |
+          v                   v
+       LightGBM        Isolation Forest   pirewall.ml.inference, wrapped by
+          |                   |            pirewall.detection.{known_attack,anomaly}
+          +---------+---------+
+                    |
+                    v
+             BEHAVIOR ANALYSIS         pirewall.detection.behavior (deterministic, no ML)
+                    |
+                    v
+             THREAT ASSESSMENT         pirewall.engine.threat + pirewall.engine.scoring
+                    |
+                    v
+             FIREWALL DECISION         pirewall.engine.decision
+                    |
+                    v
+             CANDIDATE RULE            pirewall.firewall.generator
+                    |
+                    v
+             RULE VALIDATION           pirewall.firewall.validator (10-stage chain)
+                    |
+                    v
+             FIREWALL BACKEND          pirewall.firewall.manager (the ONE authorized caller)
+                    |
+                    v
+               NFTABLES                pirewall.firewall.backend.nftables / .fake
+                    |
+                    v
+             NETWORK TRAFFIC
+```
+
+Security events flow separately, out of every stage above that can emit
+one, to two independent consumers:
+
+```text
+Threat / Firewall / System Events
+       (pirewall.core.models.event.SecurityEvent)
+              |
+       +------+------+
+       |             |
+       v             v
+     Wazuh      Control Panel
+(pirewall.integration.wazuh)  (pirewall-api, via pirewall.ipc)
+```
+
+## Module boundaries and dependency direction
+
+Dependencies flow one direction only (`CLAUDE.md`) — no module lower in
+this list imports from a module higher up it:
+
+```text
+core.models / core.enums / core.exceptions   (no dependents flow backward into here)
+        |
+        v
+config                                        (validated settings, spec §37)
+        |
+        v
+capture  ->  flow  ->  features               (packet -> flow -> feature vector)
+        |
+        v
+ml  ->  detection                             (model artifacts -> evidence wrappers)
+        |
+        v
+engine                                        (scoring, threat assessment, decision)
+        |
+        v
+firewall                                      (generator, validator, manager, backend)
+        |
+        v
+ipc                                           (the ADDENDUM.md A4 process boundary)
+        |
+    +---+---+
+    |       |
+    v       v
+  api     web                                 (pirewall-api process — never imports
+                                                capture / firewall.manager / firewall.backend)
+```
+
+`integration` (Wazuh/Netdata forwarders, Phase 8) sits alongside `ipc`:
+it's fed `SecurityEvent`s/metrics snapshots from `pirewall-core`'s own
+state, and never calls into `firewall`/`capture` itself either.
+
 This file exists per `CLAUDE.md`'s dependency policy: "Anything else [beyond
 the allowed dependency list] — ask first, and say why here." It records
 places where a phase needed something beyond the base list, and why the

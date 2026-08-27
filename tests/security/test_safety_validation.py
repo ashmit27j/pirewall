@@ -66,6 +66,35 @@ def test_management_interface_direction_is_also_protected_as_source() -> None:
     assert status != RuleStatus.ACTIVE
 
 
+@pytest.mark.parametrize("enforcement_mode", [EnforcementMode.ACTIVE, EnforcementMode.ASSISTED])
+def test_pirewall_itself_can_never_be_locked_out(enforcement_mode: EnforcementMode) -> None:
+    """spec §24 "blocking pirewall itself" / "blocking management access".
+
+    The Pi's own LAN address is the server end of every management
+    connection and the default gateway for every LAN client. An audit found
+    the Admin-PC-IP check alone did not cover it.
+    """
+    config = make_config(
+        firewall={"enforcement_mode": enforcement_mode.value, "assisted_review_threshold": 0.0}
+    )
+    manager = FirewallManager(config, FakeFirewallBackend())
+    candidate = make_candidate(action=FirewallAction.BLOCK, destination="192.168.1.2/32", threat_score=100.0)
+
+    status = _submit(manager, candidate)
+
+    assert status != RuleStatus.ACTIVE
+    assert manager.active_rules() == []
+
+
+def test_upstream_gateway_can_never_be_blocked() -> None:
+    """Blocking the upstream gateway severs all internet access for the whole protected LAN."""
+    manager = _manager_in_active_mode()
+    candidate = make_candidate(action=FirewallAction.BLOCK, destination="192.168.1.1/32", threat_score=100.0)
+    status = _submit(manager, candidate)
+    assert status != RuleStatus.ACTIVE
+    assert manager.active_rules() == []
+
+
 def test_entire_protected_lan_can_never_be_blocked() -> None:
     manager = _manager_in_active_mode()
     candidate = make_candidate(action=FirewallAction.BLOCK, destination="192.168.1.0/24", threat_score=100.0)

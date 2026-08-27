@@ -17,6 +17,7 @@ wan_interface = "eth0"
 lan_interface = "eth1"
 protected_network = "192.0.2.0/24"
 upstream_gateway = "192.0.2.1"
+pirewall_lan_ip = "192.0.2.2"
 
 [capture]
 interface = "eth1"

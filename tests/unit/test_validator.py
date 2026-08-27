@@ -96,6 +96,43 @@ def test_safety_stage_rejects_admin_pc_as_source() -> None:
     _assert_rejected(outcome, "safety", RuleRejectionReason.UNSAFE)
 
 
+def test_safety_stage_rejects_pirewall_own_lan_ip_as_destination() -> None:
+    """spec §24 "blocking pirewall itself"/"management access" — the *server* end of management.
+
+    Regression test for an audit finding: the Admin-PC-IP check alone let
+    this through, because the Pi's own address is a different address from
+    the Admin PC's. Blocking it kills the control panel and every LAN
+    client's default gateway.
+    """
+    outcome = _validate(make_candidate(destination="192.168.1.2/32"))
+    _assert_rejected(outcome, "safety", RuleRejectionReason.UNSAFE)
+
+
+def test_safety_stage_rejects_pirewall_own_lan_ip_as_source() -> None:
+    outcome = _validate(make_candidate(source="192.168.1.2/32"))
+    _assert_rejected(outcome, "safety", RuleRejectionReason.UNSAFE)
+
+
+def test_safety_stage_rejects_upstream_gateway() -> None:
+    """spec §24 "blocking the entire internet" — a /32 on the gateway achieves exactly that.
+
+    Regression test for an audit finding: only the literal `0.0.0.0/0` rule
+    was rejected, so a /32 targeting the upstream gateway — which every
+    outbound packet transits — was approved.
+    """
+    _assert_rejected(_validate(make_candidate(source="192.168.1.1/32")), "safety", RuleRejectionReason.UNSAFE)
+    _assert_rejected(
+        _validate(make_candidate(destination="192.168.1.1/32")), "safety", RuleRejectionReason.UNSAFE
+    )
+
+
+def test_safety_stage_protects_critical_addresses_from_rate_limit_too() -> None:
+    """RATE_LIMIT is restrictive too — throttling the gateway or the Pi is still an outage."""
+    for target in ("192.168.1.1/32", "192.168.1.2/32"):
+        outcome = _validate(make_candidate(action=FirewallAction.RATE_LIMIT, destination=target))
+        _assert_rejected(outcome, "safety", RuleRejectionReason.UNSAFE)
+
+
 def test_safety_stage_rejects_whole_protected_lan() -> None:
     candidate = make_candidate(destination="192.168.1.0/24")  # the whole protected_network
     outcome = _validate(candidate)

@@ -8,13 +8,21 @@ chains them, short-circuiting on the first rejection. A rejected candidate
 is never silently dropped — the caller (`pirewall.firewall.manager`)
 records exactly which stage rejected it and why.
 
-**Open question this session resolved conservatively (see docs/PROGRESS.md
-"Open questions for the human"):** spec §24's safety stage also says
-"blocking pirewall itself" / "blocking management access", but v1's config
-has no distinct field for the Pi's own management address. Until a human
-adds one, this is folded into the existing Admin-PC-IP and whole-protected-
-LAN checks below, which already cover the concrete, testable scenarios spec
-§24 and this phase's test list actually enumerate.
+The safety stage protects four distinct addresses/ranges, each with its own
+independent check (spec §24): the Admin PC (`admin.admin_pc_ip`), pirewall
+itself and therefore management access (`network.pirewall_lan_ip`), the
+upstream gateway and therefore all internet reachability
+(`network.upstream_gateway`), and the protected LAN as a whole
+(`network.protected_network`), plus a minimum-prefix floor so no rule is
+broader than the single-flow evidence that generated it.
+
+An earlier phase folded "pirewall itself"/"management access" into the
+Admin-PC-IP check on the reasoning that management access *is* "reach the
+Pi from the Admin PC". A later audit found that insufficient — the Admin PC
+is the *client* end of that connection, so a rule targeting the Pi's own
+address (the *server* end, and every LAN client's default gateway) passed
+every check. `pirewall_lan_ip` and `upstream_gateway` now get their own
+checks; see docs/PROGRESS.md "Known deviations from spec".
 """
 
 from collections.abc import Callable, Sequence
@@ -139,6 +147,24 @@ def _validate_safety(candidate: CandidateRule, config: PirewallConfig) -> RuleRe
 
     admin_pc = IPv4Network(f"{config.admin.admin_pc_ip}/32")
     if candidate.source.overlaps(admin_pc) or candidate.destination.overlaps(admin_pc):
+        return RuleRejectionReason.UNSAFE
+
+    # spec §24 "blocking pirewall itself" / "blocking management access".
+    # Protecting the Admin PC's address alone is NOT sufficient: that's the
+    # *client* end of a management connection. A rule targeting the Pi's own
+    # LAN address — the *server* end, and every LAN client's default gateway
+    # — kills the control panel and all LAN routing while leaving
+    # `admin_pc_ip` untouched, so it needs its own independent check.
+    pirewall_self = IPv4Network(f"{config.network.pirewall_lan_ip}/32")
+    if candidate.source.overlaps(pirewall_self) or candidate.destination.overlaps(pirewall_self):
+        return RuleRejectionReason.UNSAFE
+
+    # spec §24 "blocking the entire internet". The `0.0.0.0/0` check below
+    # only catches the literal all-addresses rule; blocking the upstream
+    # gateway achieves the same outage with a /32, since every packet
+    # leaving the protected network transits it.
+    upstream = IPv4Network(f"{config.network.upstream_gateway}/32")
+    if candidate.source.overlaps(upstream) or candidate.destination.overlaps(upstream):
         return RuleRejectionReason.UNSAFE
 
     protected = config.network.protected_network

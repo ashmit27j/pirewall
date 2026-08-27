@@ -12,7 +12,12 @@
 wan_interface = "eth0"          # CHANGE_ME — placeholder only
 lan_interface = "eth1"          # CHANGE_ME — placeholder only
 protected_network = "192.0.2.0/24"   # CHANGE_ME — TEST-NET-1 placeholder, not a real LAN
-upstream_gateway = "192.0.2.1"       # CHANGE_ME — placeholder only
+upstream_gateway = "192.0.2.1"       # CHANGE_ME — the home router (WAN side of the Pi)
+# The Pi's OWN LAN-facing address: the default gateway LAN clients route
+# through, and the address the Admin PC reaches the control panel on.
+# Safety validation refuses to ever block this (spec §24 "never block
+# pirewall itself / management access"), so it must be accurate.
+pirewall_lan_ip = "192.0.2.2"        # CHANGE_ME — placeholder only
 
 [capture]
 interface = "eth1"              # CHANGE_ME — must match the interface facing the protected LAN

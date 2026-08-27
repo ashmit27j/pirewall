@@ -24,6 +24,16 @@ class NetworkConfig(PirewallModel):
     protected_network: IPv4Network
     upstream_gateway: IPv4Address
 
+    # The Pi's *own* LAN-facing address — the default gateway LAN clients
+    # route through, and the address the Admin PC reaches the control
+    # panel on. Distinct from `upstream_gateway` (the home router, on the
+    # WAN side) and from `admin.admin_pc_ip` (the client end of a
+    # management connection). Required, no default, because
+    # `pirewall.firewall.validator._validate_safety` needs a concrete value
+    # to satisfy spec §24's "never block pirewall itself / management
+    # access" — see docs/PROGRESS.md's resolution of that open question.
+    pirewall_lan_ip: IPv4Address
+
 
 class CaptureConfig(PirewallModel):
     """Packet capture tuning (spec §6)."""

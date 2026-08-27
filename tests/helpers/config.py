@@ -15,6 +15,7 @@ _BASE: dict[str, dict[str, object]] = {
         "lan_interface": "eth1",
         "protected_network": "192.168.1.0/24",
         "upstream_gateway": "192.168.1.1",
+        "pirewall_lan_ip": "192.168.1.2",
     },
     "capture": {"interface": "eth1"},
     "flow": {},

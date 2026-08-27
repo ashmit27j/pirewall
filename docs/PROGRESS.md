@@ -14,9 +14,44 @@ Environment-dependent / Not yet validated.
 | 4 | Dataset adapters, preprocessing & ML training (dev machine) | Complete (pipeline); model quality Environment-dependent | See detailed notes below. |
 | 5 | ML inference, behavior analysis & threat assessment | Complete | Tested: schema-mismatch refusal (model load-time and per-call), LightGBM/Isolation Forest loaders+predictors against real (placeholder) trained artifacts, `KnownEvidence`/`AnomalyEvidence` wrappers, deterministic behavior analysis (port-scan/SYN-flood-like/repeated-connection scenarios + bounded-state flood test to 5000 sources), scoring (hand-computed cases), and `ThreatAssessment` (determinism, explainability, level thresholds). 32 new tests (225 total). Environment-dependent: actual detection *accuracy* against real attacks — needs the spec §34 attack-lab exercise against a real-data-trained model, not this session's synthetic-fixture placeholder. ruff clean, pyright --strict clean (109 files). |
 | 6 | Firewall decision, rule generation, validation & nftables backend | Complete | Tested: decision engine (threat-level -> action ladder), candidate generator (narrowest-possible /32 rules, ALLOW produces none), the full 10-stage validation chain in ADDENDUM.md order (schema/network/allowlist/safety/conflict/duplicate/rate-cap/priority/expiration/authorization — each independently tested, plus end-to-end via `FirewallManager`+`FakeFirewallBackend`), SHADOW/ASSISTED/kill-switch lifecycle branching, and backend-isolation + injection-safety security tests. 62 new tests (289 total). Environment-dependent: `NftablesBackend` against a real `nft` binary/ruleset — implemented via nft's JSON interface (spec §20) but requires a real Linux host, root/`CAP_NET_ADMIN`, and `nft` itself to exercise; a human must verify table/chain bootstrap, rule translation, and removal on the target Pi. |
-| 7 | API, auth, security events & control panel | Complete | Tested: auth (password hashing/verification, sessions, Admin-PC-IP restriction), the full RPC dispatcher (every operation via `LoopbackRpcClient`), every API endpoint end-to-end via `TestClient` (login, admin-pc restriction, session enforcement, rules disable/remove/approve/reject, allowlist CRUD, kill-switch, route-surface enumeration), the control panel's HTML rendering (every spec §30 section + addendum sections, XSS-escaping, empty-state handling), and both A4 import-isolation checks (`pirewall/api/`, `pirewall/web/` never import capture/firewall.manager/firewall.backend). 53 new tests (344 total). Environment-dependent: `UnixSocketRpcServer`/`UnixSocketRpcClient` against a real `AF_UNIX` socket, and TLS with real certificates — both require a real Linux host (`socket.AF_UNIX` doesn't exist on this Windows dev machine) and are unverified here; `LoopbackRpcClient` exercises the exact same `CoreRpcDispatcher` logic in-process for everything else. See docs/ARCHITECTURE.md for the dependency decisions this phase made (stdlib `scrypt` over bcrypt/argon2, opaque tokens over JWT, hand-rolled HTML over Jinja2, uvicorn/httpx as FastAPI companions). |
+| 7 | API, auth, security events & control panel | Complete | Tested: auth (password hashing/verification, sessions, Admin-PC-IP restriction), the full RPC dispatcher (every operation via `LoopbackRpcClient`), every API endpoint end-to-end via `TestClient` (login, admin-pc restriction, session enforcement, rules disable/remove/approve/reject, allowlist CRUD, kill-switch, route-surface enumeration), the control panel's HTML rendering (every spec §30 section + addendum sections, XSS-escaping, empty-state handling), and both A4 import-isolation checks (`pirewall/api/`, `pirewall/web/` never import capture/firewall.manager/firewall.backend). 53 new tests (344 total). Environment-dependent *as originally written*: `UnixSocketRpcServer`/`UnixSocketRpcClient` against a real `AF_UNIX` socket, and TLS with real certificates. **The socket half was upgraded to Tested by the post-Phase-9 audit pass** — `AF_UNIX` is absent only on Windows (where that label was written), not on macOS/Linux, so the real transport is now exercised by `tests/integration/test_rpc_unix_socket.py`. TLS with real certificates remains Environment-dependent; `LoopbackRpcClient` exercises the exact same `CoreRpcDispatcher` logic in-process for everything else. See docs/ARCHITECTURE.md for the dependency decisions this phase made (stdlib `scrypt` over bcrypt/argon2, opaque tokens over JWT, hand-rolled HTML over Jinja2, uvicorn/httpx as FastAPI companions). |
 | 8 | Raspberry Pi hardening, deployment & integrations (Wazuh/Netdata) | Complete | See detailed notes below. |
 | 9 | Security/integration testing, docs & final validation | Complete | See detailed notes below. |
+
+### Audit pass (post-Phase 9)
+
+A full audit-and-fix pass over the completed repository, treating the
+claims in this file as things to verify rather than facts. Ran on macOS
+(the same environment constraint as Phase 8/9 — still not Linux, so
+`AF_PACKET`/`nft`/systemd remain unverifiable). Seven defects found and
+fixed, each with a regression test verified to fail against the pre-fix
+commit:
+
+| # | Defect | Severity |
+|---|--------|----------|
+| 1 | Blocking `upstream_gateway` passed validation — severs all internet for the whole LAN (spec §24) | High |
+| 2 | Blocking the Pi's own LAN address passed validation — kills management access and every client's default gateway (spec §24) | High |
+| 3 | RPC socket mode was umask-derived — a default `0o022` umask made it world-connectable, exposing every privileged RPC operation to any local user (ADDENDUM.md A4) | High |
+| 4 | `pirewall.firewall.manager` was transitively loaded into the pirewall-api process via `pirewall/ipc/__init__.py` (ADDENDUM.md A4) | Medium |
+| 5 | RPC socket directory created non-traversable (`0o640`) under the very umask `pirewall-core.service` sets | Medium |
+| 6 | Control-panel ids interpolated into inline JS handlers; `html.escape` does not make that safe (latent, not reachable with uuid4 ids) | Medium |
+| 7 | `RpcError` escaped as an unhandled HTTP 500, so the control panel could not report a down core — contradicting ADDENDUM.md A6 | Medium |
+
+Findings 1 and 2 resolve the long-standing "pirewall itself / management
+access" open question (see below). Findings 3–5 were found by testing the
+`AF_UNIX` transport for real for the first time, which also upgraded that
+transport's own label from Environment-dependent to Tested.
+
+Also verified and found sound, with no change needed: no `subprocess`
+usage outside `NftablesBackend` and no `shell=True`/`os.system`/`eval`
+anywhere; `Any` confined to the IPC envelope with justifications; no
+circular imports; no secrets committed and `.gitignore` effective; the ML
+schema-compatibility gate genuinely covers both load paths and both
+inference paths; `enforce_admin_pc_ip` fails closed on a missing or
+unknown client host; login compares username and password without
+short-circuiting. Test quality was spot-checked for assertion-free tests —
+the apparent hits all delegate to `pytest.raises` or a shared
+`_assert_rejected` helper.
 
 ### Phase 4 details
 
@@ -255,7 +290,7 @@ you go since they land across several phases.
 | A1 Shadow / dry-run enforcement mode | Implemented + Tested (Phase 6); real multi-week observation Environment-dependent (Phase 9) | `FirewallManager` branches on `EnforcementMode.SHADOW`: an otherwise-approved candidate becomes `RuleStatus.SHADOWED`, never reaches the backend, and produces a "[shadow mode] would have ..." `SecurityEvent`. Phase 9: the addendum's own recommended 1-2 week real-traffic observation window before moving to ASSISTED/ACTIVE is inherently not something this repository's tests can substitute for — see "Open questions for the human." |
 | A2 Static allowlist (outranks adaptive rules) | Implemented + Tested (Phase 6, 7) | Phase 6: validator stage as previously noted. Phase 7: `GET/POST/DELETE /api/v1/allowlist`, admin-only, control-panel section with add/remove — tested end-to-end via `TestClient`. |
 | A3 Rate cap on rule creation | Implemented + Tested (Phase 6, 8) | `RuleCreationRateLimiter` (fixed window) backs the `rate_cap` validator stage; rejects with `RuleRejectionReason.RATE_LIMITED` once the window's budget is spent. Detection/`SecurityEvent` generation is untouched by the cap (the cap only ever runs after a `ThreatAssessment`/`FirewallDecision` already exist). Phase 8: `pirewall.core.models.metrics.NetdataMetricsSnapshot` adds `adaptive_rule_creation_rate_per_window`/`adaptive_rule_budget_fraction`, exported by `pirewall.integration.netdata` (payload shaping tested) — no live collector loop populates a snapshot from the real rate limiter yet, see Phase 8's "known gap" note above. |
-| A4 Privileged/unprivileged process split | Implemented + Tested (pipeline); real transport and real two-process deployment Environment-dependent (Phase 7, 8) | Typed RPC protocol (`pirewall.ipc`): `CoreRpcDispatcher` (all 16 operations, fully unit-tested), `UnixSocketRpcServer`/`UnixSocketRpcClient` (real Linux `AF_UNIX` transport; this session's dev machine is macOS, not Linux, so this remains unexercised at runtime — `pyright`'s `pythonPlatform=Linux` pin only confirms it type-checks, not that it works), `LoopbackRpcClient` (in-process test double). `pirewall/api/`+`pirewall/web/` proven to never import `pirewall.capture`/`firewall.manager`/`firewall.backend` via an AST-based import-graph test. Phase 8: `deploy/systemd/pirewall-core.service`/`pirewall-api.service` implement the actual two-process deployment (dedicated users, `pirewall-core`'s primary group is the shared `pirewall-ipc` group + `UMask=0117` for the socket, `pirewall-api` only a supplementary member with an explicitly empty `CapabilityBoundingSet=`/`AmbientCapabilities=`) — static structure Tested (`tests/security/test_systemd_hardening.py`), real installation/enforcement Environment-dependent. Both units' `ExecStart=` reference `pirewall.main`/`pirewall.api.__main__`, which don't exist yet (see Phase 8's "known gap" note). |
+| A4 Privileged/unprivileged process split | Implemented + Tested (pipeline); real transport and real two-process deployment Environment-dependent (Phase 7, 8) | Typed RPC protocol (`pirewall.ipc`): `CoreRpcDispatcher` (all 16 operations, fully unit-tested), `UnixSocketRpcServer`/`UnixSocketRpcClient` — **upgraded to Tested by the audit pass**: `AF_UNIX` exists on macOS (the earlier Environment-dependent label was written on Windows, where it does not), so `tests/integration/test_rpc_unix_socket.py` now exercises the real transport end to end — bind/connect/accept, request/response round-trip, malformed input both directions, and the socket's actual permission bits. `LoopbackRpcClient` (in-process test double). `pirewall/api/`+`pirewall/web/` proven to never import `pirewall.capture`/`firewall.manager`/`firewall.backend` via an AST-based import-graph test. Phase 8: `deploy/systemd/pirewall-core.service`/`pirewall-api.service` implement the actual two-process deployment (dedicated users, `pirewall-core`'s primary group is the shared `pirewall-ipc` group + `UMask=0117` for the socket, `pirewall-api` only a supplementary member with an explicitly empty `CapabilityBoundingSet=`/`AmbientCapabilities=`) — static structure Tested (`tests/security/test_systemd_hardening.py`), real installation/enforcement Environment-dependent. Both units' `ExecStart=` reference `pirewall.main`/`pirewall.api.__main__`, which don't exist yet (see Phase 8's "known gap" note). |
 | A5 IPv4-only v1 scope | Implemented + Tested (Phase 1, 2, 6) | Phases 1-2 as previously noted. Phase 6: the validator's `network` stage adds a belt-and-suspenders runtime check (tested via a `model_copy`-bypassed candidate, since the type system already makes a real IPv6 `CandidateRule` unconstructable). |
 | A6 Fail-open default + systemd watchdog | Implemented (Phase 1, 6 groundwork); watchdog directives Implemented + Tested (static), real enforcement Environment-dependent (Phase 8) | `FailureMode` enum, `failure.mode` config (default `fail_open`), `failure.watchdog_sec`/crash-loop fields. Phase 6: `revert_to_base()` explicitly fails open (backend removal errors are swallowed; the manager's own state still marks rules `REMOVED`). Phase 8: `deploy/systemd/pirewall-core.service` sets `Type=notify`+`WatchdogSec=30s`+`Restart=on-failure`+`StartLimitBurst=3`/`StartLimitIntervalSec=300`, matching `config.failure`'s defaults — asserted present by `tests/security/test_systemd_hardening.py`. Nothing in `pirewall/` yet actually calls `sd_notify` (no `pirewall/main.py` exists to do so — see Phase 8's "known gap" note), so the real crash-loop-detection *behavior* remains entirely Environment-dependent, not just the systemd config around it. Phase 9: added `tests/security/test_firewall_failure_handling.py`, proving the fail-open *state-transition* guarantee (backend removal errors swallowed, manager state still updates) end-to-end through the real `FirewallManager`, not just via `contextlib.suppress` code inspection — but the real-crash/real-watchdog half remains Environment-dependent, itemized in "Open questions for the human." |
 | A7 Assisted mode / BLOCK approval queue | Implemented + Tested (Phase 6, 7) | Phase 6: manager logic as previously noted. Phase 7: `POST /api/v1/rules/{id}/approve`/`/reject`, control-panel Approve/Reject buttons on `PENDING_APPROVAL` rules — tested end-to-end via `TestClient`. |
@@ -329,7 +364,7 @@ subsystems... report, don't improvise").
 - [x] authentication — Tested (Phase 7).
 - [x] TLS — Implemented (config fields, `min_tls_version`, Phase 1/7); real TLS termination Environment-dependent and additionally blocked on the not-yet-built `pirewall.api.__main__` entry point (see "Open questions" below).
 - [x] certificate support — Implemented + Tested at the config layer (required non-empty `tls_cert_path`/`tls_key_path`, Phase 9 added explicit missing/empty-path tests); real certificate loading Environment-dependent, same entry-point gap as TLS above.
-- [x] Admin PC restriction — Tested at both the application layer (Phase 7) and, statically, the network layer (`deploy/firewall/base.nft.template`'s `input` chain, Phase 8).
+- [x] Admin PC restriction — Tested at both the application layer (Phase 7; audit pass confirmed it fails closed on a missing/unknown client host) and, statically, the network layer (`deploy/firewall/base.nft.template`'s `input` chain, Phase 8).
 - [x] safe administrative operations — Tested (disable/remove/approve/reject/allowlist/kill-switch, every one routed through the single authorized `FirewallManager` path, Phase 7).
 
 ### Control Panel
@@ -344,7 +379,7 @@ subsystems... report, don't improvise").
 ### Integration
 - [x] Wazuh — Implemented + Tested (payload shaping, `pirewall.integration.wazuh`, Phase 8); real delivery to a real Wazuh agent Environment-dependent.
 - [x] Netdata/metrics — Implemented + Tested (payload shaping, `pirewall.integration.netdata`, Phase 8, including ADDENDUM.md A3's rule-rate metric); real delivery to a real Netdata instance Environment-dependent. No live collector loop exists yet to periodically build a `NetdataMetricsSnapshot` from running state — see "Open questions" below (same root cause as the `pirewall/main.py` gap).
-- [x] Admin PC communication — Implemented (Wazuh/Netdata forwarders above; the RPC socket between `pirewall-core`/`pirewall-api` is Admin-PC-facing indirectly via the control panel); real end-to-end Environment-dependent.
+- [x] Admin PC communication — Implemented (Wazuh/Netdata forwarders above). The RPC socket carrying it is now **Tested** against a real `AF_UNIX` socket including its permission bits (audit pass); real Wazuh/Netdata delivery remains Environment-dependent.
 
 ### Raspberry Pi Security
 - [x] least privilege — Implemented (`deploy/systemd/*.service` capability scoping, ADDENDUM.md A4, Phase 8); real enforcement Environment-dependent.
@@ -389,6 +424,54 @@ subsystems... report, don't improvise").
 - [x] Raspberry Pi hardening — Implemented (folded into `docs/SECURITY.md` rather than a separate file — spec §35 lists "Raspberry Pi hardening" as a documentation topic, not necessarily a separate filename, and `docs/SECURITY.md` §1 is entirely that topic).
 
 ## Known deviations from spec
+
+### Audit pass (post-Phase 9) — behavior changes
+
+An audit-and-fix pass over the completed repository changed behavior
+documented by earlier phases. Each item below supersedes what the
+referenced phase originally recorded.
+
+- **Phase 6 safety validation now has four independent address checks, not
+  two.** Previously: Admin PC, whole protected LAN, whole internet
+  (`0.0.0.0/0`), minimum prefix length. Two candidate rules were found that
+  passed the whole chain and should not have:
+  - a `/32` targeting `network.upstream_gateway` — every outbound packet
+    transits it, so blocking it is "blocking the entire internet" (spec
+    §24) achieved without ever matching `0.0.0.0/0`;
+  - a `/32` targeting the Pi's own LAN address — spec §24's "blocking
+    pirewall itself" and "blocking management access", which the
+    Admin-PC-IP check does not cover because the Admin PC is the client
+    end of a management connection, not the server end.
+  Both now have their own check. This **rejects candidate rules that
+  earlier phases would have deployed**; the affected targets are ones no
+  correct deployment should ever want blocked.
+- **`network.pirewall_lan_ip` is a new required config field.** The Pi's
+  own LAN address was not derivable from existing config (it differs from
+  `upstream_gateway`, which is the home router on the WAN side, and from
+  `admin_pc_ip`). Required with no default, following the existing
+  convention for security-relevant fields: a config missing it fails
+  loudly rather than silently losing a safety check. **Any config written
+  before this pass needs the field added.**
+- **`pirewall/ipc/__init__.py` re-exports nothing.** It previously
+  re-exported both halves of the RPC protocol, which pulled
+  `pirewall.firewall.manager` into the pirewall-api process transitively
+  (ADDENDUM.md A4 violation that the AST-based isolation test could not
+  see). Import from the specific submodule instead.
+- **The RPC socket's mode is set by the code, not the umask.**
+  `UnixSocketRpcServer.start()` now guarantees `0o660` and a traversable
+  `0o750` directory regardless of the caller's umask. Previously both were
+  umask-derived, which produced a world-connectable `0o755` socket under a
+  default `0o022` umask, and a non-traversable `0o640` directory under the
+  `0o117` umask `pirewall-core.service` itself sets.
+- **Control panel ids no longer reach inline JS handlers.** They travel in
+  `data-` attributes read by a delegated listener. `html.escape` is correct
+  for attribute values but not for JS string literals — the HTML parser
+  decodes `&#x27;` back to `'` before the JS engine parses an `onclick`,
+  so an id containing a quote escaped the string literal. Not reachable
+  with today's uuid4 ids; fixed as defence in depth.
+- **`RpcError` maps to HTTP 503 with a "core unreachable" page**, instead
+  of escaping as an unhandled 500. ADDENDUM.md A6 already claimed the
+  control panel could report a crash-looping core; it could not.
 
 List anything implemented differently than `docs/MASTER_SPEC.md` says, with
 the reason.
@@ -525,25 +608,20 @@ the reason.
 List anything Claude Code got stuck on or needs a decision on (e.g. real
 dataset file locations, Admin PC IP, actual WAN/LAN interface names).
 
-- **Phase 6 safety validation — "pirewall itself" / "management access":**
-  spec §24's safety stage lists four things a candidate rule must never be
-  able to block: pirewall itself, the Admin PC, management access, and the
-  entire protected LAN/internet. `config.admin.admin_pc_ip` and
-  `config.network.protected_network` give concrete values for two of the
-  four; there's no distinct config field for "the Pi's own management
-  address" or a general "management access" concept separate from the
-  Admin PC. **Provisional, conservative choice made this session:** folded
-  "pirewall itself" and "management access" into the existing Admin-PC-IP
-  and whole-protected-LAN checks, on the reasoning that in this
-  architecture management access to pirewall *is* "reach the Pi from the
-  Admin PC" (spec §29: administrative access is restricted to the Admin PC
-  IP), so protecting that IP already covers the concrete case. This passes
-  every safety scenario this phase's test list actually enumerates. If you
-  want a sharper, independent check (e.g. the Pi's own LAN-facing IP as a
-  separate field from the Admin PC, for a deployment where they differ),
-  add it to `AdminConfig` and extend `pirewall.firewall.validator._validate_safety`
-  accordingly — the validator-stage structure makes this a small, isolated
-  change.
+- ~~**Phase 6 safety validation — "pirewall itself" / "management
+  access"**~~ — **RESOLVED by the audit pass.** The provisional choice
+  (folding both into the Admin-PC-IP and whole-LAN checks) was
+  independently re-evaluated and found **insufficient**: the Admin PC is
+  the *client* end of a management connection, so a candidate rule
+  targeting the Pi's own LAN address — the *server* end, and every LAN
+  client's default gateway — left `admin_pc_ip` untouched and passed the
+  full chain. Verified by constructing the candidate and observing it
+  APPROVED. Fixed by adding a required `network.pirewall_lan_ip` config
+  field and an independent safety check for it. The same probe found a
+  second gap (the upstream gateway was blockable, severing all internet),
+  also fixed. See "Known deviations from spec" for both, and
+  `tests/unit/test_validator.py` /
+  `tests/security/test_safety_validation.py` for the regression tests.
 
 - **Phase 8 — `pirewall/main.py`/`pirewall/api/__main__.py` don't exist
   yet:** every deployment artifact this phase built (`deploy/systemd/*.service`,
@@ -624,14 +702,17 @@ dataset file locations, Admin PC IP, actual WAN/LAN interface names).
     household traffic for at least 1-2 weeks, and review
     `GET /api/v1/rules` (status `SHADOWED`) plus `GET /api/v1/events`
     before ever setting `enforcement_mode` to `"assisted"` or `"active"`.
-  - **A4 socket permissions on a real filesystem**: the group-ownership/
-    `UMask` scheme (`deploy/systemd/README.md`) is design-documented and
-    statically asserted present in both `.service` files
-    (`tests/security/test_systemd_hardening.py`), but the actual resulting
-    file mode/ownership of `/run/pirewall/core.sock` has never been
-    observed on a real filesystem. **A human must**: after installing both
-    units on real hardware (post `pirewall/main.py`), run
-    `ls -l /run/pirewall/core.sock` and confirm it reads
-    `srw-rw---- pirewall-core pirewall-ipc` (or equivalent), then confirm
+  - **A4 socket permissions on a real filesystem** — *partially resolved
+    by the audit pass.* The **mode** is no longer environment-dependent:
+    `UnixSocketRpcServer.start()` now sets it to `0o660` itself rather
+    than inheriting it from the process umask (the audit found a default
+    `0o022` umask produced a **world-connectable `0o755`** socket, exposing
+    every privileged RPC operation to any local user), and
+    `tests/integration/test_rpc_unix_socket.py` asserts it against a real
+    socket. What is still unverifiable here is **ownership**: which user
+    and group the socket belongs to comes from the deployment, not the
+    code. **A human must**: after installing both units on real hardware
+    (post `pirewall/main.py`), run `ls -l /run/pirewall/core.sock` and
+    confirm it reads `srw-rw---- pirewall-core pirewall-ipc`, then confirm
     a process running as neither `pirewall-core` nor a member of
     `pirewall-ipc` gets `Permission denied` connecting to it.

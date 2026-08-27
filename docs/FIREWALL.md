@@ -86,7 +86,7 @@ schema -> network -> allowlist -> safety -> conflict -> duplicate
 | `schema` | field-level validity beyond what Pydantic already guarantees (currently: a missing `threat_score`) |
 | `network` | source/destination aren't valid `IPv4Network`s (belt-and-suspenders — the type system already prevents this) |
 | `allowlist` | a `BLOCK`/`RATE_LIMIT` candidate targets a static `AllowlistEntry` (ADDENDUM.md A2) — **outranks everything below**, unconditionally |
-| `safety` | a `BLOCK`/`RATE_LIMIT` candidate would touch the Admin PC, the whole protected LAN, the whole internet (`0.0.0.0/0`), or is narrower than `firewall.min_rule_prefix_length` allows (spec §24 "never broader than the evidence") |
+| `safety` | a `BLOCK`/`RATE_LIMIT` candidate would touch any of five protected things — see below |
 | `conflict` | an active rule already covers the same target with a *different* action |
 | `duplicate` | an active rule already covers the exact same target *and* action |
 | `rate_cap` | the adaptive rule-creation budget for the current window is spent (ADDENDUM.md A3) — detection/`SecurityEvent` generation is untouched by this, only rule *creation* is capped |
@@ -96,6 +96,23 @@ schema -> network -> allowlist -> safety -> conflict -> duplicate
 
 A rejected candidate is never silently dropped: `FirewallManager` records
 which stage rejected it and why, and emits a `RULE_REJECTED` `SecurityEvent`.
+
+### What the safety stage protects (spec §24)
+
+Five independent checks, each keyed to a concrete config value, so a
+failure of any one is individually attributable:
+
+| Protected | Config field | Why |
+|---|---|---|
+| The Admin PC | `admin.admin_pc_ip` | The client end of every management connection. |
+| pirewall itself | `network.pirewall_lan_ip` | The *server* end of management, and every LAN client's default gateway. Protecting the Admin PC does not cover this — they are different addresses. |
+| Internet reachability | `network.upstream_gateway` | Every outbound packet transits it, so a `/32` here is "blocking the entire internet" without ever matching `0.0.0.0/0`. |
+| The protected LAN as a whole | `network.protected_network` | The LAN itself or any supernet of it. Blocking a single host *inside* it is still allowed — that's the point of the system. |
+| Anything broader than the evidence | `firewall.min_rule_prefix_length` | v1 only ever has single-flow evidence, so nothing wider should be needed; also catches the literal `0.0.0.0/0`. |
+
+The `pirewall_lan_ip` and `upstream_gateway` checks were added by a
+post-Phase-9 audit that found candidate rules targeting both were being
+approved. See `docs/PROGRESS.md` "Known deviations from spec".
 
 ## Enforcement mode branching (ADDENDUM.md A1, A7)
 

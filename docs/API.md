@@ -99,8 +99,10 @@ directly. Every route's `RpcClientDep` is one of:
 
 - `pirewall.ipc.client.UnixSocketRpcClient` — the real transport, talks to
   `pirewall.ipc.server.UnixSocketRpcServer` running inside `pirewall-core`
-  over `config.api.rpc_socket_path`. Linux-only (`socket.AF_UNIX`) —
-  **Environment-dependent**, see `docs/PROGRESS.md`.
+  over `config.api.rpc_socket_path`. Requires `socket.AF_UNIX` (absent on
+  Windows only) and is **Tested** end to end against a real socket by
+  `tests/integration/test_rpc_unix_socket.py`, including the socket's
+  permission bits.
 - `pirewall.ipc.loopback.LoopbackRpcClient` — an in-process test double
   calling `pirewall.ipc.dispatcher.CoreRpcDispatcher` directly, no socket
   at all. **Test-only** — never used in the real two-process deployment.
@@ -117,7 +119,6 @@ directly. Every route's `RpcClientDep` is one of:
   enforcement, every write endpoint, route-surface enumeration), control
   panel HTML rendering (every section, XSS-escaping, empty-state handling),
   both A4 import-isolation checks.
-- **Environment-dependent**: `UnixSocketRpcServer`/`UnixSocketRpcClient`
-  against a real `AF_UNIX` socket, and TLS with real certificates — both
-  require a real Linux host and are unverified in this repository's dev
-  environment.
+- **Environment-dependent**: TLS with real certificates, and the socket's
+  real *ownership* under systemd (its mode is code-guaranteed and tested).
+  Both need a real Linux host.

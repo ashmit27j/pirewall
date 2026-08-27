@@ -39,7 +39,7 @@ PacketCapture                          FirewallBackend
     |-- FakePacketCapture (test-only)      |-- FakeFirewallBackend (test-only)
 
 RpcClient (pirewall.ipc)
-    |-- UnixSocketRpcClient (real, AF_UNIX, Environment-dependent)
+    |-- UnixSocketRpcClient (real, AF_UNIX, Tested on any POSIX host)
     |-- LoopbackRpcClient (test-only, calls the dispatcher in-process)
 ```
 
@@ -57,14 +57,19 @@ implementation's behavior. It does **not** prove:
   promiscuous mode.
 - `NftablesBackend` actually bootstraps tables/chains and translates rules
   correctly against a real `nft` binary.
-- `UnixSocketRpcServer`/`Client` actually work over a real `AF_UNIX` socket
-  (this repository's dev environment may not even be Linux).
+- systemd actually applies the socket's *ownership* (`pirewall-core`
+  user, `pirewall-ipc` group). The socket's *mode* is guaranteed by
+  `UnixSocketRpcServer` itself and covered by
+  `tests/integration/test_rpc_unix_socket.py`, which exercises the real
+  `AF_UNIX` transport end to end — that part is no longer
+  Environment-dependent.
 - Real ML detection *accuracy* — `tests/ml/` trains tiny models on
   synthetic fixtures, not real attack traffic (see `docs/ML_PIPELINE.md`).
 - Anything about real systemd capability/namespace enforcement, real
-  socket file permissions, or real SSH/TLS hardening (`deploy/systemd/`,
+  socket file *ownership*, or real SSH/TLS hardening (`deploy/systemd/`,
   `deploy/firewall/`, `deploy/network/` are statically parsed by
-  `tests/security/`, never actually loaded/installed).
+  `tests/security/`, never actually loaded/installed). The socket's
+  *mode* is a separate matter and is tested — see above.
 
 Every one of these is labeled **Environment-dependent** in
 `docs/PROGRESS.md`, with the exact human verification step needed. Per

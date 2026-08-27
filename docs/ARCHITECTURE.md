@@ -130,9 +130,14 @@ are simpler, sufficient, and dependency-free.
 Spec §30 asks for "HTML, CSS, minimal JavaScript... not a large frontend
 framework." Jinja2 is the most common FastAPI templating pairing but isn't
 on the allowed list. `pirewall/web/render.py` builds pages as plain Python
-functions returning strings, escaping all dynamic content via stdlib
+functions returning strings, escaping dynamic content via stdlib
 `html.escape` — this is a real, if unglamorous, choice to stay within the
-dependency policy rather than reach for the default.
+dependency policy rather than reach for the default. Note the tradeoff it
+carries: a template engine applies context-aware escaping, and doing this
+by hand means getting the context right at each site. A post-Phase-9 audit
+found ids interpolated into inline `onclick` JS, where `html.escape` is
+not sufficient; values bound for JS now travel in `data-` attributes
+instead (see `pirewall/web/render.py`'s module docstring).
 
 ### `uvicorn` and `httpx` alongside FastAPI (Phase 7)
 
@@ -159,10 +164,10 @@ Unix domain socket using the typed request/response protocol in
   `pirewall.firewall.manager.FirewallManager`), pure Python, no networking,
   fully unit-testable.
 * `pirewall.ipc.server.UnixSocketRpcServer` — the real transport, runs
-  inside `pirewall-core`. Linux-only (`socket.AF_UNIX`); see
-  `docs/PROGRESS.md` for its Environment-dependent label.
+  inside `pirewall-core`. Requires `socket.AF_UNIX`; exercised against a
+  real socket by `tests/integration/test_rpc_unix_socket.py`.
 * `pirewall.ipc.client.UnixSocketRpcClient` — the real transport's client
-  half, runs inside `pirewall-api`. Same Environment-dependent label.
+  half, runs inside `pirewall-api`. Covered by the same tests.
 * `pirewall.ipc.loopback.LoopbackRpcClient` — an in-process test double
   implementing the same `RpcClient` Protocol by calling the dispatcher
   directly, no socket at all. **Test-only.** The real two-process

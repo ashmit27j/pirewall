@@ -59,6 +59,21 @@ Full detail in `docs/ADDENDUM.md`.
 | `docs/DEPLOYMENT.md` | Step-by-step real Raspberry Pi deployment. |
 | `docs/DEVELOPMENT_WORKFLOW.md` | The per-subsystem development loop this project follows. |
 
+## Platform support
+
+Three machines are involved, with different requirements:
+
+| Role | Platform | Notes |
+|---|---|---|
+| **Enforcement box** | Raspberry Pi 4, **64-bit** Raspberry Pi OS | 4 GB is comfortable — a full flow table measures ~93 MiB against a 768 MiB unit cap. arm64 is required: `numpy`/`scipy`/`scikit-learn`/`lightgbm` ship `aarch64` wheels but not 32-bit `armv7l`. |
+| **Admin PC** | Any Linux (Arch/Omarchy, Debian, Fedora…) | Runs Wazuh and Netdata and views the control panel. Both integrations are plain network protocols (TCP syslog, UDP StatsD), so nothing is distro-specific — see `docs/DEPLOYMENT.md` §8, which includes Arch notes since Wazuh has no official Arch package. |
+| **Development** | Linux or macOS | The full suite runs on both. The Linux-only modules (`AFPacketCapture`, `NftablesBackend`) import cleanly everywhere and are exercised through their `Fake` counterparts; the `AF_UNIX` RPC transport is genuinely tested on any POSIX host. Windows can run most of the suite but skips the socket tests. |
+
+**Python 3.12+ is required**, and on the Pi it must come from `uv`, not
+`apt`: Raspberry Pi OS Bookworm is Debian 12 and ships Python 3.11, with no
+`python3.12` package. `uv python install 3.12` fetches a standalone
+`aarch64` build. See `docs/DEPLOYMENT.md` §2.
+
 ## Getting started (development)
 
 ```sh

@@ -53,6 +53,61 @@ short-circuiting. Test quality was spot-checked for assertion-free tests —
 the apparent hits all delegate to `pytest.raises` or a shared
 `_assert_rejected` helper.
 
+### Target-platform compatibility pass
+
+Triggered by the operator confirming the deployment shape: enforcement on a
+**Pi 4 (4 GB)**, Admin PC on **Omarchy or another Linux distro**. Verified
+the project against those targets rather than assuming. Four defects found,
+all in deployment-critical paths, all verified against upstream sources
+rather than from memory:
+
+1. **Python 3.12 was uninstallable on the target OS.** `docs/DEPLOYMENT.md`
+   said `apt install python3.12`. Raspberry Pi OS Bookworm is Debian 12,
+   which ships **Python 3.11** and has no `python3.12` package — an
+   operator following the guide would stall at step 2. Relaxing
+   `requires-python` was not an option either: `numpy`/`scipy` publish
+   `aarch64` wheels only for cp312+. Fixed by installing the interpreter
+   through `uv` (verified: `python-build-standalone` publishes
+   `cpython-3.12.14-aarch64-unknown-linux-gnu`), which also makes the Pi
+   run the same interpreter version as development.
+2. **`integration.wazuh_port` defaulted to 1514, which cannot work.** 1514
+   is Wazuh's *agent connection service* (AES-encrypted,
+   enrollment-authenticated); `SyslogWazuhTransport` sends plain JSON
+   lines, so events would never be ingested — and a refused connection is
+   indistinguishable from "no events yet" from the Pi's side. Corrected to
+   **514**, Wazuh's remote syslog collector, with deployment notes that it
+   is disabled by default and must allow the Pi's IP.
+3. **The static-IP template targeted the wrong network stack.**
+   `deploy/network/dhcpcd-lan.conf.template` claimed dhcpcd was current for
+   "Bookworm and earlier". It is the reverse: Raspberry Pi OS switched to
+   **NetworkManager in Bookworm**, so dhcpcd applies to Bullseye and older.
+   Deployment now leads with `nmcli` (including `ipv4.never-default yes`,
+   so the LAN side does not steal the default route), and the template is
+   marked Bullseye-era.
+4. **Admin PC guidance assumed Debian-ish packaging.** Made distro-neutral,
+   with explicit Arch/Omarchy notes — Wazuh publishes no official Arch
+   package (AUR or the official container image), Netdata is in `pacman`.
+
+**Verified sound, no change needed:** every dependency (`lightgbm`,
+`scikit-learn`, `numpy`, `scipy`, `pydantic-core`) publishes `aarch64`
+manylinux wheels, so nothing compiles from source on the Pi — but this
+requires the **64-bit** image, now stated as a hard requirement. The
+Linux-only modules import cleanly on macOS, so development works on either
+platform.
+
+**Measured, not estimated** (dev machine; re-measure on the Pi):
+
+| Property | Measurement | Verdict for Pi 4 / 4 GB |
+|---|---|---|
+| Flow table at `max_flows=100000` | ~979 B/flow → **~93 MiB** | Comfortable inside `MemoryMax=768M` |
+| Isolation Forest, single-flow scoring | **~15.6 ms/call** (`n_estimators=100`) | ~64 flows/s here → est. **10–20 flows/s on a Pi 4** |
+| Isolation Forest, batch of 200 | **~0.088 ms/flow** | ~178× faster — the overhead is per-call, not tree traversal |
+
+The inference figure is a genuine throughput ceiling on the target
+hardware and is logged under "Open questions for the human" rather than
+fixed here, because batching changes the shape of the detection layer's
+inference call (new design work, not an audit fix).
+
 ### Phase 4 details
 
 Real CICIDS2017/UNSW-NB15 dataset files were **not found** on this machine
@@ -676,6 +731,34 @@ dataset file locations, Admin PC IP, actual WAN/LAN interface names).
   `_render_detections_section` mirroring `_render_threats_section`'s
   structure, and one extra `rpc_client.list_detections()` call in
   `pirewall.web.routes.dashboard`.
+
+- **Pi 4 anomaly-scoring throughput — needs a design decision.** Anomaly
+  detection scores **one flow per `IsolationForest.decision_function`
+  call**. Measured on the dev machine, that is ~15.6 ms/call at
+  `n_estimators=100`, versus ~0.088 ms/flow when the same forest scores a
+  batch of 200 — a ~178× gap that is almost entirely scikit-learn's fixed
+  per-call overhead, not tree traversal. Single-flow scoring therefore
+  tops out near 64 flows/s on a fast x86 laptop, so plausibly **10–20
+  flows/s on a Pi 4's Cortex-A72**. A busy household can exceed that, at
+  which point anomaly scoring becomes the pipeline bottleneck and flows
+  queue or get dropped. **Not fixed here** because the real remedy —
+  scoring flows in batches — changes the shape of
+  `pirewall.detection.anomaly.detect` and whatever main loop eventually
+  drives it, which is design work rather than an audit fix. Options, in
+  increasing order of effort:
+  1. Retrain with fewer trees (`n_estimators=25` measured ~4.3 ms/call,
+     3.6× better) and accept some detection-quality loss. Config-only.
+  2. Batch flows through inference — two orders of magnitude, and the
+     right long-term answer. Needs a buffering/flush policy, which
+     interacts with whatever `pirewall/main.py` ends up looking like.
+  3. Accept the ceiling for SHADOW-mode operation (A1), where falling
+     behind delays observation but enforces nothing, and revisit before
+     enabling ACTIVE.
+  Whichever you choose, `pirewall.inference_latency_ms` is already
+  exported to Netdata (spec §33), so the real figure is observable on the
+  Pi rather than needing to be guessed. **A human must** re-run
+  `scripts/diagnostics/performance_smoke.py` on the actual Pi before
+  enabling enforcement — every number above is x86.
 
 - **Phase 9 — real-hardware verification still required (ADDENDUM.md A1,
   A4, A6), explicitly listed per this phase's own instructions:**

@@ -32,14 +32,40 @@ of that.
 
 ## 2. Required packages
 
+**Use the 64-bit (arm64) Raspberry Pi OS image.** This is not optional:
+`numpy`, `scipy`, `scikit-learn`, and `lightgbm` publish prebuilt
+`manylinux` wheels for `aarch64` but not for 32-bit `armv7l`. On a 32-bit
+image pip would fall back to compiling them from source on the Pi, which
+takes hours and frequently fails for lack of RAM.
+
 ```sh
-sudo apt install nftables python3.12 python3.12-venv
+sudo apt update && sudo apt install nftables
 ```
 
-`nftables` (not `iptables`) is required — `pirewall.firewall.backend.nftables.NftablesBackend`
-talks to the `nft` binary directly via its JSON interface (spec §20).
-Install `uv` (https://docs.astral.sh/uv/) for dependency management, or use
-`pip`/`venv` directly against the pinned versions in `pyproject.toml`/`uv.lock`.
+`nftables` (not `iptables`) is required —
+`pirewall.firewall.backend.nftables.NftablesBackend` talks to the `nft`
+binary directly via its JSON interface (spec §20).
+
+### Python 3.12+ — do not use `apt` for this
+
+pirewall requires Python **3.12 or newer** (`pyproject.toml`), and the
+`numpy`/`scipy` versions it pins ship `aarch64` wheels only for CPython
+3.12+. Raspberry Pi OS Bookworm is Debian 12, which ships **Python 3.11**
+and has no `python3.12` package — `apt install python3.12` fails outright.
+
+Install `uv`, and let it manage the interpreter:
+
+```sh
+curl -LsSf https://astral.sh/uv/install.sh | sh   # aarch64 Linux build published upstream
+source "$HOME/.local/bin/env"
+uv python install 3.12                            # standalone build, no apt involved
+```
+
+This is the same mechanism used on the development machine, so the Pi runs
+the interpreter version the project is actually tested against rather than
+whatever the distro happens to ship. (If you are on a Trixie-based image,
+its system Python is 3.13 and would also satisfy the requirement — but
+using `uv`'s pinned interpreter everywhere keeps dev and Pi identical.)
 
 ## 3. Install pirewall
 
@@ -77,11 +103,25 @@ This writes substituted files to `deploy/rendered/` — review every one
 before applying it by hand:
 
 1. `sudo cp deploy/rendered/60-pirewall-forwarding.conf /etc/sysctl.d/60-pirewall-forwarding.conf && sudo sysctl --system`
-2. Edit `deploy/rendered/dhcpcd-lan.conf` to set the Pi's *own* address
-   within the protected network (the renderer fills in the network CIDR
-   as a reminder, not a specific host address — see the file's own
-   comment), then append it to `/etc/dhcpcd.conf` and restart networking
-   (or reboot).
+2. Give the LAN interface its static address — the value you set as
+   `network.pirewall_lan_ip`. **Raspberry Pi OS Bookworm and later use
+   NetworkManager**, so this is `nmcli`, not `/etc/dhcpcd.conf`:
+
+   ```sh
+   sudo nmcli con add type ethernet ifname "$LAN_IF" con-name pirewall-lan \
+       ipv4.method manual \
+       ipv4.addresses "$PIREWALL_LAN_IP/$PREFIX" \
+       ipv4.never-default yes          # the LAN side is not our default route
+   sudo nmcli con up pirewall-lan
+   ```
+
+   `ipv4.never-default yes` matters: the Pi's own default route must stay
+   on the WAN side (toward `network.upstream_gateway`). Leave the WAN
+   interface on DHCP from the home router unless your setup needs
+   otherwise. Verify with `ip addr show "$LAN_IF"` and `ip route`.
+
+   Only on Bullseye or older (which predate the NetworkManager switch) use
+   `deploy/rendered/dhcpcd-lan.conf`, appended to `/etc/dhcpcd.conf`.
 3. `sudo nft -c -f deploy/firewall/base.nft.template` to check syntax
    (note: this file has no config tokens needing rendering beyond what's
    already substituted the same way — confirm the rendered copy in
@@ -160,22 +200,105 @@ other host is refused): `curl -v https://<pi-lan-ip>:8443/api/v1/health`.
 
 ## 8. Admin PC-side Wazuh/Netdata configuration
 
-- **Wazuh**: install the Wazuh agent (or a syslog-compatible collector) on
-  the Admin PC, listening on `integration.wazuh_port` (default 1514).
-  `pirewall.integration.wazuh.SyslogWazuhTransport` sends one JSON line per
-  `SecurityEvent` over a TCP connection to `integration.wazuh_host:wazuh_port`.
-  Confirm events appear in Wazuh's event viewer after triggering a test
-  detection.
-- **Netdata**: install Netdata on the Admin PC with its StatsD collector
-  enabled, listening on `integration.netdata_port` (default 8125 — *not*
-  Netdata's 19999 dashboard port). `pirewall.integration.netdata.StatsdNetdataTransport`
+The Admin PC is any Linux box on the protected LAN — this repository
+assumes nothing about its distribution. Both integrations are plain network
+protocols (TCP syslog, UDP StatsD), so anything that speaks them works. The
+notes below flag where distro packaging differs, since an Arch-based Admin
+PC (Omarchy and friends) is a common choice and Wazuh does not publish
+official Arch packages.
+
+- **Wazuh** — pirewall is **not** a Wazuh agent and deliberately does not
+  install one (that would add another privileged daemon to the enforcement
+  box, against spec §45). It forwards to the Wazuh server's **remote
+  syslog collector**, which needs two things done explicitly:
+
+  1. **Use port 514, not 1514.** 1514 is the agent connection service,
+     which speaks Wazuh's AES-encrypted, enrollment-authenticated agent
+     protocol; plain JSON sent there is not ingested. `integration.wazuh_port`
+     now defaults to `514` for this reason.
+  2. **Enable the collector and allow the Pi.** It is disabled by default.
+     In the manager's `ossec.conf`:
+
+     ```xml
+     <remote>
+       <connection>syslog</connection>
+       <port>514</port>
+       <protocol>tcp</protocol>
+       <allowed-ips>PI_LAN_IP/32</allowed-ips>
+     </remote>
+     ```
+
+     then restart the manager. Without `allowed-ips` covering the Pi, the
+     connection is refused.
+
+  `pirewall.integration.wazuh.SyslogWazuhTransport` then sends one JSON
+  object per line per `SecurityEvent` to `wazuh_host:wazuh_port`. Confirm
+  events arrive after triggering a test detection — check the manager's
+  `archives.log`/alerts rather than assuming, since a silently refused
+  connection looks identical to "no events yet" from the Pi's side.
+
+  *On Arch/Omarchy*: Wazuh has no official Arch package; it is available
+  via AUR, or run the manager in Docker/Podman (the official
+  `wazuh/wazuh-manager` image), which sidesteps packaging entirely and is
+  the lower-maintenance option for a single-host lab. Either way, publish
+  514/tcp and apply the `<remote>` block above.
+
+- **Netdata**: enable its StatsD collector, listening on
+  `integration.netdata_port` (default 8125 — *not* Netdata's 19999
+  dashboard port). `pirewall.integration.netdata.StatsdNetdataTransport`
   sends one UDP StatsD gauge packet per metric to
   `integration.netdata_host:netdata_port`. Confirm the `pirewall.*` charts
   (see `pirewall.integration.netdata.snapshot_to_metrics` for the full
   metric list, including the ADDENDUM.md A3 adaptive-rule-rate metrics)
-  appear in Netdata's dashboard.
+  appear in the dashboard. Note StatsD is UDP and therefore silent on
+  failure — absence of charts is the only symptom of a wrong host/port.
+
+  *On Arch/Omarchy*: `pacman -S netdata` packages it directly, or use
+  Netdata's official kickstart script. StatsD is built in; no plugin
+  install is needed, only enabling it.
+
 - Set `integration.wazuh_enabled`/`integration.netdata_enabled = true` in
-  `config/local_config.toml` once both are confirmed reachable.
+  `config/local_config.toml` once both are confirmed reachable — they
+  default to `false` precisely so a misconfigured endpoint cannot cause
+  errors on a first deployment.
+
+## 8b. Raspberry Pi 4 (4 GB) sizing notes
+
+Measured on the development machine, not on a Pi — treat as budgeting
+input, and re-measure on the target with
+`scripts/diagnostics/performance_smoke.py` (spec §40, §46).
+
+**Memory — comfortable.** A full flow table at the default
+`flow.max_flows = 100000` measures ~93 MiB of Python objects (~979 bytes
+per tracked flow). Add the ML stack resident (numpy/scipy/scikit-learn/
+lightgbm, roughly 200–250 MiB) and the interpreter, and `pirewall-core`
+sits well inside the `MemoryMax=768M` its unit sets, which in turn leaves
+most of a 4 GB Pi free. `pirewall-api` is capped at 256M and does no
+packet-rate work. No tuning needed for 4 GB.
+
+**Inference throughput — the real constraint.** Anomaly scoring currently
+runs one flow per `IsolationForest.decision_function` call, and at
+`n_estimators=100` that measures ~15.6 ms/call on x86 — almost entirely
+scikit-learn's fixed per-call overhead, not tree traversal. The same
+forest scoring a batch of 200 costs ~0.088 ms/flow, a ~178× difference.
+
+That puts single-flow scoring at roughly 64 flows/sec on a fast x86
+laptop, so plausibly **~10–20 flows/sec on a Pi 4's Cortex-A72**. A busy
+household can complete more flows than that, in which case anomaly
+scoring becomes the pipeline's bottleneck. Mitigations, cheapest first:
+
+1. Retrain with fewer trees — `--n-estimators 25` measured ~4.3 ms/call,
+   a 3.6× improvement, at some detection-quality cost.
+2. Score flows in batches rather than one at a time. This is the real
+   fix (two orders of magnitude) but changes the shape of the detection
+   layer's inference call, so it is recorded as an open design item in
+   `docs/PROGRESS.md` rather than done implicitly.
+
+Neither is required for a **SHADOW**-mode first deployment (ADDENDUM.md
+A1), where falling behind delays observations but enforces nothing —
+which is another reason to run SHADOW for the recommended 1–2 weeks and
+watch `pirewall.inference_latency_ms` in Netdata before enabling
+enforcement.
 
 ## 9. Secure update procedure
 

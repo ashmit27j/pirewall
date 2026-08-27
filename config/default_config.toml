@@ -139,8 +139,14 @@ backup_count = 5
 
 [integration]
 wazuh_enabled = false
-wazuh_host = "CHANGE_ME"        # CHANGE_ME — Admin PC hostname/IP running Wazuh
-wazuh_port = 1514                # Wazuh agent syslog listener default
+wazuh_host = "CHANGE_ME"        # CHANGE_ME — Admin PC hostname/IP running the Wazuh server
+# Wazuh's *remote syslog collector*, not 1514. 1514 is the agent connection
+# service, which speaks Wazuh's own AES-encrypted, enrollment-authenticated
+# agent protocol — pirewall is not an agent and sends plain JSON lines, so
+# events pointed at 1514 never arrive. The 514 collector is DISABLED by
+# default in Wazuh and must be enabled with the Pi's IP allowed; see
+# docs/DEPLOYMENT.md §8.
+wazuh_port = 514
 netdata_enabled = false
 netdata_host = "CHANGE_ME"      # CHANGE_ME — Admin PC hostname/IP running Netdata
 netdata_port = 8125              # Netdata's StatsD listener default (not the 19999 dashboard port)

@@ -1,11 +1,15 @@
 # pirewall — static LAN interface configuration (spec §21)
 #
-# TEMPLATE — not applied automatically. Review, render (see README.md), and
-# append the block below to /etc/dhcpcd.conf on Raspberry Pi OS releases
-# that still use dhcpcd (Bookworm and earlier). If your image uses
-# NetworkManager instead, use `nmcli con add ... ipv4.addresses
-# <pi-lan-ip>/<prefix-length>` with the same values — do not mix the two
-# network managers.
+# TEMPLATE — not applied automatically, and on a current Raspberry Pi OS it
+# is NOT the file you want.
+#
+# Raspberry Pi OS switched to NetworkManager in **Bookworm**; dhcpcd is only
+# the default on **Bullseye and earlier**. On Bookworm or later, configure
+# the LAN interface with `nmcli` instead — see docs/DEPLOYMENT.md §4 step 2
+# for the exact command. Do not mix the two network managers.
+#
+# This template is kept for Bullseye-era deployments. Review, render (see
+# README.md), and append the block below to /etc/dhcpcd.conf.
 #
 # This gives the Pi's LAN-facing interface a static address inside the
 # protected network so it acts as that network's gateway. The WAN-facing

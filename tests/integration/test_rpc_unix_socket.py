@@ -61,8 +61,14 @@ def socket_dir() -> Iterator[Path]:
     pytest's `tmp_path` (which embeds the test name) blows past that — a
     plain `tmp_path` fixture here fails with a bare EACCES/ENAMETOOLONG
     that looks nothing like a path-length problem.
+
+    Prefers `/tmp` (short on both Linux and macOS, unlike macOS's default
+    `$TMPDIR` under `/var/folders/...`) but falls back to the platform
+    default if it is absent, rather than hardcoding a path that may not
+    exist.
     """
-    with tempfile.TemporaryDirectory(dir="/tmp", prefix="pw") as directory:
+    base = "/tmp" if Path("/tmp").is_dir() else None
+    with tempfile.TemporaryDirectory(dir=base, prefix="pw") as directory:
         yield Path(directory)
 
 

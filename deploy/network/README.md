@@ -12,7 +12,7 @@ substituted files to `deploy/rendered/` — it never applies anything).
 | File | Purpose | Applied via |
 |------|---------|--------------|
 | `60-pirewall-forwarding.conf.template` | Enables IPv4 forwarding (ADDENDUM.md A5 — IPv4-only for v1; IPv6 forwarding is deliberately left disabled) | `/etc/sysctl.d/60-pirewall-forwarding.conf` + `sysctl --system` |
-| `dhcpcd-lan.conf.template` | Static IP configuration for the LAN-facing interface | appended to `/etc/dhcpcd.conf` (or the equivalent for your network manager — see below) |
+| `dhcpcd-lan.conf.template` | Static IP for the LAN interface, **Bullseye and older only** | appended to `/etc/dhcpcd.conf`. Raspberry Pi OS Bookworm+ uses NetworkManager — use `nmcli` instead, see `docs/DEPLOYMENT.md` §4 step 2 |
 | `nat-masquerade.nft.template` | NAT/masquerading so protected-LAN clients can reach the WAN | loaded via `nft -f` into its own table, separate from `deploy/firewall/base.nft.template` and the `pirewall`/`adaptive` table `pirewall.firewall.backend.nftables.NftablesBackend` manages at runtime |
 
 ## Placeholders
@@ -44,10 +44,12 @@ applying it by hand on the Pi.
 
 1. Confirm `network.wan_interface`/`network.lan_interface` in your config
    actually match `ip link show` on the target hardware — do not guess.
-2. Apply `60-pirewall-forwarding.conf` (sysctl), then `dhcpcd-lan.conf` (or
-   your network manager's equivalent static-IP config), then reboot or
-   restart networking to confirm the LAN interface comes up with the
-   expected static address.
+2. Apply `60-pirewall-forwarding.conf` (sysctl), then give the LAN
+   interface its static address — `nmcli` on Bookworm and later,
+   `dhcpcd-lan.conf` only on Bullseye and older (see the table above).
+   Restart networking or reboot, then confirm the LAN interface came up
+   with the expected address and that the default route still points at
+   `upstream_gateway` on the WAN side.
 3. Load `deploy/firewall/base.nft.template` (see that directory's README)
    **before** `nat-masquerade.nft.template` — the base ruleset's
    deny-by-default forwarding posture should exist before NAT starts

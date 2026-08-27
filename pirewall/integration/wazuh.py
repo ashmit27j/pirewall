@@ -5,12 +5,26 @@ a structured JSON payload and hands it to a `WazuhTransport`. It never
 stores, queries, correlates, or retains events itself — `CoreStateStore`
 already holds the bounded recent-history buffer pirewall itself needs.
 
-`SyslogWazuhTransport` speaks RFC 5424-ish syslog over TCP to the Wazuh
-agent's syslog collector, the standard way to feed Wazuh from a
-non-agent-installed source. It requires a real Wazuh agent listening on the
-Admin PC and is therefore **Environment-dependent** — see
-`docs/PROGRESS.md`. `pirewall.integration.fake.FakeWazuhTransport` exercises
-`WazuhForwarder`'s payload shaping without any real network I/O.
+`SyslogWazuhTransport` sends one JSON object per line over a TCP connection
+to the Wazuh server's **remote syslog collector** — the standard way to
+feed Wazuh from a source that isn't running a Wazuh agent, which pirewall
+deliberately isn't (installing an agent on the enforcement box would add
+another privileged daemon to the very host spec §45 is trying to keep
+minimal).
+
+Two things about that collector are easy to get wrong, both covered in
+`docs/DEPLOYMENT.md` §8:
+
+* Its port is **514**, not 1514. Port 1514 is the *agent connection
+  service*, which speaks Wazuh's own AES-encrypted, enrollment-
+  authenticated protocol; plain JSON sent there is not ingested.
+* It is **disabled by default** in Wazuh and must be explicitly enabled
+  with the Pi's address allowed, or the connection is refused.
+
+End-to-end delivery into a real Wazuh instance is therefore
+**Environment-dependent** and unverified here — see `docs/PROGRESS.md`.
+What is Tested is the payload shaping, via
+`pirewall.integration.fake.FakeWazuhTransport`.
 """
 
 import json
@@ -88,9 +102,10 @@ class SyslogWazuhTransport:
 
     Opens and closes a connection per message rather than holding one open —
     pirewall-core emits events at human-scale, not high-frequency-trading
-    scale, so simplicity wins over connection reuse here. Requires a real
-    Wazuh agent/forwarder listening at `host:port` on the Admin PC —
-    **Environment-dependent**, cannot be exercised on a dev machine.
+    scale, so simplicity wins over connection reuse here. Requires Wazuh's
+    remote syslog collector (port 514, disabled by default) listening at
+    `host:port` — **Environment-dependent**, cannot be exercised on a dev
+    machine. See this module's docstring and `docs/DEPLOYMENT.md` §8.
     """
 
     def __init__(self, host: str, port: int, *, timeout_seconds: float = 5.0) -> None:

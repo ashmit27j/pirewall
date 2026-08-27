@@ -83,6 +83,13 @@ rate_window_seconds = 60                 # A3 — window the cap above applies o
 default_rule_ttl_seconds = 3600
 max_active_rules = 500
 
+# spec §24 — no v1 candidate rule (single-flow evidence only) should ever
+# need to be broader than this; the safety validator rejects anything wider.
+min_rule_prefix_length = 24
+
+# Packets/second allowed through a RATE_LIMIT rule before excess is dropped.
+rate_limit_per_second = 10
+
 # A2 — static allowlist. Adaptive BLOCK/RATE_LIMIT rules can never target
 # these entries, regardless of threat score or enforcement mode. Empty by
 # default; add entries for devices that must never be adaptively blocked

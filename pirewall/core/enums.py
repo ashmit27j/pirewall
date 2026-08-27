@@ -132,6 +132,21 @@ class ModelType(StrEnum):
     ISOLATION_FOREST = "isolation_forest"
 
 
+class RuleRejectionReason(StrEnum):
+    """Why `pirewall.firewall.validator` rejected a `CandidateRule` (spec §24)."""
+
+    INVALID_SCHEMA = "invalid_schema"
+    INVALID_NETWORK = "invalid_network"
+    ALLOWLISTED = "allowlisted"
+    UNSAFE = "unsafe"
+    CONFLICT = "conflict"
+    DUPLICATE = "duplicate"
+    RATE_LIMITED = "rate_limited"
+    SHADOWED = "shadowed"
+    MISSING_EXPIRATION = "missing_expiration"
+    UNAUTHORIZED = "unauthorized"
+
+
 class AddressFamily(StrEnum):
     """IP address family of a parsed packet (spec §7).
 

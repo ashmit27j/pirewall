@@ -136,6 +136,16 @@ class FirewallConfig(PirewallModel):
     max_active_rules: int = Field(default=500, gt=0)
     allowlist: tuple[AllowlistEntry, ...] = Field(default_factory=tuple)
 
+    # spec §24 "reject any rule broader than the evidence that generated
+    # it": v1's adaptive pipeline only ever has single-flow evidence, so no
+    # legitimate candidate should need to target anything broader than
+    # this prefix length. Checked in the safety validation stage.
+    min_rule_prefix_length: int = Field(default=24, ge=0, le=32)
+
+    # Packets/second allowed through before a RATE_LIMIT rule starts
+    # dropping (pirewall.firewall.backend.nftables).
+    rate_limit_per_second: int = Field(default=10, gt=0)
+
 
 class APIConfig(PirewallModel):
     """FastAPI network/TLS configuration (spec §28, §29)."""

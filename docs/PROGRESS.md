@@ -13,7 +13,7 @@ Environment-dependent / Not yet validated.
 | 3 | Flow aggregation & feature extraction | Complete | Tested: flow-key bidirectional normalization, `FlowState` accumulation (forward/backward attribution, TCP flag counts, `RunningStats` for packet-size/inter-arrival, bounded-memory per flow), `FlowTable` LRU eviction (flood-tested to 5000 flows against a 100-flow cap), active/inactive timeout + TCP FIN/RST completion, `FlowAggregator` end-to-end (including IPv6 packets never entering the table — ADDENDUM.md A5), and the canonical feature schema/extractor (determinism, schema versioning, zero-division guards). 40 new tests (168 total). ruff clean, pyright --strict clean (76 files). |
 | 4 | Dataset adapters, preprocessing & ML training (dev machine) | Complete (pipeline); model quality Environment-dependent | See detailed notes below. |
 | 5 | ML inference, behavior analysis & threat assessment | Complete | Tested: schema-mismatch refusal (model load-time and per-call), LightGBM/Isolation Forest loaders+predictors against real (placeholder) trained artifacts, `KnownEvidence`/`AnomalyEvidence` wrappers, deterministic behavior analysis (port-scan/SYN-flood-like/repeated-connection scenarios + bounded-state flood test to 5000 sources), scoring (hand-computed cases), and `ThreatAssessment` (determinism, explainability, level thresholds). 32 new tests (225 total). Environment-dependent: actual detection *accuracy* against real attacks — needs the spec §34 attack-lab exercise against a real-data-trained model, not this session's synthetic-fixture placeholder. ruff clean, pyright --strict clean (109 files). |
-| 6 | Firewall decision, rule generation, validation & nftables backend | Not started | |
+| 6 | Firewall decision, rule generation, validation & nftables backend | Complete | Tested: decision engine (threat-level -> action ladder), candidate generator (narrowest-possible /32 rules, ALLOW produces none), the full 10-stage validation chain in ADDENDUM.md order (schema/network/allowlist/safety/conflict/duplicate/rate-cap/priority/expiration/authorization — each independently tested, plus end-to-end via `FirewallManager`+`FakeFirewallBackend`), SHADOW/ASSISTED/kill-switch lifecycle branching, and backend-isolation + injection-safety security tests. 62 new tests (289 total). Environment-dependent: `NftablesBackend` against a real `nft` binary/ruleset — implemented via nft's JSON interface (spec §20) but requires a real Linux host, root/`CAP_NET_ADMIN`, and `nft` itself to exercise; a human must verify table/chain bootstrap, rule translation, and removal on the target Pi. |
 | 7 | API, auth, security events & control panel | Not started | |
 | 8 | Raspberry Pi hardening, deployment & integrations (Wazuh/Netdata) | Not started | |
 | 9 | Security/integration testing, docs & final validation | Not started | |
@@ -69,14 +69,14 @@ you go since they land across several phases.
 
 | Item | Status | Notes |
 |------|--------|-------|
-| A1 Shadow / dry-run enforcement mode | Implemented (Phase 1 groundwork) | `EnforcementMode` enum, `RuleStatus.SHADOWED`, `firewall.enforcement_mode` config (default `shadow`). Manager branching is Phase 6. |
-| A2 Static allowlist (outranks adaptive rules) | Implemented (Phase 1 groundwork) | `AllowlistEntry` model, `firewall.allowlist` config (seed, empty by default). Validator stage + storage is Phase 6. |
-| A3 Rate cap on rule creation | Implemented (Phase 1 groundwork) | `firewall.max_adaptive_rules_per_window` / `rate_window_seconds` config fields. Validator stage + counter state is Phase 6. |
+| A1 Shadow / dry-run enforcement mode | Implemented + Tested (Phase 6) | `FirewallManager` branches on `EnforcementMode.SHADOW`: an otherwise-approved candidate becomes `RuleStatus.SHADOWED`, never reaches the backend, and produces a "[shadow mode] would have ..." `SecurityEvent`. |
+| A2 Static allowlist (outranks adaptive rules) | Implemented + Tested (Phase 6) | Dedicated validator stage (`pirewall.firewall.validator`) rejects any BLOCK/RATE_LIMIT candidate matching an `AllowlistEntry`, checked before safety, regardless of threat score — tested including a `CRITICAL`-score attempt. |
+| A3 Rate cap on rule creation | Implemented + Tested (Phase 6) | `RuleCreationRateLimiter` (fixed window) backs the `rate_cap` validator stage; rejects with `RuleRejectionReason.RATE_LIMITED` once the window's budget is spent. Detection/`SecurityEvent` generation is untouched by the cap (the cap only ever runs after a `ThreatAssessment`/`FirewallDecision` already exist). |
 | A4 Privileged/unprivileged process split | Not started | Socket protocol is Phase 7; systemd units are Phase 8. |
-| A5 IPv4-only v1 scope | Implemented (Phase 1+2) | Phase 1: `Flow`, `CandidateRule`/`FirewallRule`, `AllowlistEntry`, `BehaviorAssessment`, `ThreatAssessment` all use `IPv4Address`/`IPv4Network` fields — an IPv6 value cannot be constructed at all. Phase 2: parser fully decodes both IPv4 and IPv6 (`PacketMetadata.address_family` tags which), so Phase 3's flow aggregator can filter IPv6 out before it ever reaches the adaptive pipeline. |
-| A6 Fail-open default + systemd watchdog | Implemented (Phase 1 groundwork) | `FailureMode` enum, `failure.mode` config (default `fail_open`), `failure.watchdog_sec`/crash-loop fields. Watchdog wiring is Phase 8. |
-| A7 Assisted mode / BLOCK approval queue | Implemented (Phase 1 groundwork) | `RuleStatus.PENDING_APPROVAL`, `firewall.assisted_review_threshold` config. Manager logic is Phase 6. |
-| A8 Emergency kill-switch | Not started | Depends on `firewall/manager.py` (Phase 6) and the API (Phase 7). |
+| A5 IPv4-only v1 scope | Implemented + Tested (Phase 1, 2, 6) | Phases 1-2 as previously noted. Phase 6: the validator's `network` stage adds a belt-and-suspenders runtime check (tested via a `model_copy`-bypassed candidate, since the type system already makes a real IPv6 `CandidateRule` unconstructable). |
+| A6 Fail-open default + systemd watchdog | Implemented (Phase 1 groundwork) | `FailureMode` enum, `failure.mode` config (default `fail_open`), `failure.watchdog_sec`/crash-loop fields. Watchdog wiring is Phase 8. Phase 6: `revert_to_base()` explicitly fails open (backend removal errors are swallowed; the manager's own state still marks rules `REMOVED`). |
+| A7 Assisted mode / BLOCK approval queue | Implemented + Tested (Phase 6) | `FirewallManager` holds high-score BLOCK candidates at `PENDING_APPROVAL` in `ASSISTED` mode; `approve_pending`/`reject_pending` drive the same `_deploy` path as everything else. Tested: high-score hold, approval deploys, rejection never deploys, low-score BLOCK and MONITOR/RATE_LIMIT auto-deploy. |
+| A8 Emergency kill-switch | Implemented + Tested (Phase 6) | `FirewallManager.revert_to_base()`: sets `SHADOW`, transitions every `ACTIVE` rule to `REMOVED` via the normal per-rule transition, leaves the allowlist and static base ruleset untouched. Phase 7 wires the API endpoint to this method — not a new path. |
 
 ## Acceptance criteria reconciliation (spec §50)
 
@@ -204,6 +204,26 @@ Leave blank until then; don't pre-fill with guesses.
 List anything implemented differently than `docs/MASTER_SPEC.md` says, with
 the reason.
 
+- **Phase 6 decision engine**: the `ThreatLevel -> FirewallAction` ladder
+  (LOW->ALLOW, MEDIUM->MONITOR, HIGH->RATE_LIMIT, CRITICAL->BLOCK) is a
+  deliberate, documented design choice (`pirewall.engine.decision`), not
+  derived from spec text (spec §19 lists the four actions but doesn't
+  prescribe a mapping) or from data.
+- **Phase 6 rule priority**: `priority = round(100 - threat_score)` (higher
+  threat -> lower number -> evaluated first). Spec §23 lists `priority` as
+  a rule field but doesn't define how it's computed; this is a simple,
+  explainable scheme, not tuned against real conflicting-rule scenarios.
+- **Phase 6 nftables RATE_LIMIT translation**: implemented as *two* nft
+  rules sharing one comment/rule-id (an `accept`-under-`limit` rule
+  followed by an unconditional `drop`), since a bare nft `limit` statement
+  alone doesn't drop excess traffic — it just stops matching, letting
+  excess fall through. `NftablesBackend.remove_rule` deletes every nft
+  rule tagged with that id's comment, so this stays transparent to callers.
+- **Phase 6 kill-switch event type**: `revert_to_base()`'s summary event
+  uses `SecurityEventType.SYSTEM_WARNING` (severity `WARNING`) — no
+  existing event type in spec §31's list names "administratively removed
+  rule(s)"; `SYSTEM_WARNING` is the closest fit and matches how ADDENDUM.md
+  A6 itself describes a crash-loop event.
 - **Phase 2 parser**: no 802.1Q VLAN tag support (an Ethernet frame with
   ethertype 0x8100 is treated as unsupported and rejected). Not required by
   spec §7. Revisit if a real deployment's switch port trunks VLAN-tagged
@@ -272,3 +292,23 @@ the reason.
 
 List anything Claude Code got stuck on or needs a decision on (e.g. real
 dataset file locations, Admin PC IP, actual WAN/LAN interface names).
+
+- **Phase 6 safety validation — "pirewall itself" / "management access":**
+  spec §24's safety stage lists four things a candidate rule must never be
+  able to block: pirewall itself, the Admin PC, management access, and the
+  entire protected LAN/internet. `config.admin.admin_pc_ip` and
+  `config.network.protected_network` give concrete values for two of the
+  four; there's no distinct config field for "the Pi's own management
+  address" or a general "management access" concept separate from the
+  Admin PC. **Provisional, conservative choice made this session:** folded
+  "pirewall itself" and "management access" into the existing Admin-PC-IP
+  and whole-protected-LAN checks, on the reasoning that in this
+  architecture management access to pirewall *is* "reach the Pi from the
+  Admin PC" (spec §29: administrative access is restricted to the Admin PC
+  IP), so protecting that IP already covers the concrete case. This passes
+  every safety scenario this phase's test list actually enumerates. If you
+  want a sharper, independent check (e.g. the Pi's own LAN-facing IP as a
+  separate field from the Admin PC, for a deployment where they differ),
+  add it to `AdminConfig` and extend `pirewall.firewall.validator._validate_safety`
+  accordingly — the validator-stage structure makes this a small, isolated
+  change.

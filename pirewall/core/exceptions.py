@@ -91,5 +91,13 @@ class AuthenticationError(PirewallError):
     """Raised on authentication/authorization failures in the API layer."""
 
 
+class RpcError(PirewallError):
+    """Raised when a pirewall-api <-> pirewall-core RPC call fails (ADDENDUM.md A4).
+
+    Covers both transport failures (socket unavailable/timeout) and a
+    well-formed error response from pirewall-core (e.g. "rule not found").
+    """
+
+
 class IntegrationError(PirewallError):
     """Raised when an external integration (Wazuh, Netdata) fails to send/receive data."""

@@ -156,6 +156,17 @@ class APIConfig(PirewallModel):
     tls_key_path: str = Field(min_length=1)
     cors_origins: tuple[str, ...] = Field(default_factory=tuple)
 
+    # How many recent flows/detections/threats/decisions/events
+    # pirewall-core retains in memory for the control panel/API to read
+    # (pirewall.ipc.state.CoreStateStore) — bounded, per spec §17/§26's
+    # general "state must be bounded" theme.
+    history_size: int = Field(default=500, gt=0)
+
+    # The Unix domain socket pirewall-core listens on and pirewall-api
+    # connects to (ADDENDUM.md A4). Filesystem permissions restricting it
+    # to the two service users are set up in Phase 8's systemd units.
+    rpc_socket_path: str = Field(default="/run/pirewall/core.sock", min_length=1)
+
 
 class AuthenticationConfig(PirewallModel):
     """Single-admin username/password authentication (spec §29: no RBAC beyond one role)."""

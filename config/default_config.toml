@@ -108,6 +108,8 @@ port = 8443
 tls_cert_path = "deploy/certificates/CHANGE_ME.crt"  # CHANGE_ME — real cert path
 tls_key_path = "deploy/certificates/CHANGE_ME.key"   # CHANGE_ME — real key path, never commit the real file
 cors_origins = []
+history_size = 500
+rpc_socket_path = "/run/pirewall/core.sock"   # ADDENDUM.md A4 — pirewall-core <-> pirewall-api
 
 [authentication]
 admin_username = "CHANGE_ME"

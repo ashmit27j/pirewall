@@ -14,7 +14,7 @@ Environment-dependent / Not yet validated.
 | 4 | Dataset adapters, preprocessing & ML training (dev machine) | Complete (pipeline); model quality Environment-dependent | See detailed notes below. |
 | 5 | ML inference, behavior analysis & threat assessment | Complete | Tested: schema-mismatch refusal (model load-time and per-call), LightGBM/Isolation Forest loaders+predictors against real (placeholder) trained artifacts, `KnownEvidence`/`AnomalyEvidence` wrappers, deterministic behavior analysis (port-scan/SYN-flood-like/repeated-connection scenarios + bounded-state flood test to 5000 sources), scoring (hand-computed cases), and `ThreatAssessment` (determinism, explainability, level thresholds). 32 new tests (225 total). Environment-dependent: actual detection *accuracy* against real attacks — needs the spec §34 attack-lab exercise against a real-data-trained model, not this session's synthetic-fixture placeholder. ruff clean, pyright --strict clean (109 files). |
 | 6 | Firewall decision, rule generation, validation & nftables backend | Complete | Tested: decision engine (threat-level -> action ladder), candidate generator (narrowest-possible /32 rules, ALLOW produces none), the full 10-stage validation chain in ADDENDUM.md order (schema/network/allowlist/safety/conflict/duplicate/rate-cap/priority/expiration/authorization — each independently tested, plus end-to-end via `FirewallManager`+`FakeFirewallBackend`), SHADOW/ASSISTED/kill-switch lifecycle branching, and backend-isolation + injection-safety security tests. 62 new tests (289 total). Environment-dependent: `NftablesBackend` against a real `nft` binary/ruleset — implemented via nft's JSON interface (spec §20) but requires a real Linux host, root/`CAP_NET_ADMIN`, and `nft` itself to exercise; a human must verify table/chain bootstrap, rule translation, and removal on the target Pi. |
-| 7 | API, auth, security events & control panel | Not started | |
+| 7 | API, auth, security events & control panel | Complete | Tested: auth (password hashing/verification, sessions, Admin-PC-IP restriction), the full RPC dispatcher (every operation via `LoopbackRpcClient`), every API endpoint end-to-end via `TestClient` (login, admin-pc restriction, session enforcement, rules disable/remove/approve/reject, allowlist CRUD, kill-switch, route-surface enumeration), the control panel's HTML rendering (every spec §30 section + addendum sections, XSS-escaping, empty-state handling), and both A4 import-isolation checks (`pirewall/api/`, `pirewall/web/` never import capture/firewall.manager/firewall.backend). 53 new tests (344 total). Environment-dependent: `UnixSocketRpcServer`/`UnixSocketRpcClient` against a real `AF_UNIX` socket, and TLS with real certificates — both require a real Linux host (`socket.AF_UNIX` doesn't exist on this Windows dev machine) and are unverified here; `LoopbackRpcClient` exercises the exact same `CoreRpcDispatcher` logic in-process for everything else. See docs/ARCHITECTURE.md for the dependency decisions this phase made (stdlib `scrypt` over bcrypt/argon2, opaque tokens over JWT, hand-rolled HTML over Jinja2, uvicorn/httpx as FastAPI companions). |
 | 8 | Raspberry Pi hardening, deployment & integrations (Wazuh/Netdata) | Not started | |
 | 9 | Security/integration testing, docs & final validation | Not started | |
 
@@ -23,7 +23,7 @@ Environment-dependent / Not yet validated.
 Real CICIDS2017/UNSW-NB15 dataset files were **not found** on this machine
 (checked common locations; none configured/present). Per the operator's
 standing instruction, everything except real-dataset training quality was
-still built and verified using small synthetic fixture data:
+still built and verified using small synthetic fixture data:  
 
 - **Tested** — `load_cicids2017`/`load_unsw_nb15` adapters (11 tests):
   valid-row mapping, missing-value/invalid-value skip-and-count behavior,
@@ -70,13 +70,13 @@ you go since they land across several phases.
 | Item | Status | Notes |
 |------|--------|-------|
 | A1 Shadow / dry-run enforcement mode | Implemented + Tested (Phase 6) | `FirewallManager` branches on `EnforcementMode.SHADOW`: an otherwise-approved candidate becomes `RuleStatus.SHADOWED`, never reaches the backend, and produces a "[shadow mode] would have ..." `SecurityEvent`. |
-| A2 Static allowlist (outranks adaptive rules) | Implemented + Tested (Phase 6) | Dedicated validator stage (`pirewall.firewall.validator`) rejects any BLOCK/RATE_LIMIT candidate matching an `AllowlistEntry`, checked before safety, regardless of threat score — tested including a `CRITICAL`-score attempt. |
+| A2 Static allowlist (outranks adaptive rules) | Implemented + Tested (Phase 6, 7) | Phase 6: validator stage as previously noted. Phase 7: `GET/POST/DELETE /api/v1/allowlist`, admin-only, control-panel section with add/remove — tested end-to-end via `TestClient`. |
 | A3 Rate cap on rule creation | Implemented + Tested (Phase 6) | `RuleCreationRateLimiter` (fixed window) backs the `rate_cap` validator stage; rejects with `RuleRejectionReason.RATE_LIMITED` once the window's budget is spent. Detection/`SecurityEvent` generation is untouched by the cap (the cap only ever runs after a `ThreatAssessment`/`FirewallDecision` already exist). |
-| A4 Privileged/unprivileged process split | Not started | Socket protocol is Phase 7; systemd units are Phase 8. |
+| A4 Privileged/unprivileged process split | Implemented + Tested (pipeline); real transport Environment-dependent (Phase 7) | Typed RPC protocol (`pirewall.ipc`): `CoreRpcDispatcher` (all 16 operations, fully unit-tested), `UnixSocketRpcServer`/`UnixSocketRpcClient` (real Linux `AF_UNIX` transport, unverified on this Windows dev machine), `LoopbackRpcClient` (in-process test double). `pirewall/api/`+`pirewall/web/` proven to never import `pirewall.capture`/`firewall.manager`/`firewall.backend` via an AST-based import-graph test. systemd units (the actual two-process deployment + socket file permissions) are Phase 8. |
 | A5 IPv4-only v1 scope | Implemented + Tested (Phase 1, 2, 6) | Phases 1-2 as previously noted. Phase 6: the validator's `network` stage adds a belt-and-suspenders runtime check (tested via a `model_copy`-bypassed candidate, since the type system already makes a real IPv6 `CandidateRule` unconstructable). |
 | A6 Fail-open default + systemd watchdog | Implemented (Phase 1 groundwork) | `FailureMode` enum, `failure.mode` config (default `fail_open`), `failure.watchdog_sec`/crash-loop fields. Watchdog wiring is Phase 8. Phase 6: `revert_to_base()` explicitly fails open (backend removal errors are swallowed; the manager's own state still marks rules `REMOVED`). |
-| A7 Assisted mode / BLOCK approval queue | Implemented + Tested (Phase 6) | `FirewallManager` holds high-score BLOCK candidates at `PENDING_APPROVAL` in `ASSISTED` mode; `approve_pending`/`reject_pending` drive the same `_deploy` path as everything else. Tested: high-score hold, approval deploys, rejection never deploys, low-score BLOCK and MONITOR/RATE_LIMIT auto-deploy. |
-| A8 Emergency kill-switch | Implemented + Tested (Phase 6) | `FirewallManager.revert_to_base()`: sets `SHADOW`, transitions every `ACTIVE` rule to `REMOVED` via the normal per-rule transition, leaves the allowlist and static base ruleset untouched. Phase 7 wires the API endpoint to this method — not a new path. |
+| A7 Assisted mode / BLOCK approval queue | Implemented + Tested (Phase 6, 7) | Phase 6: manager logic as previously noted. Phase 7: `POST /api/v1/rules/{id}/approve`/`/reject`, control-panel Approve/Reject buttons on `PENDING_APPROVAL` rules — tested end-to-end via `TestClient`. |
+| A8 Emergency kill-switch | Implemented + Tested (Phase 6, 7) | Phase 6: `revert_to_base()` as previously noted. Phase 7: `POST /api/v1/firewall/kill-switch` (same auth/Admin-PC path as every other write endpoint) + a control-panel button with a JS confirmation step — tested end-to-end via `TestClient`. |
 
 ## Acceptance criteria reconciliation (spec §50)
 
@@ -228,6 +228,25 @@ the reason.
   ethertype 0x8100 is treated as unsupported and rejected). Not required by
   spec §7. Revisit if a real deployment's switch port trunks VLAN-tagged
   traffic to the Pi.
+- **Phase 7 SecurityEvent wiring scope**: the phase prompt asked to "wire
+  event emission into the relevant Phase 2-6 modules where it's missing
+  (capture errors, flow errors, model errors, firewall
+  blocks/rejections/expirations)." Firewall events were already wired in
+  Phase 6. This phase added an optional `on_event` sink to
+  `pirewall.capture.pipeline.capture_packets` so malformed packets can also
+  emit `CAPTURE_ERROR` (tested). Flow-error and model-error emission were
+  **not** wired further: nothing before Phase 8 owns a running "main loop"
+  that calls flow aggregation/inference and would catch those exceptions
+  to turn into events — `pirewall.ipc.state.CoreStateStore.record_event`
+  exists as the sink once that loop exists. Do this wiring as part of
+  Phase 8's `pirewall/main.py`, not as a standalone follow-up — the natural
+  place is wherever those calls actually happen in sequence.
+- **Phase 7 FastAPI route introspection**: the installed FastAPI version
+  wraps each `include_router()` call in an internal `_IncludedRouter`
+  rather than flattening routes into `app.routes` directly — route
+  enumeration (and any future code that needs to walk `app.routes`) must
+  go through `route.original_router.routes` to reach the real `APIRoute`
+  objects. See `tests/unit/test_api_routes.py::test_registered_route_surface_matches_spec`.
 - **Phase 5**: `pirewall.engine.scoring`'s combination formula (known-attack
   weight * confidence; anomaly is a flat weight if flagged; behavior scales
   by fraction of possible pattern types detected — all weights from

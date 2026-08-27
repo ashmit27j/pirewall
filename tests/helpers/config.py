@@ -2,7 +2,12 @@
 
 from typing import Any
 
+from pirewall.api.auth import hash_password
 from pirewall.config.models import PirewallConfig
+
+TEST_ADMIN_USERNAME = "admin"
+TEST_ADMIN_PASSWORD = "correct horse battery staple"
+_TEST_ADMIN_PASSWORD_HASH = hash_password(TEST_ADMIN_PASSWORD)
 
 _BASE: dict[str, dict[str, object]] = {
     "network": {
@@ -22,7 +27,10 @@ _BASE: dict[str, dict[str, object]] = {
     "threat": {},
     "firewall": {},
     "api": {"tls_cert_path": "deploy/certificates/test.crt", "tls_key_path": "deploy/certificates/test.key"},
-    "authentication": {"admin_username": "admin", "admin_password_hash": "hash"},
+    "authentication": {
+        "admin_username": TEST_ADMIN_USERNAME,
+        "admin_password_hash": _TEST_ADMIN_PASSWORD_HASH,
+    },
     "admin": {"admin_pc_ip": "192.168.1.50"},
     "logging": {},
     "integration": {},

@@ -95,6 +95,48 @@ class FirewallManager:
     def active_rules(self) -> list[FirewallRule]:
         return [rule for rule in self._rules.values() if rule.status is RuleStatus.ACTIVE]
 
+    def all_rules(self) -> list[FirewallRule]:
+        """Every rule this manager knows about, in any status (spec §30 control panel "rule status")."""
+        return list(self._rules.values())
+
+    def disable_rule(self, rule_id: str, now: datetime) -> FirewallRule | None:
+        """Stop enforcing `rule_id` but keep its record (spec §28 `/rules/{id}/disable`).
+
+        Distinct from `remove_rule`: `DISABLED` and `REMOVED` are separate
+        terminal states (spec §25) — disabling is the reversible-in-spirit
+        "turn this off" action an operator reaches for first.
+        """
+        return self._retire_rule(rule_id, RuleStatus.DISABLED, now, "disabled by administrator")
+
+    def remove_rule(self, rule_id: str, now: datetime) -> FirewallRule | None:
+        """Permanently remove `rule_id` (spec §28 `/rules/{id}/remove`)."""
+        return self._retire_rule(rule_id, RuleStatus.REMOVED, now, "removed by administrator")
+
+    def _retire_rule(
+        self, rule_id: str, to_status: RuleStatus, now: datetime, reason: str
+    ) -> FirewallRule | None:
+        rule = self._rules.get(rule_id)
+        if rule is None or rule.status is not RuleStatus.ACTIVE:
+            return None
+        with contextlib.suppress(FirewallError):
+            self.__backend.remove_rule(rule_id)
+        updated = rule.model_copy(update={"status": to_status})
+        self._rules[rule_id] = updated
+        self._record(rule_id, RuleStatus.ACTIVE, to_status, now, reason)
+        return updated
+
+    def add_allowlist_entry(self, entry: AllowlistEntry) -> None:
+        """Add a static allowlist entry (ADDENDUM.md A2)."""
+        self._allowlist.append(entry)
+
+    def remove_allowlist_entry(self, entry_id: str) -> bool:
+        """Remove an allowlist entry by id. Returns `False` if `entry_id` wasn't found."""
+        for index, entry in enumerate(self._allowlist):
+            if entry.id == entry_id:
+                del self._allowlist[index]
+                return True
+        return False
+
     def register_decision(self, decision: FirewallDecision) -> None:
         """Record that `decision` came from the real decision engine (spec §24 authorization stage)."""
         self._known_decision_ids.add(decision.id)

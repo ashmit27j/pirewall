@@ -77,6 +77,16 @@ class CoreRpcDispatcher:
         )
         return _dump(result)
 
+    def _get_capture_stats(self, _params: dict[str, Any]) -> dict[str, Any] | None:
+        """Current packet capture counters, or `None` before the first reading.
+
+        `None` rather than a zeroed snapshot: pirewall-core populates this
+        once the capture loop has actually run, so a `None` here honestly
+        means "capture has not reported yet", not "zero packets seen".
+        """
+        stats = self._state.capture_stats
+        return _dump(stats) if stats is not None else None
+
     def _list_flows(self, _params: dict[str, Any]) -> list[dict[str, Any]]:
         return _dump_list(list(self._state.flows))
 
@@ -149,6 +159,7 @@ class CoreRpcDispatcher:
 
     _HANDLERS: ClassVar[dict[RpcOperation, Callable[["CoreRpcDispatcher", dict[str, Any]], Any]]] = {
         RpcOperation.GET_STATUS: _get_status,
+        RpcOperation.GET_CAPTURE_STATS: _get_capture_stats,
         RpcOperation.LIST_FLOWS: _list_flows,
         RpcOperation.LIST_DETECTIONS: _list_detections,
         RpcOperation.LIST_THREATS: _list_threats,

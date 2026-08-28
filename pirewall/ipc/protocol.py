@@ -20,6 +20,7 @@ class RpcOperation(StrEnum):
     """Every operation pirewall-api may invoke on pirewall-core. A closed set — no arbitrary commands."""
 
     GET_STATUS = "get_status"
+    GET_CAPTURE_STATS = "get_capture_stats"
     LIST_FLOWS = "list_flows"
     LIST_DETECTIONS = "list_detections"
     LIST_THREATS = "list_threats"

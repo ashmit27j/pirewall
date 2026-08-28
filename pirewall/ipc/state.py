@@ -13,6 +13,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from pirewall.core.models.capture_stats import CaptureStatistics
 from pirewall.core.models.decision import FirewallDecision
 from pirewall.core.models.detection_record import DetectionRecord
 from pirewall.core.models.event import SecurityEvent
@@ -29,6 +30,12 @@ class CoreStateStore:
     started_at: datetime
     lightgbm_metadata: ModelMetadata | None = None
     isolation_forest_metadata: ModelMetadata | None = None
+    # Latest reading from `PacketCapture.statistics()`. A single current
+    # value rather than a history: the control panel's "network statistics"
+    # section (spec §30) asks what capture is doing *now*, and the rate
+    # metrics that need history are derived in
+    # `pirewall.runtime.metrics.MetricsCollector` instead.
+    capture_stats: CaptureStatistics | None = None
     flows: deque[Flow] = field(default_factory=deque[Flow])
     detections: deque[DetectionRecord] = field(default_factory=deque[DetectionRecord])
     threats: deque[ThreatAssessment] = field(default_factory=deque[ThreatAssessment])
@@ -56,3 +63,7 @@ class CoreStateStore:
 
     def record_event(self, event: SecurityEvent) -> None:
         self.events.append(event)
+
+    def record_capture_stats(self, stats: CaptureStatistics) -> None:
+        """Replace the current capture-statistics reading (spec §6, §30)."""
+        self.capture_stats = stats

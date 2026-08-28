@@ -38,11 +38,66 @@ Single-admin, no RBAC — `config.authentication.admin_username`/
 `config.api.tls_cert_path`/`tls_key_path` are required, non-empty config
 fields (`ConfigurationError` if missing — see
 `tests/unit/test_config_loader.py`'s certificate tests). Minimum TLS
-version is `config.security.min_tls_version` (default `TLSv1.3`). Actually
-terminating TLS with a real certificate happens in the not-yet-built
-`pirewall.api.__main__` entry point (uvicorn's TLS options) — see
-`docs/PROGRESS.md` Phase 8/9's "known gap" note and `docs/DEPLOYMENT.md` §6
-for real certificate setup.
+version is `config.security.min_tls_version` (default `TLSv1.3`), enforced
+by `pirewall.api.__main__.make_ssl_context_factory`: uvicorn's own
+`ssl_version=` selects a protocol *family*, not a floor, so the minimum is
+raised on the `SSLContext` uvicorn builds, through its documented
+`ssl_context_factory` hook.
+
+`pirewall.api.__main__` refuses to start if either path is missing,
+unreadable, or still a `CHANGE_ME` placeholder — see
+`validate_runtime_prerequisites`. See `docs/DEPLOYMENT.md` §6 and
+`scripts/deployment/make_certs.sh` for generating a self-signed pair with
+the `subjectAltName` clients actually verify.
+
+## No endpoint creates firewall rules
+
+There is no `POST /api/v1/rules`, and that is deliberate. The validation
+chain's authorization stage (`pirewall.firewall.validator._validate_authorization`)
+rejects any candidate whose `decision_id` was not produced by the real
+decision engine, so a hand-authored rule could only be accepted by
+weakening that stage — and `CLAUDE.md` forbids "trusted callers that skip
+validation". Adaptive rules therefore originate from exactly one place, the
+detection pipeline; the API's role in the rule lifecycle is to *review*
+what that pipeline proposed (`disable`/`remove`/`approve`/`reject`, plus
+the A8 kill-switch) and to maintain the A2 allowlist, which is the
+supported way for an operator to state policy directly.
+
+## Live event stream
+
+`GET /api/v1/events/stream` is **Server-Sent Events**, not a WebSocket.
+Two reasons, both practical:
+
+* The stream is strictly one-way, and SSE is plain chunked HTTP, so it
+  needs no protocol library beyond the pinned uvicorn. A WebSocket route
+  returns 404 under real uvicorn unless `websockets` or `wsproto` is also
+  installed, and neither is on `CLAUDE.md`'s dependency list.
+* Browsers implement `EventSource` natively, including reconnection.
+
+It is a **poll-and-push bridge, not a subscription**. `SecurityEvent`s are
+produced in the other process, and the A4 RPC protocol is a synchronous
+request/response socket with a closed operation set — there is no
+subscribe/notify operation, and adding one would give the privileged
+process a long-lived push channel into the unprivileged one. So pirewall-api
+polls `list_events()` twice a second and forwards what is new. Stated
+plainly: **latency is up to that poll interval, and an event can be missed**
+if more than `api.history_size` events are recorded between two polls. The
+audit trail of record is `GET /api/v1/events`, plus Wazuh where configured.
+
+Frames:
+
+```text
+event: security_event
+data: {"id": "...", "event_type": "threat_detected", ...}
+
+event: error
+data: {"detail": "pirewall-core is unreachable: ..."}
+
+: keep-alive
+```
+
+An unreachable `pirewall-core` produces `error` frames and the stream stays
+open (ADDENDUM.md A6) rather than dropping the connection.
 
 ## Route surface
 
@@ -57,6 +112,9 @@ enumerates every registered route and asserts it matches this list exactly
 | POST | `/api/v1/auth/login` | Admin PC only | Returns a session token; emits `AUTHENTICATION_FAILURE` on failure. |
 | POST | `/api/v1/auth/logout` | session + Admin PC | Invalidates the session. |
 | GET | `/api/v1/status` | session + Admin PC | `StatusResult` — enforcement mode, failure mode, rule/flow counts, model-loaded flags. |
+| GET | `/api/v1/capture-stats` | session + Admin PC | `CaptureStatistics` — packets seen/dropped/malformed (spec §30 "network statistics"). `null` until `pirewall-core` publishes its first reading, which is distinct from "zero packets seen". |
+| GET | `/api/v1/config` | session + Admin PC | The running configuration, with `admin_password_hash`, both TLS paths, and the Wazuh/Netdata hostnames redacted. **Read-only — there is deliberately no write counterpart** (spec §45: a compromised session must not be able to rewrite `enforcement_mode` or `admin_pc_ip`). |
+| GET | `/api/v1/events/stream` | session + Admin PC | Live `SecurityEvent` push as Server-Sent Events. See below. |
 | GET | `/api/v1/flows` | session + Admin PC | Recent `Flow`s (`CoreStateStore`'s bounded buffer). |
 | GET | `/api/v1/detections` | session + Admin PC | Recent `DetectionRecord`s. |
 | GET | `/api/v1/threats` | session + Admin PC | Recent `ThreatAssessment`s. |

@@ -6,14 +6,32 @@ Nothing in this repository runs any of these steps automatically — spec
 the nftables ruleset during a Claude Code session. Read `docs/SECURITY.md`
 alongside this file.
 
-**Before you start:** `pirewall/main.py` (the running main loop for
-`pirewall-core`) and `pirewall/api/__main__.py` (the entry point for
-`pirewall-api`) do not exist in this repository yet — see
-`docs/PROGRESS.md` Phase 8/9. Steps 6-9 below describe the target-state
-deployment those entry points are built for; you cannot actually start
-either systemd unit until they land. Everything through step 5 (OS setup,
-network templates, base firewall ruleset, users/groups) can be done ahead
-of that.
+**Before you start:** both entry points now exist — `pirewall/main.py`
+(`pirewall-core`) and `pirewall/api/__main__.py` (`pirewall-api`, run as
+`python -m pirewall.api`) — so every step below is executable end to end.
+What has *not* been verified is the Pi-specific half: `AF_PACKET` capture
+on a real interface, `nft` against a real ruleset, and systemd supervision
+itself. `docs/DEPLOYMENT_COMPLETE.md` lists exactly what was verified, how,
+and what you need to check on the hardware.
+
+Both entry points accept `--check-config`, which validates everything they
+can without binding a socket or opening a capture handle. Run it after
+every configuration change — it is much faster than diagnosing a failed
+unit:
+
+```sh
+python -m pirewall.main --check-config    # config shape and values
+python -m pirewall.api  --check-config    # the above, plus credentials and TLS material
+```
+
+**For the short version**, see `docs/SETUP.md` — the same steps as ordered
+commands with minimal prose. This file is the reasoning behind them. In
+particular, steps 3 and 6 below are now largely automated:
+
+```sh
+uv run python -m scripts.deployment.configure     # writes config/local_config.toml
+scripts/deployment/make_certs.sh <pi-lan-ip>      # writes the TLS pair
+```
 
 ## 1. OS setup
 
@@ -159,11 +177,27 @@ certificate both work if the Pi has a resolvable name; a self-signed
 certificate is acceptable for a LAN-only admin panel restricted to one
 Admin PC. Whichever you choose:
 
+For a self-signed pair, use the script in this repository rather than a
+hand-written `openssl` command. It sets the `subjectAltName` to the Pi's
+LAN IP, which is what modern clients actually verify (a certificate with
+only a Common Name fails verification even after you accept the warning),
+and it generates an EC P-256 key rather than RSA-4096 — near-instant on a
+Pi 4 instead of tens of seconds, cheaper to handshake, and supported by
+every TLS 1.3 client:
+
 ```sh
+scripts/deployment/make_certs.sh 192.168.100.1   # your network.pirewall_lan_ip
 sudo mkdir -p /opt/pirewall/deploy/certificates
 sudo chown pirewall-api:pirewall-api /opt/pirewall/deploy/certificates
 sudo chmod 700 /opt/pirewall/deploy/certificates
-# place cert.pem / key.pem here, mode 600, owned by pirewall-api
+# then place pirewall.crt / pirewall.key here, key mode 600, owned by pirewall-api
+```
+
+Confirm pirewall-api accepts them before enabling the unit — it refuses to
+start on a missing, unreadable, or still-placeholder certificate path:
+
+```sh
+python -m pirewall.api --check-config
 ```
 
 Never commit the real cert/key. `min_tls_version = "TLSv1.3"` is the

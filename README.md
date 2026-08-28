@@ -56,7 +56,9 @@ Full detail in `docs/ADDENDUM.md`.
 | `docs/API.md` | Every API endpoint, the auth model, the control panel. |
 | `docs/TESTING.md` | How to run each test tier, the Protocol+Fake pattern, what's Fake vs. real-hardware-verified. |
 | `docs/SECURITY.md` | Hardening, the two-process privilege split, threat model, resource-exhaustion protections. |
-| `docs/DEPLOYMENT.md` | Step-by-step real Raspberry Pi deployment. |
+| `docs/SETUP.md` | The ordered, copy-paste setup path, plus how to change the Admin PC or the password afterwards. Start here. |
+| `docs/DEPLOYMENT.md` | The reasoning behind each setup step: OS choices, hardening, network templates, Wazuh/Netdata, updates. |
+| `docs/DEPLOYMENT_COMPLETE.md` | What the two service entry points do, what was verified and how, and what a human still has to check on the Pi. |
 | `docs/DEVELOPMENT_WORKFLOW.md` | The per-subsystem development loop this project follows. |
 
 ## Platform support
@@ -84,6 +86,17 @@ uv run pyright                              # strict type check
 uv run python -m scripts.diagnostics.performance_smoke   # performance smoke pass
 ```
 
+Running the two services locally (neither needs root; `pirewall-core`
+reports capture as unavailable off Linux and stays up to say so):
+
+```sh
+uv run python -m pirewall.main --check-config    # validate config, start nothing
+uv run python -m pirewall.api  --check-config    # the above, plus credentials and TLS material
+
+uv run python -m pirewall.main                   # pirewall-core  (capture -> ... -> firewall)
+uv run python -m pirewall.api                    # pirewall-api   (HTTPS control panel)
+```
+
 None of the above touches real network configuration, systemd state, or a
 real nftables ruleset — every hardware-dependent component (packet
 capture, the nftables backend, the inter-process RPC socket) is a
@@ -92,12 +105,30 @@ capture, the nftables backend, the inter-process RPC socket) is a
 
 ## Deploying to a real Raspberry Pi
 
-See `docs/DEPLOYMENT.md` for the full step-by-step guide (OS setup,
-network/firewall templates, systemd units, certificates, Admin PC-side
-Wazuh/Netdata configuration, secure update procedure) and
-`docs/SECURITY.md` for the hardening rationale behind it. Nothing in this
-repository applies any of that automatically — every template under
-`deploy/` is reviewed and applied by a human.
+Start with `docs/SETUP.md` — the ordered, copy-paste path. Setup is
+mostly automatic:
+
+```sh
+uv run python -m scripts.deployment.configure     # detect the network, ask what it can't know
+scripts/deployment/make_certs.sh <pi-lan-ip>      # self-signed TLS pair
+uv run python -m pirewall.main --check-config     # validate before starting anything
+```
+
+`configure` reads the live layout with `ip` and fills in the interfaces,
+the LAN's CIDR, the Pi's own address and the upstream gateway. It asks for
+exactly two things it cannot observe: which machine may administer the
+firewall, and the admin password. The first is a policy decision, not a
+fact about the network — detected hosts are offered as candidates and a
+human chooses.
+
+`docs/DEPLOYMENT.md` has the reasoning behind each step and
+`docs/SECURITY.md` the hardening rationale. Nothing in this repository
+applies any of that automatically — every template under `deploy/` is
+reviewed and applied by a human.
+
+`docs/DEPLOYMENT_COMPLETE.md` is the companion: what the two entry points
+do, exactly what has been verified and how, and the short checklist of what
+only real Pi hardware can confirm.
 
 ## Project status
 

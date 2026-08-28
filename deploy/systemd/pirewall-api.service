@@ -2,7 +2,9 @@
 Description=pirewall-api — FastAPI control panel/API (ADDENDUM.md A4)
 # TEMPLATE — must be reviewed and tested on real Pi hardware before trusting
 # it in production (spec §27). Not installed or started by anything in this
-# repository. Start after pirewall-core so the RPC socket already exists,
+# repository. The entry point exists and has been run for real over TLS on
+# a development machine; what is unverified here is systemd supervision and
+# this unit's own sandboxing. See docs/DEPLOYMENT_COMPLETE.md. Start after pirewall-core so the RPC socket already exists,
 # but this unit must keep running independently of pirewall-core's health
 # (ADDENDUM.md A4/A6) — hence "After=" (ordering only), deliberately no
 # "Requires=" or "BindsTo=" that would take pirewall-api down with it.
@@ -12,13 +14,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/pirewall/.venv/bin/python -m pirewall.api.__main__
-# NOTE: this entry point (load config, build a `UnixSocketRpcClient`
-# pointed at config.api.rpc_socket_path, call
-# `pirewall.api.app.create_app`, serve it with uvicorn+TLS) is not yet
-# implemented — see docs/PROGRESS.md Phase 8. This unit file is a
-# deployment target for that future entry point, not proof it exists; do
-# not start this unit until it lands.
+# `pirewall.api` loads config, refuses to start on placeholder credentials
+# or missing/unreadable TLS material, builds a UnixSocketRpcClient pointed
+# at config.api.rpc_socket_path, and serves `pirewall.api.app.create_app`
+# over uvicorn + TLS at config.security.min_tls_version.
+#
+# Validate before enabling — this checks the credential and certificate
+# problems that would otherwise only appear as a failed unit:
+#   /opt/pirewall/.venv/bin/python -m pirewall.api --check-config
+ExecStart=/opt/pirewall/.venv/bin/python -m pirewall.api
 WorkingDirectory=/opt/pirewall
 
 Restart=on-failure

@@ -1,7 +1,12 @@
-"""`FakePacketCapture`: behaves like the `PacketCapture` protocol for tests."""
+"""`FakePacketCapture`: behaves like the `PacketCapture` protocol for tests.
+
+Also covers the one `AFPacketCapture` failure path that *is* testable off
+Linux: refusing to start on a platform with no `AF_PACKET` support.
+"""
 
 import pytest
 
+from pirewall.capture.af_packet import AFPacketCapture
 from pirewall.capture.fake import FakePacketCapture
 from pirewall.core.exceptions import CaptureError
 
@@ -51,3 +56,26 @@ def test_stop_ends_iteration_early() -> None:
 def test_statistics_report_configured_interface() -> None:
     capture = FakePacketCapture("lan0", [])
     assert capture.statistics().interface == "lan0"
+
+
+def test_af_packet_capture_reports_an_unsupported_platform_as_a_typed_error() -> None:
+    """A platform with no `AF_PACKET` must raise `CaptureError`, not a stdlib `AttributeError`.
+
+    `socket.AF_PACKET` is Linux-only, so on macOS (where pirewall is
+    developed) `socket.socket(socket.AF_PACKET, ...)` raises `AttributeError`
+    — which is not an `OSError` and so was not caught. It escaped untyped
+    and crashed `pirewall.runtime.core.CoreDaemon.start()` with a traceback,
+    bypassing the "capture unavailable, keep serving RPC so the Admin PC can
+    see why" path A6 asks for. Found by running the real daemon.
+
+    On Linux this asserts the complementary property: the failure is still a
+    `CaptureError` (no such interface / no CAP_NET_RAW), never an untyped one.
+    """
+    capture = AFPacketCapture(
+        interface="pirewall-nonexistent0",
+        snap_len=65535,
+        promiscuous=False,
+        buffer_size_bytes=4096,
+    )
+    with pytest.raises(CaptureError):
+        capture.start()

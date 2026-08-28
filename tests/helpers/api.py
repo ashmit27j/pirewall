@@ -18,6 +18,7 @@ from pirewall.api.app import create_app
 from pirewall.config.models import PirewallConfig
 from pirewall.firewall.backend.fake import FakeFirewallBackend
 from pirewall.firewall.manager import FirewallManager
+from pirewall.ipc.client import BaseRpcClient
 from pirewall.ipc.dispatcher import CoreRpcDispatcher
 from pirewall.ipc.loopback import LoopbackRpcClient
 from pirewall.ipc.state import CoreStateStore
@@ -56,6 +57,10 @@ class TestHarness:
     backend: FakeFirewallBackend
     state: CoreStateStore
     config: PirewallConfig
+    # The same instance the app resolves through `get_rpc_client`. Exposed
+    # as a typed field so tests that drive the RPC layer directly (or stub
+    # a down core) don't have to reach through the untyped `app.state`.
+    rpc_client: BaseRpcClient
 
     def get(self, url: str, **kwargs: Any) -> Response:
         return Response(self.client.get(url, **kwargs))  # pyright: ignore[reportUnknownMemberType]
@@ -65,6 +70,9 @@ class TestHarness:
 
     def delete(self, url: str, **kwargs: Any) -> Response:
         return Response(self.client.delete(url, **kwargs))  # pyright: ignore[reportUnknownMemberType]
+
+    def set_cookie(self, name: str, value: str) -> None:
+        self.client.cookies.set(name, value)  # pyright: ignore[reportUnknownMemberType]
 
 
 def make_harness(
@@ -87,7 +95,14 @@ def make_harness(
     rpc_client = LoopbackRpcClient(dispatcher)
     app = create_app(config, rpc_client)
     test_client = TestClient(app, client=client_address)
-    return TestHarness(client=test_client, manager=manager, backend=backend, state=state, config=config)
+    return TestHarness(
+        client=test_client,
+        manager=manager,
+        backend=backend,
+        state=state,
+        config=config,
+        rpc_client=rpc_client,
+    )
 
 
 def login(

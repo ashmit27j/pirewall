@@ -4,6 +4,11 @@ Description=pirewall-core — packet capture, flow/feature/detection pipeline, f
 # it in production (spec §27 "do not apply systemd restrictions that break
 # required networking functionality without testing"). Not installed or
 # started by anything in this repository.
+#
+# The entry point this unit targets now exists (pirewall/main.py) and has
+# been run for real, but only off-Linux: AF_PACKET capture, nftables, and
+# systemd supervision itself remain unverified until a human runs this on
+# the Pi. See docs/DEPLOYMENT_COMPLETE.md.
 Documentation=file:///opt/pirewall/docs/DEPLOYMENT.md
 After=network-online.target
 Wants=network-online.target
@@ -17,13 +22,19 @@ Type=notify
 WatchdogSec=30s
 NotifyAccess=main
 
+# `pirewall.main` loads config, then runs `pirewall.runtime.core.CoreDaemon`:
+# capture -> flow -> features -> detection -> engine -> firewall manager in
+# one process, plus the sd_notify heartbeats WatchdogSec= above depends on
+# and the RPC socket pirewall-api connects to.
+#
+# --config is omitted deliberately: the entry point resolves
+# config/local_config.toml (gitignored, your real network layout) and falls
+# back to config/default_config.toml. Add an explicit --config here if you
+# keep the file elsewhere.
+#
+# Validate the configuration before enabling this unit:
+#   /opt/pirewall/.venv/bin/python -m pirewall.main --check-config
 ExecStart=/opt/pirewall/.venv/bin/python -m pirewall.main
-# NOTE: `pirewall.main` (the process that wires capture -> flow -> features
-# -> detection -> engine -> firewall manager into one running loop, sends
-# sd_notify watchdog heartbeats, and serves the RPC socket) is not yet
-# implemented — see docs/PROGRESS.md Phase 8. This unit file is a deployment
-# target for that future entry point, not proof it exists; do not start this
-# unit until `pirewall/main.py` lands.
 WorkingDirectory=/opt/pirewall
 
 # ADDENDUM.md A6: restart on crash (not on a clean exit), and detect a

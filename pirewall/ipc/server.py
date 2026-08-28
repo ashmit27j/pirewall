@@ -10,8 +10,10 @@ systemd's `RuntimeDirectory=`. See `docs/PROGRESS.md`.
 """
 
 import contextlib
+import logging
 import os
 import socket
+import threading
 from collections.abc import Generator
 from pathlib import Path
 
@@ -22,7 +24,13 @@ from pirewall.ipc._framing import read_all
 from pirewall.ipc.dispatcher import CoreRpcDispatcher
 from pirewall.ipc.protocol import RpcRequest, RpcResponse
 
+_logger = logging.getLogger(__name__)
+
 _LISTEN_BACKLOG = 5
+# How long `accept()` blocks before `serve_until_stopped` re-checks its stop
+# flag. Short enough that shutdown feels immediate, long enough that an idle
+# core is not spinning the CPU on a Pi.
+_ACCEPT_TIMEOUT_SECONDS = 0.5
 
 # owner rw + group rw, nothing for other. The group is the shared
 # `pirewall-ipc` group both service users belong to (see
@@ -122,6 +130,40 @@ class UnixSocketRpcServer:
             self._handle(connection)
         finally:
             connection.close()
+
+    def serve_until_stopped(self, stop: threading.Event) -> None:
+        """Serve connections until `stop` is set. Intended to be the body of a thread.
+
+        `serve_one` blocks in `accept()` indefinitely, which would leave
+        pirewall-core unable to shut down while no client is connected. This
+        variant puts a short timeout on the listening socket so the loop can
+        notice `stop` between accepts.
+
+        A failure handling one connection is logged and the loop continues:
+        pirewall-api being unable to complete one request must never stop
+        the RPC server, and must certainly never stop packet filtering
+        (spec §26, ADDENDUM.md A6).
+        """
+        server_socket = self._server_socket
+        if server_socket is None:
+            raise RpcError("RPC server has not been started")
+        server_socket.settimeout(_ACCEPT_TIMEOUT_SECONDS)
+        while not stop.is_set():
+            try:
+                connection, _address = server_socket.accept()
+            except TimeoutError:
+                continue
+            except OSError as exc:
+                if stop.is_set() or self._server_socket is None:
+                    return  # `stop()` closed the socket out from under us
+                _logger.warning("RPC accept failed: %s", exc)
+                continue
+            try:
+                self._handle(connection)
+            except (OSError, RpcError) as exc:
+                _logger.warning("RPC connection failed: %s", exc)
+            finally:
+                connection.close()
 
     def _handle(self, connection: socket.socket) -> None:
         raw = read_all(connection)

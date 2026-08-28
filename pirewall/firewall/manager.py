@@ -89,6 +89,30 @@ class FirewallManager:
     def allowlist(self) -> tuple[AllowlistEntry, ...]:
         return tuple(self._allowlist)
 
+    def backend_health(self) -> bool:
+        """Whether the firewall backend is reachable and operating normally (spec §33).
+
+        Exists so the running daemon can report firewall health without
+        holding a reference to the backend itself — this manager is the only
+        code path allowed to touch `pirewall.firewall.backend` (CLAUDE.md),
+        and that has to stay true for a read-only health probe too.
+        Swallows a backend failure into `False`: "is it healthy" must always
+        have an answer.
+        """
+        try:
+            return self.__backend.health_check()
+        except FirewallError:
+            return False
+
+    def adaptive_rules_in_window(self, now: datetime) -> int:
+        """How many adaptive rules have been created in the current A3 rate window.
+
+        Delegates to the rate limiter this manager owns; nothing outside
+        gets a reference to the limiter itself (the manager is the single
+        authorized owner of rule-creation state, spec §22).
+        """
+        return self._rate_limiter.count_in_window(now)
+
     def get_rule(self, rule_id: str) -> FirewallRule | None:
         return self._rules.get(rule_id)
 
@@ -111,6 +135,32 @@ class FirewallManager:
     def remove_rule(self, rule_id: str, now: datetime) -> FirewallRule | None:
         """Permanently remove `rule_id` (spec §28 `/rules/{id}/remove`)."""
         return self._retire_rule(rule_id, RuleStatus.REMOVED, now, "removed by administrator")
+
+    def expire_rules(self, now: datetime) -> list[FirewallRule]:
+        """Retire every ACTIVE rule whose `expires_at` has passed (spec §25).
+
+        `CandidateRule.expires_at` is mandatory — the validation chain's
+        expiration stage rejects a candidate without one — but until this
+        existed nothing ever acted on it: an ACTIVE rule stayed deployed in
+        the backend indefinitely, and `RuleStatus.EXPIRED` was a state the
+        lifecycle documented but could never reach. `pirewall.runtime.core`
+        calls this on a timer; that timer is what makes a rule TTL mean
+        anything.
+
+        Returns the rules that were expired, so the caller can emit one
+        `RULE_EXPIRED` `SecurityEvent` each — the same division of labour as
+        `disable_rule`/`remove_rule`.
+        """
+        expired: list[FirewallRule] = []
+        for rule in list(self._rules.values()):
+            if rule.status is not RuleStatus.ACTIVE or rule.expires_at is None:
+                continue
+            if rule.expires_at > now:
+                continue
+            retired = self._retire_rule(rule.id, RuleStatus.EXPIRED, now, "rule TTL elapsed")
+            if retired is not None:
+                expired.append(retired)
+        return expired
 
     def _retire_rule(
         self, rule_id: str, to_status: RuleStatus, now: datetime, reason: str

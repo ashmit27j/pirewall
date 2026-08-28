@@ -1,8 +1,10 @@
-"""Read-only endpoints (spec §28): status, flows, detections, threats, decisions, rules, events, models."""
+"""Read-only endpoints (spec §28): status, capture statistics, flows, detections, threats,
+decisions, rules, events, models."""
 
 from fastapi import APIRouter
 
 from pirewall.api.app import RpcClientDep
+from pirewall.core.models.capture_stats import CaptureStatistics
 from pirewall.core.models.decision import FirewallDecision
 from pirewall.core.models.detection_record import DetectionRecord
 from pirewall.core.models.event import SecurityEvent
@@ -18,6 +20,16 @@ router = APIRouter(prefix="/api/v1", tags=["read"])
 @router.get("/status", response_model=StatusResult)
 def get_status(rpc_client: RpcClientDep) -> StatusResult:
     return rpc_client.get_status()
+
+
+@router.get("/capture-stats", response_model=CaptureStatistics | None)
+def get_capture_stats(rpc_client: RpcClientDep) -> CaptureStatistics | None:
+    """Current packet capture counters — the control panel's "network statistics" (spec §30).
+
+    `null` means pirewall-core has not reported a reading yet (it publishes
+    one per watchdog tick), which is distinct from "zero packets seen".
+    """
+    return rpc_client.get_capture_stats()
 
 
 @router.get("/flows", response_model=list[Flow])

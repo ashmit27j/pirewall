@@ -51,9 +51,25 @@ class AFPacketCapture:
         self._packets_malformed = 0
 
     def start(self) -> None:
-        """Bind an AF_PACKET socket to `interface`. Raises `CaptureError` on failure."""
+        """Bind an AF_PACKET socket to `interface`. Raises `CaptureError` on failure.
+
+        Includes the "this platform has no `AF_PACKET` at all" case. That is
+        an `AttributeError` from the stdlib, not an `OSError`, so without an
+        explicit check it would escape as an untyped exception and crash
+        whatever is running the capture loop — bypassing the caller's
+        graceful "capture unavailable, keep serving" handling (ADDENDUM.md
+        A6) and violating the rule that no subsystem lets a stdlib exception
+        cross its boundary (spec §44, CLAUDE.md). It is reachable in
+        practice: pirewall is developed on macOS and only deployed on Linux.
+        """
         if self._socket is not None:
             return
+        if not hasattr(socket, "AF_PACKET"):
+            raise CaptureError(
+                f"cannot capture on {self._interface}: this platform has no AF_PACKET support "
+                "(packet capture requires Linux). Use pirewall.capture.fake.FakePacketCapture "
+                "for development off-Linux."
+            )
         try:
             sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(_ETH_P_ALL))
             sock.bind((self._interface, 0))

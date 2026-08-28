@@ -12,6 +12,7 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, Response
+from starlette.requests import HTTPConnection
 
 from pirewall.api.auth import Authenticator, Session, SessionStore, enforce_admin_pc_ip
 from pirewall.config.models import PirewallConfig
@@ -22,20 +23,24 @@ from pirewall.web.render import render_core_unavailable_page
 SESSION_COOKIE_NAME = "pirewall_session"
 
 
-def get_config(request: Request) -> PirewallConfig:
-    config = request.app.state.pirewall_config
+# `HTTPConnection` rather than `Request`: it is the common base of `Request`
+# and `WebSocket`, so these three resolve on the WebSocket event stream as
+# well as on every HTTP route. A `Request`-annotated dependency cannot be
+# satisfied during a WebSocket handshake — FastAPI has no `Request` to pass.
+def get_config(connection: HTTPConnection) -> PirewallConfig:
+    config = connection.app.state.pirewall_config
     assert isinstance(config, PirewallConfig)
     return config
 
 
-def get_rpc_client(request: Request) -> BaseRpcClient:
-    client = request.app.state.pirewall_rpc_client
+def get_rpc_client(connection: HTTPConnection) -> BaseRpcClient:
+    client = connection.app.state.pirewall_rpc_client
     assert isinstance(client, BaseRpcClient)
     return client
 
 
-def get_authenticator(request: Request) -> Authenticator:
-    authenticator = request.app.state.pirewall_authenticator
+def get_authenticator(connection: HTTPConnection) -> Authenticator:
+    authenticator = connection.app.state.pirewall_authenticator
     assert isinstance(authenticator, Authenticator)
     return authenticator
 
@@ -105,8 +110,9 @@ def create_app(
     """
     # Import routers lazily to keep any accidental heavy/forbidden import
     # (ADDENDUM.md A4) local to this one function, easy to spot in review.
-    from pirewall.api.routes import allowlist, firewall, health, read, rules
+    from pirewall.api.routes import allowlist, events_stream, firewall, health, read, rules
     from pirewall.api.routes import auth as auth_routes
+    from pirewall.api.routes import config as config_routes
     from pirewall.web import routes as web_routes
 
     app = FastAPI(title="pirewall control panel", docs_url=None, redoc_url=None, openapi_url=None)
@@ -136,6 +142,8 @@ def create_app(
     app.include_router(auth_routes.public_router, dependencies=admin_pc_only)
     app.include_router(auth_routes.protected_router, dependencies=protected)
     app.include_router(read.router, dependencies=protected)
+    app.include_router(config_routes.router, dependencies=protected)
+    app.include_router(events_stream.router, dependencies=protected)
     app.include_router(rules.router, dependencies=protected)
     app.include_router(allowlist.router, dependencies=protected)
     app.include_router(firewall.router, dependencies=protected)

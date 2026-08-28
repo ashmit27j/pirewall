@@ -28,6 +28,16 @@ class RuleCreationRateLimiter:
         self._prune(now)
         return len(self._timestamps) < self._max_per_window
 
+    def count_in_window(self, now: datetime) -> int:
+        """How much of the budget is currently spent. Read-only, like `would_allow`.
+
+        Exposed for ADDENDUM.md A3's Netdata metric ("adaptive-rule creation
+        rate and how close it is to the cap") — reporting the cap without
+        reporting current usage against it would make the metric useless.
+        """
+        self._prune(now)
+        return len(self._timestamps)
+
     def record(self, now: datetime) -> None:
         """Consume one unit of budget — call only once a candidate fully passes validation."""
         self._prune(now)

@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from pirewall.core.exceptions import RpcError
 from pirewall.core.models.allowlist import AllowlistEntry
+from pirewall.core.models.capture_stats import CaptureStatistics
 from pirewall.core.models.decision import FirewallDecision
 from pirewall.core.models.detection_record import DetectionRecord
 from pirewall.core.models.event import SecurityEvent
@@ -37,6 +38,11 @@ class BaseRpcClient(ABC):
 
     def get_status(self) -> StatusResult:
         return StatusResult.model_validate(self._require_data(RpcOperation.GET_STATUS))
+
+    def get_capture_stats(self) -> CaptureStatistics | None:
+        """Current capture counters, or `None` if pirewall-core has not reported any yet."""
+        data = self._optional_data(RpcOperation.GET_CAPTURE_STATS)
+        return CaptureStatistics.model_validate(data) if data is not None else None
 
     def list_flows(self) -> list[Flow]:
         return [Flow.model_validate(item) for item in self._require_list(RpcOperation.LIST_FLOWS)]

@@ -42,11 +42,17 @@ scripts/deployment/make_certs.sh <pi-lan-ip>      # writes the TLS pair
    entirely in favor of SSH keys from first boot (`raspi-config` or the
    Raspberry Pi Imager's advanced options can pre-seed this).
 3. `sudo apt update && sudo apt full-upgrade`, then reboot.
-4. Confirm your two NICs (or one NIC + USB Ethernet adapter, a common Pi 4
-   gateway setup) and note their real interface names: `ip link show`.
-   These are what `network.wan_interface`/`network.lan_interface` must
-   match exactly — do not guess or reuse the placeholder `eth0`/`eth1` from
-   `config/default_config.toml`.
+4. Confirm you have two usable interfaces and note their real names:
+   `ip link show`. pirewall needs an uplink (WAN) and an interface facing
+   the network you want protected (LAN); **each side may independently be
+   wired or wireless** — two NICs, one NIC + a USB Ethernet adapter, the
+   onboard Wi-Fi radio as a client uplink, a USB Wi-Fi dongle running an
+   access point, or any mix. §4 documents both paths for both sides.
+   Whatever you end up with, the names are what
+   `network.wan_interface`/`network.lan_interface` must match exactly — do
+   not guess or reuse the placeholder `eth0`/`eth1` from
+   `config/default_config.toml`. If both interfaces are `wlan`-named, see
+   §4.1 for how to tell the onboard radio from the dongle.
 
 ## 2. Required packages
 
@@ -118,39 +124,363 @@ uv run python -m scripts.deployment.render_templates --config config/local_confi
 ```
 
 This writes substituted files to `deploy/rendered/` — review every one
-before applying it by hand:
+before applying it by hand. The order is: identify the interfaces (§4.1),
+enable forwarding (§4.2), bring up the WAN (§4.3), bring up the LAN (§4.4),
+then load the nftables rulesets (§4.5).
 
-1. `sudo cp deploy/rendered/60-pirewall-forwarding.conf /etc/sysctl.d/60-pirewall-forwarding.conf && sudo sysctl --system`
-2. Give the LAN interface its static address — the value you set as
-   `network.pirewall_lan_ip`. **Raspberry Pi OS Bookworm and later use
-   NetworkManager**, so this is `nmcli`, not `/etc/dhcpcd.conf`:
+**Raspberry Pi OS Bookworm and later use NetworkManager**, so every
+interface command below is `nmcli`, not `/etc/dhcpcd.conf`. Only on
+Bullseye or older (which predate the NetworkManager switch) use
+`deploy/rendered/dhcpcd-lan.conf`, appended to `/etc/dhcpcd.conf`.
 
-   ```sh
-   sudo nmcli con add type ethernet ifname "$LAN_IF" con-name pirewall-lan \
-       ipv4.method manual \
-       ipv4.addresses "$PIREWALL_LAN_IP/$PREFIX" \
-       ipv4.never-default yes          # the LAN side is not our default route
-   sudo nmcli con up pirewall-lan
-   ```
+### 4.1 Identify your interfaces
 
-   `ipv4.never-default yes` matters: the Pi's own default route must stay
-   on the WAN side (toward `network.upstream_gateway`). Leave the WAN
-   interface on DHCP from the home router unless your setup needs
-   otherwise. Verify with `ip addr show "$LAN_IF"` and `ip route`.
+Do this first, and write the names down — everything after it refers to
+`$WAN_IF` and `$LAN_IF`. `ethtool` and `iw` are used throughout this
+section and are not on a Lite image by default:
 
-   Only on Bullseye or older (which predate the NetworkManager switch) use
-   `deploy/rendered/dhcpcd-lan.conf`, appended to `/etc/dhcpcd.conf`.
-3. `sudo nft -c -f deploy/firewall/base.nft.template` to check syntax
-   (note: this file has no config tokens needing rendering beyond what's
-   already substituted the same way — confirm the rendered copy in
-   `deploy/rendered/base.nft` if you rendered it), then
-   `sudo nft -f deploy/rendered/base.nft` to load it for real.
-4. `sudo nft -f deploy/rendered/nat-masquerade.nft` to load NAT.
-5. Confirm forwarding actually works from a test LAN client before
-   proceeding (e.g. `ping` and a real outbound connection through the Pi).
+```sh
+sudo apt install ethtool iw
+ip link show
+```
+
+If one side is Ethernet and the other Wi-Fi (`eth0` + `wlan0`) the names
+speak for themselves. **If both are `wlan`-named, the name alone does not
+tell you which radio is which** — ask the driver:
+
+```sh
+ethtool -i wlan0
+ethtool -i wlan1
+```
+
+| `driver:` field | What it is |
+|---|---|
+| `brcmfmac` | the Pi's **onboard** Wi-Fi radio |
+| `rtl8xxxu` | an **RTL8188EUS-class USB dongle** (in-kernel driver) |
+| `8188eu` / `rtl8188eus` | the same dongle, running the out-of-tree DKMS driver (§4.4.1) |
+| `smsc95xx`, `lan78xx`, `r8152`, … | onboard or USB **Ethernet** |
+
+Do this rather than assuming `wlan0` is onboard: USB devices are enumerated
+in probe order, so a dongle can come up as `wlan0` on one boot and `wlan1`
+on the next. Two guards are worth setting up once you know which is which:
+
+* Pin the names. Match on the USB device rather than the driver, so the
+  rule survives a driver swap:
+
+  ```ini
+  # /etc/systemd/network/10-pirewall-lan.link
+  [Match]
+  Property=ID_VENDOR_ID=0bda ID_MODEL_ID=8179
+
+  [Link]
+  Name=pirewall-lan
+  ```
+
+  Then use `pirewall-lan` as `network.lan_interface` and
+  `capture.interface`. pirewall does not care what an interface is called
+  (§4.6), so a descriptive name is free.
+* Re-run detection after any reboot that could have reordered them:
+
+  ```sh
+  uv run python -m scripts.deployment.configure --detect
+  ```
+
+  This prints the layout it observes and writes nothing. Note that when
+  more than one non-WAN interface is addressed, `--detect` breaks the tie
+  **alphabetically** and says so in a warning — it does not know which
+  radio you meant. Read the warning rather than skipping past it.
+
+### 4.2 Enable forwarding
+
+```sh
+sudo cp deploy/rendered/60-pirewall-forwarding.conf /etc/sysctl.d/60-pirewall-forwarding.conf
+sudo sysctl --system
+```
+
+### 4.3 WAN interface — pick one
+
+The WAN side needs an address and the Pi's default route. Either path
+produces exactly that; nothing later in this document depends on which one
+you took.
+
+#### Option A — wired uplink (Ethernet into the upstream router)
+
+Nothing to configure. Plug it in and let the upstream router's DHCP address
+it, which is the Raspberry Pi OS default. Confirm:
+
+```sh
+ip addr show "$WAN_IF"     # expect an address in the upstream router's subnet
+ip route                   # expect: default via <router> dev $WAN_IF
+```
+
+The gateway shown there is `network.upstream_gateway`.
+
+#### Option B — wireless uplink (associate as a client to an existing Wi-Fi network)
+
+Use the onboard radio (`brcmfmac`) as a normal Wi-Fi client:
+
+```sh
+sudo nmcli device wifi list ifname "$WAN_IF"          # confirm the SSID is visible
+sudo nmcli device wifi connect "<SSID>" password "<PSK>" ifname "$WAN_IF"
+```
+
+Confirm it associated *and* got a route — association alone is not enough:
+
+```sh
+nmcli device status                # $WAN_IF should read "connected"
+ip addr show "$WAN_IF"             # expect an address from the upstream network
+ip route                           # expect: default via <router> dev $WAN_IF
+```
+
+Two notes on this path:
+
+* **The Wi-Fi passphrase is not a pirewall secret.** It lives in
+  NetworkManager's own connection store
+  (`/etc/NetworkManager/system-connections/`, mode `600`, root-owned), the
+  same place the rest of the host's network credentials live. It never
+  enters `config/local_config.toml`, is never read by pirewall, and is not
+  covered by `CLAUDE.md`'s "never commit secrets" rule any more than the
+  host's SSH host key is — treat it as host configuration, not application
+  configuration.
+* **A wireless uplink is a shared, variable-latency medium.** If the
+  upstream link drops, the Pi loses its default route and LAN clients lose
+  internet. That is an availability property of the deployment, not a
+  pirewall failure mode, and ADDENDUM.md A6's `fail_open` default means
+  pirewall does not compound it.
+
+### 4.4 LAN interface — pick one
+
+The LAN side needs the Pi's own address on the protected network — the
+value you set as `network.pirewall_lan_ip`, in the CIDR you set as
+`network.protected_network`. Safety validation refuses to ever block that
+address (spec §24), so what the interface actually ends up holding must
+match the config exactly.
+
+#### Option A — wired LAN (static address on an Ethernet interface)
+
+```sh
+sudo nmcli con add type ethernet ifname "$LAN_IF" con-name pirewall-lan \
+    ipv4.method manual \
+    ipv4.addresses "$PIREWALL_LAN_IP/$PREFIX" \
+    ipv4.never-default yes          # the LAN side is not our default route
+sudo nmcli con up pirewall-lan
+```
+
+`ipv4.never-default yes` matters: the Pi's own default route must stay on
+the WAN side (toward `network.upstream_gateway`). Verify with
+`ip addr show "$LAN_IF"` and `ip route`.
+
+This path gives clients **no DHCP** — `ipv4.method manual` addresses the Pi
+and nothing else. Either configure LAN clients statically, or run a DHCP
+server yourself (`dnsmasq` bound to `$LAN_IF`). Option B below includes one.
+
+#### Option B — wireless LAN (a USB dongle running as an access point)
+
+This is the path for a Pi whose only wired port is doing something else, or
+none at all. `nmcli device wifi hotspot` creates the AP, and NetworkManager
+runs a `dnsmasq` instance behind it for DHCP and DNS.
+
+**Check AP support before anything else.** Not every Wi-Fi chipset can act
+as an access point, and the failure mode if it can't is confusing rather
+than explicit:
+
+```sh
+iw list | grep -A 12 "Supported interface modes"
+```
+
+`AP` must appear in that list for the radio you intend to use. If it does
+not, stop here and read §4.4.1 — no amount of `nmcli` will work around a
+driver that does not implement AP mode.
+
+Then create the hotspot and immediately pin its addressing:
+
+```sh
+sudo nmcli device wifi hotspot ifname "$LAN_IF" con-name pirewall-lan-ap \
+    ssid "<your SSID>" password "<your WPA2 passphrase, 8+ chars>"
+
+# `nmcli device wifi hotspot` picks its own subnet (10.42.0.1/24) and brings
+# the connection straight up. Override it to match your config, then bounce
+# the connection so the new address and its DHCP pool take effect.
+sudo nmcli connection modify pirewall-lan-ap \
+    ipv4.method shared \
+    ipv4.addresses "$PIREWALL_LAN_IP/$PREFIX" \
+    ipv4.never-default yes \
+    802-11-wireless.band bg \
+    wifi-sec.key-mgmt wpa-psk \
+    wifi-sec.proto rsn \
+    wifi-sec.pairwise ccmp \
+    wifi-sec.group ccmp
+sudo nmcli connection down pirewall-lan-ap
+sudo nmcli connection up pirewall-lan-ap
+```
+
+**Why the second command is not optional.** `nmcli device wifi hotspot`
+defaults to `10.42.0.1/24`, which will not match the
+`network.pirewall_lan_ip` / `network.protected_network` in
+`config/local_config.toml`. If you leave the mismatch in place, safety
+validation is protecting an address the Pi does not have and rule
+generation is scoping rules to a network no client is on — pirewall will
+start and look healthy while enforcing against the wrong subnet. Keeping
+`ipv4.method shared` is what preserves the DHCP/DNS service; overriding
+`ipv4.addresses` is what moves it onto your subnet. `wifi-sec.*` pins
+WPA2-CCMP explicitly rather than relying on the default, and
+`802-11-wireless.band bg` pins 2.4 GHz (see §4.4.2).
+
+The other order that works, if you would rather never have the wrong subnet
+live at all, is `nmcli connection add type wifi ... ipv4.method shared` with
+every property set up front. The two-step form above is documented because
+it is harder to get wrong.
+
+Verify — all four, not just the first:
+
+```sh
+nmcli device status                          # $LAN_IF: "connected", pirewall-lan-ap
+nmcli connection show pirewall-lan-ap | grep -E 'ipv4.method|ipv4.addresses|802-11-wireless'
+ip addr show "$LAN_IF"                       # must show $PIREWALL_LAN_IP
+iw dev "$LAN_IF" info                        # expect: type AP
+```
+
+Then **connect a real client device** and confirm it gets a lease in your
+subnet before moving on:
+
+```sh
+sudo journalctl -u NetworkManager | grep -i dhcp   # dnsmasq lease messages
+ip neigh show dev "$LAN_IF"                        # the client's address should appear
+```
+
+A client that associates but gets no address, or an address in
+`10.42.0.0/24`, means the `ipv4.addresses` override did not take — go back
+and re-check `nmcli connection show`.
+
+**One interaction to check, not assume:** `ipv4.method shared` makes
+NetworkManager install its *own* masquerade rules for the shared subnet, in
+addition to whatever you load from `deploy/rendered/nat-masquerade.nft`.
+After §4.5, run `sudo nft list ruleset` and look at what masquerade rules
+actually exist. If NetworkManager has already covered
+`network.protected_network`, loading the template's rule as well is
+redundant. Decide deliberately which one owns NAT rather than ending up
+with both by accident.
+
+##### 4.4.1 RTL8188EUS (USB ID `0bda:8179`) — AP-mode caveat
+
+This dongle is the one this deployment was specified around, and it has a
+known wrinkle worth stating plainly. The in-kernel driver it binds to is
+`rtl8xxxu`, whose AP-mode support for this chipset is incomplete: depending
+on your kernel version, `iw list` may not list `AP` under "Supported
+interface modes" at all, or may list it while the hotspot fails to start,
+starts and accepts no clients, or drops clients shortly after association.
+
+Confirm with the `iw list` check in §4.4 **before** troubleshooting `nmcli`
+— if `AP` is absent, the problem is the driver and nothing at the
+NetworkManager layer will fix it.
+
+The documented fallback is to replace `rtl8xxxu` with the out-of-tree
+Realtek `rtl8188eus` driver, which does implement AP mode for this chipset,
+built as a DKMS module so it survives kernel upgrades:
+
+> <https://github.com/aircrack-ng/rtl8188eus>
+
+Follow that repository's own instructions. They are **not reproduced here**
+on purpose: the build depends on your exact kernel headers and blacklisting
+`rtl8xxxu`, it has not been run against this deployment, and inlining steps
+nobody here has executed would be the kind of unverified claim `CLAUDE.md`'s
+labeling rules exist to prevent. This is the same category as every other
+host-specific step in this document — **documented, not automated**.
+
+After swapping drivers, re-check `ethtool -i "$LAN_IF"` (the `driver:` field
+becomes `8188eu`), re-run the `iw list` check, and note that the interface
+may come back with a different name — re-run `--detect` (§4.1).
+
+##### 4.4.2 What this dongle can and cannot do
+
+The RTL8188EUS is **2.4 GHz only, 802.11b/g/n, single-stream** — a ~150
+Mbps PHY rate, so realistically ~40–70 Mbps of usable throughput shared
+across every client, less on a congested 2.4 GHz band. There is no 5 GHz
+and no 802.11ac/ax.
+
+This is irrelevant to pirewall's own function: capture, flow tracking,
+detection, and enforcement are unaffected by link rate, and a Pi 4 is not
+throughput-limited by pirewall at these speeds. It matters only for
+expectations — if the protected LAN carries anything bandwidth-heavy, the
+dongle is the ceiling, not the firewall.
+
+### 4.5 Load the nftables rulesets
+
+```sh
+sudo nft -c -f deploy/rendered/base.nft         # syntax check first
+sudo nft -f deploy/rendered/base.nft
+sudo nft -f deploy/rendered/nat-masquerade.nft  # see the NAT note in §4.4 Option B
+```
+
+Load `base.nft` **before** `nat-masquerade.nft`: the base ruleset's
+deny-by-default forwarding posture should exist before NAT starts
+forwarding traffic. Both templates reference `${WAN_INTERFACE}` /
+`${LAN_INTERFACE}` by name, so if you renamed an interface in §4.1 or
+switched a side between wired and wireless, re-render before loading.
+
+Then confirm forwarding actually works from a test LAN client (e.g. `ping`
+and a real outbound connection through the Pi) before proceeding.
 
 See `deploy/network/README.md` and `deploy/firewall/README.md` for the full
 rationale behind each template and the load order.
+
+### 4.6 Why pirewall itself does not care which paths you picked
+
+Worth stating explicitly, because a Wi-Fi-only deployment otherwise leaves
+it as an unstated assumption:
+
+* **pirewall's runtime code never distinguishes wired from wireless.**
+  `network.wan_interface`, `network.lan_interface`, and
+  `capture.interface` are plain strings (`pirewall/config/models.py`); no
+  code anywhere branches on an interface's name or type. The nftables
+  templates substitute whatever names you configured, and adaptive rules
+  generated at runtime match on addresses and ports, never on an interface.
+* **`AF_PACKET` capture is identical on a client-mode and an AP-mode
+  interface.** `pirewall.capture.af_packet.AFPacketCapture` binds a
+  `SOCK_RAW` socket to the interface by name and reads
+  Ethernet-framed packets. The kernel's mac80211 layer presents a wireless
+  interface in either mode as a normal Ethernet device to `AF_PACKET` —
+  802.11 headers are stripped and 802.3 headers synthesized before the
+  packet reaches the socket. `pirewall/capture/parser.py` therefore sees
+  exactly the same frames it would on `eth0`, and needs no wireless-specific
+  handling. (This holds for `managed` and `AP` mode; it would *not* hold for
+  `monitor` mode, which delivers raw 802.11 frames — pirewall does not use
+  monitor mode.)
+
+#### Switching between wired and wireless later
+
+Because of the two points above, moving either side between modes is purely
+a NetworkManager operation. There is **no pirewall config change and no code
+change** involved:
+
+```sh
+sudo nmcli con down pirewall-lan-ap        # or pirewall-lan / the wifi connection
+sudo nmcli con delete pirewall-lan-ap
+# ...then run the other option's commands from §4.3 or §4.4
+```
+
+Afterwards, do these three things — they are the only pirewall-side work:
+
+1. Re-run detection to confirm the new layout is what you think it is:
+
+   ```sh
+   uv run python -m scripts.deployment.configure --detect
+   ```
+
+2. If the interface **name** changed (it will, switching between an
+   Ethernet port and a Wi-Fi radio), update `network.wan_interface` /
+   `network.lan_interface` / `capture.interface` in
+   `config/local_config.toml`, re-render the templates (§4), reload
+   `base.nft` and `nat-masquerade.nft`, and
+   `sudo systemctl restart pirewall-core`.
+3. If the interface name is the same and the addressing is unchanged,
+   nothing needs to change at all — `uv run python -m pirewall.main
+   --check-config` and a restart are enough to confirm it.
+
+Keeping `network.pirewall_lan_ip` and `network.protected_network` the same
+across a LAN-side switch means step 2 is the only edit, and the allowlist,
+the Admin PC restriction, and every safety-validation invariant carry over
+untouched.
 
 ## 5. Create service users/groups
 

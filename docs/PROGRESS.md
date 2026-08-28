@@ -205,6 +205,126 @@ could rewrite `enforcement_mode` or `admin_pc_ip` over HTTP would make one
 stolen session equivalent to owning the firewall (spec §45). Configuration
 changes stay an out-of-band, SSH-and-restart operation.
 
+### Wireless-deployment documentation session
+
+The operator's deployment target was confirmed as **all-wireless**: the
+onboard Pi radio (`brcmfmac`) associated as a *client* to an existing
+upstream Wi-Fi network as the WAN, and an RTL8188EUS USB dongle (USB ID
+`0bda:8179`) running as an access point as the LAN. Documentation and test
+coverage only; **no runtime code changed**.
+
+**Verified first, not assumed** — the premise that pirewall's runtime is
+interface-type agnostic was checked rather than trusted:
+
+- `network.wan_interface`, `network.lan_interface` and `capture.interface`
+  are plain `str = Field(min_length=1)` in `pirewall/config/models.py` — no
+  pattern, no type enum.
+- `AFPacketCapture` passes the name straight to `sock.bind((name, 0))` and
+  `socket.if_nametoindex(name)`; both resolve any interface the kernel has.
+- Grepping `pirewall/` for `wlan|eth0|eth1|wifi|wireless|ethernet` returns
+  only `capture/parser.py`'s comments about Ethernet *framing*. Grepping for
+  `iifname|oifname|wan_interface|lan_interface` returns only the two config
+  fields — the firewall backend emits no interface match at all; adaptive
+  rules are address/port-based. Interface names reach `deploy/*.template`
+  as `${WAN_INTERFACE}`/`${LAN_INTERFACE}` string substitution and nowhere
+  else.
+- `scripts/deployment/discovery.py` picks the WAN from whichever `dev`
+  carries the IPv4 default route and the LAN as the first addressed non-WAN
+  interface *sorted by name* — no `eth`/`wlan` preference anywhere.
+
+So the conclusion holds, with one honest caveat recorded rather than
+patched around: `choose_lan_interface` breaks ties **alphabetically**. That
+is pre-existing and identical for `eth0`/`eth1`, but it bites harder with a
+USB radio, whose `wlan0`/`wlan1` ordering is not stable across reboots.
+Documented (`docs/DEPLOYMENT.md` §4.1: `ethtool -i` to identify, a
+`systemd.link` snippet to pin a stable name, `--detect` to re-confirm after
+a reboot) rather than changed — guessing which radio the operator meant is
+exactly what that function deliberately refuses to do.
+
+**Implemented (as documentation)** — `docs/DEPLOYMENT.md` §4 restructured
+so WAN and LAN are each an explicit *pick one* between a wired and a
+wireless path, with the previously-documented wired paths kept intact and
+relabelled as one of two options rather than the only one. New: §4.1
+interface identification (`ethtool -i`: `brcmfmac` = onboard,
+`rtl8xxxu`/`8188eu` = the dongle), §4.3 Option B Wi-Fi-client WAN via
+`nmcli device wifi connect`, §4.4 Option B Wi-Fi-AP LAN via
+`nmcli device wifi hotspot` **including the mandatory
+`ipv4.addresses` override** — the hotspot defaults to `10.42.0.1/24`, and
+leaving that mismatched with `network.pirewall_lan_ip` /
+`network.protected_network` would let pirewall start looking healthy while
+safety-validating an address the Pi does not hold — §4.6 on why neither
+choice reaches pirewall's code, and a "switching later" subsection stating
+that moving a side between modes is `nmcli con down`/`delete` plus the
+other path's commands, with `--detect` afterwards and no pirewall config or
+code change unless the interface *name* changed. `docs/SETUP.md` gained the
+condensed command-only version of all of it; `deploy/network/README.md`'s
+order-of-operations no longer implies a wired-only LAN.
+
+**Implemented (as documentation)** — `docs/DEPLOYMENT.md` §4.6 now states
+explicitly that `AF_PACKET` capture is identical on a managed-mode client
+interface and an AP-mode interface, because mac80211 strips 802.11 and
+synthesizes 802.3 headers before the packet reaches the socket, so
+`capture/parser.py` sees the same frames it would on `eth0`. Previously an
+unstated assumption; noted there that this holds for `managed`/`AP` but
+*not* `monitor` mode, which pirewall does not use.
+
+**Tested** — `tests/unit/test_discovery.py::TestWirelessLayout`, 5 new
+tests (512 total). Adds `_WIRELESS_ROUTES`/`_WIRELESS_ADDRESSES`/
+`_WIRELESS_NEIGHBOURS` fixtures with a **wlan-named WAN and a different
+wlan-named LAN** — a shape no previous fixture covered, since the existing
+one is `eth0` WAN + `wlan0` LAN. Covers `parse_default_route`,
+`parse_addresses`, `choose_lan_interface` (including that a third addressed
+wlan interface warns exactly as `eth1`/`wlan0` does), and `discover()` end
+to end with `_run_ip` stubbed — asserting `pirewall_lan_ip` and
+`upstream_gateway` come out right on a wireless layout, and that neighbour
+scanning targets the AP interface rather than the uplink radio. `ruff check
+.` clean, `pyright --strict` clean, full suite green; nothing was weakened
+to achieve that.
+
+**Environment-dependent** — everything about the actual hardware. Stated
+plainly because none of it could be exercised here:
+
+- **RTL8188EUS AP-mode support is not confirmed.** The in-kernel
+  `rtl8xxxu` driver's AP support for this chipset is incomplete and
+  kernel-version-dependent: `iw list` may omit `AP` entirely, or list it
+  while the hotspot fails to start, accepts no clients, or drops them after
+  association. §4.4/§4.4.1 document the `iw list` check as the thing to run
+  *before* troubleshooting `nmcli`, and the fallback of replacing the
+  driver with the out-of-tree DKMS one at
+  <https://github.com/aircrack-ng/rtl8188eus>. **That link is given instead
+  of inlined install steps on purpose** — the build depends on the exact
+  kernel headers and on blacklisting `rtl8xxxu`, and has not been run by
+  anyone here; inlining unverified commands is what the labeling rules
+  exist to prevent. Same category as every other host-specific step in
+  `DEPLOYMENT.md`: **documented, not automated**.
+- **The hotspot working end to end has not been observed.** The `nmcli`
+  sequence, the `ipv4.method shared` + `ipv4.addresses` override actually
+  producing DHCP leases on `network.protected_network`, and a real client
+  associating and routing through the Pi are all unverified. **A human
+  must**: run §4.4 Option B on the real dongle, then confirm
+  `ip addr show "$LAN_IF"` holds `pirewall_lan_ip`, `iw dev "$LAN_IF" info`
+  reports `type AP`, and a real client device gets a lease in the
+  configured subnet and **not** in `10.42.0.0/24`.
+- **NAT ownership needs a human decision on the box.**
+  `ipv4.method shared` makes NetworkManager install its own masquerade
+  rules alongside whatever `deploy/rendered/nat-masquerade.nft` loads.
+  §4.4 Option B says to run `sudo nft list ruleset` after §4.5 and decide
+  deliberately which one owns NAT. Not resolved here — which is correct
+  either way depends on the live ruleset, and this repository never touches
+  it.
+- **Wi-Fi-client WAN association** (`nmcli device wifi connect`, and the
+  Pi keeping its default route over a variable-latency shared medium) is
+  likewise real-hardware-only.
+- **`AF_PACKET` on an AP-mode interface** — the §4.6 claim is a statement
+  about kernel behaviour, not something exercised here. `AFPacketCapture`
+  remains Environment-dependent exactly as it was for Phase 2; a wireless
+  LAN does not change that label in either direction.
+
+The ~150 Mbps 2.4 GHz 802.11b/g/n ceiling of this dongle (§4.4.2) is
+recorded as an expectation-setting note. It does not affect pirewall —
+capture, flow tracking, detection and enforcement are link-rate
+independent — but it is the throughput ceiling of the protected LAN.
+
 ### Phase 4 details
 
 Real CICIDS2017/UNSW-NB15 dataset files were **not found** on this machine

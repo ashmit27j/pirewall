@@ -43,13 +43,26 @@ applying it by hand on the Pi.
 ## Order of operations on the real Pi
 
 1. Confirm `network.wan_interface`/`network.lan_interface` in your config
-   actually match `ip link show` on the target hardware — do not guess.
-2. Apply `60-pirewall-forwarding.conf` (sysctl), then give the LAN
-   interface its static address — `nmcli` on Bookworm and later,
-   `dhcpcd-lan.conf` only on Bullseye and older (see the table above).
-   Restart networking or reboot, then confirm the LAN interface came up
-   with the expected address and that the default route still points at
-   `upstream_gateway` on the WAN side.
+   actually match `ip link show` on the target hardware — do not guess. If
+   both are `wlan`-named, use `ethtool -i <iface>` to tell the onboard Pi
+   radio (`brcmfmac`) from a USB dongle (`rtl8xxxu`/`8188eu`); USB probe
+   order makes `wlan0`/`wlan1` unstable across reboots
+   (`docs/DEPLOYMENT.md` §4.1).
+2. Apply `60-pirewall-forwarding.conf` (sysctl), then bring up both sides.
+   **Each side may independently be wired or wireless** — a wired or
+   Wi-Fi-client WAN, and a static-Ethernet or Wi-Fi-AP LAN;
+   `docs/DEPLOYMENT.md` §4.3/§4.4 documents all four combinations. Either
+   way this is `nmcli` on Bookworm and later, and `dhcpcd-lan.conf` only on
+   Bullseye and older with a wired LAN (see the table above). Then confirm
+   the LAN interface came up with the expected address — for a Wi-Fi AP,
+   that means overriding `nmcli device wifi hotspot`'s default
+   `10.42.0.1/24` onto `network.protected_network` — and that the default
+   route still points at `upstream_gateway` on the WAN side.
+
+   These templates substitute interface *names* only; nothing in them or in
+   `pirewall/` distinguishes wired from wireless (`docs/DEPLOYMENT.md`
+   §4.6). Switching a side between the two later means re-rendering these
+   templates if the name changed, and nothing else.
 3. Load `deploy/firewall/base.nft.template` (see that directory's README)
    **before** `nat-masquerade.nft.template` — the base ruleset's
    deny-by-default forwarding posture should exist before NAT starts

@@ -26,13 +26,94 @@ you run deliberately.
   not for 32-bit `armv7l`, and compiling them on the Pi takes hours and
   usually fails for lack of RAM.
 * **Two network interfaces**: an uplink (WAN) and the interface facing the
-  network you want protected (LAN). A second NIC, a USB Ethernet adapter,
-  or the Pi's own Wi-Fi hotspot all work.
+  network you want protected (LAN). **Each side can independently be wired
+  or wireless** — see the next section.
 * **The LAN side must already be up and addressed** before step 3 — that is
   what setup reads the layout from.
 
 See `DEPLOYMENT.md` §1–§4 for OS setup, packages, installing Python 3.12
 via `uv`, and applying the network/NAT templates.
+
+### Bring the two interfaces up — pick one path per side
+
+Independent choices: wired WAN + wireless LAN, wireless WAN + wired LAN, or
+either matching pair. pirewall's own code never distinguishes them
+(`DEPLOYMENT.md` §4.6), so nothing later in this file changes with your
+choice. Bookworm and later: this is `nmcli`, not `/etc/dhcpcd.conf`.
+
+**First, know which interface is which.** With two `wlan`-named interfaces
+the name alone does not tell you — `wlan0` is not guaranteed to be the
+onboard radio across reboots, since USB probe order decides it:
+
+```sh
+ip link show
+ethtool -i wlan0        # driver brcmfmac = onboard Pi radio
+ethtool -i wlan1        # driver rtl8xxxu (or 8188eu) = RTL8188EUS USB dongle
+```
+
+`DEPLOYMENT.md` §4.1 has a `systemd.link` snippet to pin stable names.
+
+**WAN — pick one:**
+
+```sh
+# A. Wired: plug into the upstream router, take DHCP. Nothing to configure.
+ip addr show "$WAN_IF" && ip route      # confirm an address and a default route
+
+# B. Wireless: associate as a client to the existing Wi-Fi network.
+sudo nmcli device wifi connect "<SSID>" password "<PSK>" ifname "$WAN_IF"
+ip addr show "$WAN_IF" && ip route      # confirm an address and a default route
+```
+
+The Wi-Fi passphrase lives in NetworkManager's own store, not in
+`config/local_config.toml` — host configuration, like an SSH host key, not
+a pirewall secret.
+
+**LAN — pick one:**
+
+```sh
+# A. Wired: static address, no DHCP server (configure clients statically
+#    or run your own dnsmasq).
+sudo nmcli con add type ethernet ifname "$LAN_IF" con-name pirewall-lan \
+    ipv4.method manual ipv4.addresses "$PIREWALL_LAN_IP/$PREFIX" \
+    ipv4.never-default yes
+sudo nmcli con up pirewall-lan
+
+# B. Wireless AP on a USB dongle. CHECK AP SUPPORT FIRST — "AP" must appear:
+iw list | grep -A 12 "Supported interface modes"
+
+sudo nmcli device wifi hotspot ifname "$LAN_IF" con-name pirewall-lan-ap \
+    ssid "<your SSID>" password "<WPA2 passphrase, 8+ chars>"
+# Required: the hotspot defaults to 10.42.0.1/24 and MUST be moved onto the
+# subnet in your config, or pirewall protects an address the Pi lacks.
+sudo nmcli connection modify pirewall-lan-ap \
+    ipv4.method shared ipv4.addresses "$PIREWALL_LAN_IP/$PREFIX" \
+    ipv4.never-default yes 802-11-wireless.band bg \
+    wifi-sec.key-mgmt wpa-psk wifi-sec.proto rsn \
+    wifi-sec.pairwise ccmp wifi-sec.group ccmp
+sudo nmcli connection down pirewall-lan-ap && sudo nmcli connection up pirewall-lan-ap
+
+nmcli device status && ip addr show "$LAN_IF" && iw dev "$LAN_IF" info
+# Then connect a real client and confirm it gets a lease in YOUR subnet,
+# not 10.42.0.x.
+```
+
+If `iw list` does not show `AP` for an RTL8188EUS dongle (USB `0bda:8179`),
+or the hotspot starts but drops clients, the in-kernel `rtl8xxxu` driver is
+the problem — `DEPLOYMENT.md` §4.4.1 documents replacing it with
+<https://github.com/aircrack-ng/rtl8188eus>. That dongle is also 2.4 GHz
+802.11b/g/n only (~150 Mbps PHY ceiling).
+
+**Switching later** is a NetworkManager operation only — no pirewall config
+or code change:
+
+```sh
+sudo nmcli con down <name> && sudo nmcli con delete <name>
+# ...then the other path's commands above
+uv run python -m scripts.deployment.configure --detect   # confirm the new layout
+```
+
+Update `network.*_interface` / `capture.interface` and re-render the
+templates only if the interface *name* changed. `DEPLOYMENT.md` §4.6.
 
 ## 1. Install pirewall
 

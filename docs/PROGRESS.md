@@ -369,6 +369,63 @@ still built and verified using small synthetic fixture data:
 
 ruff clean, pyright --strict clean (93 files, 193 tests total).
 
+### Real-data training session (laptop, post entry-point/setup-tooling)
+
+Operator provided a real UNSW-NB15 dataset subset under a same-day
+deadline (`data/UNSW_NB15_training-set.csv` + `data/UNSW_NB15_testing-set.csv`,
+the standard 48-feature ML-ready partition files, headers verified
+identical). Both files were concatenated into
+`data/UNSW_NB15_combined.csv` (gitignored, not committed) so both training
+CLIs use the full 257,673 rows supplied rather than discarding one file —
+class breakdown: Normal 93,000 / Generic 58,871 / Exploits 44,525 /
+Fuzzers 24,246 / DoS 16,353 / Reconnaissance 13,987 / Analysis 2,677 /
+Backdoor 2,329 / Shellcode 1,511 / Worms 174. Ran on a Windows dev laptop
+(`uv` installed via `pip install uv` under `py -3.12`, distinct from the
+project's usual macOS dev environment — `uv sync` and `pytest tests/ml/`
+both ran clean first as a sanity check before training).
+
+- **Tested** — `python -m scripts.train.train_lightgbm --dataset unsw
+  --dataset-path data/UNSW_NB15_combined.csv --model-version 0.1.0
+  --output-dir pirewall/ml/artifacts` and the equivalent
+  `train_isolation_forest` command, both **without** `--placeholder`
+  (`is_placeholder: false` — this is real attack/normal traffic, not a
+  synthetic fixture) but with `notes` stating plainly that the dataset is a
+  reduced subset, not the full raw UNSW-NB15 corpus (~2.5M flows) or
+  CICIDS2017. Produced real artifacts replacing the old Phase 4 synthetic
+  placeholders: `pirewall/ml/artifacts/lightgbm_model.txt` (accuracy
+  0.7155, macro-F1 0.4120 on a 25% held-out internal split) and
+  `pirewall/ml/artifacts/isolation_forest_model.joblib` (precision 0.5639,
+  recall 0.0702, FPR 0.0968, FNR 0.9298). `tests/ml/` (36 tests) re-run and
+  still green against the new artifacts. Both `.metadata.json` sidecars
+  were produced directly by the training run (never hand-edited), carrying
+  the real `feature_schema_version`/`feature_ordering` for the runtime
+  schema-compatibility gate to check against.
+- **Explicit limitation, not a formality**: these numbers must not be read
+  as representative of full-dataset performance. 257,673 rows across a
+  same-day-provided subset is materially less data and label diversity than
+  a full CICIDS2017 or complete UNSW-NB15 corpus — expect **materially
+  weaker real-world detection accuracy** than a full training run would
+  produce, per spec §34's attack-lab caveat and this file's Phase 4 note
+  above.
+- **Isolation Forest's low recall (0.0702) is a pre-existing pipeline
+  property, not new this session**: `train_isolation_forest` fits on the
+  whole training split (attacks included), not a normal-only subset, per
+  `pirewall/ml/training/isolation_forest_trainer.py`'s own docstring
+  ("labels are only used for evaluation... the model itself never sees
+  labels"). On a dataset that is ~64% attack traffic, the fitted "normal"
+  boundary is far looser than an anomaly detector trained on genuinely
+  benign-only traffic would produce. Not fixed here — changing the
+  trainer's fit-time filtering is a design change outside this session's
+  scope (train models with the existing pipeline, not modify it).
+- **Deployment**: copy `pirewall/ml/artifacts/lightgbm_model.txt`,
+  `lightgbm_model.txt.metadata.json`, `isolation_forest_model.joblib`, and
+  `isolation_forest_model.joblib.metadata.json` to
+  `/opt/pirewall/pirewall/ml/artifacts/` on the Pi (manual `scp`/`rsync`,
+  per `docs/DEPLOYMENT.md` §9's secure update procedure) then restart
+  `pirewall-core` — the schema-compatibility gate will refuse a bad
+  artifact rather than silently degrading. No manual metadata edits needed;
+  the sidecars are already correct as training output.
+
 ### Phase 8 details
 
 Goal: deployment artifacts + hardening documentation + Wazuh/Netdata

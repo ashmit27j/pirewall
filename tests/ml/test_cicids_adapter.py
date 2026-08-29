@@ -1,4 +1,9 @@
-"""`load_cicids2017` against small synthetic fixture CSVs (spec §12, §13)."""
+"""`load_cicids2017` against small synthetic fixture CSVs (spec §12, §13).
+
+Fixture header matches the real, published "MachineLearningCVE" CICIDS2017
+column layout, verified against all 8 real files this project trains
+against: no Source IP, Source Port, Destination IP, or Protocol column.
+"""
 
 from pathlib import Path
 
@@ -8,9 +13,13 @@ from pirewall.core.enums import Protocol
 from pirewall.core.exceptions import DatasetError
 from pirewall.ml.preprocessing.cicids_adapter import load_cicids2017
 
+# Matches the adapter's own documented placeholder (this dataset variant has
+# no real source/destination IP columns).
+_PLACEHOLDER_SOURCE_IP = "10.255.255.1"
+_PLACEHOLDER_DESTINATION_IP = "10.255.255.2"
+
 _HEADER = (
-    " Source IP, Source Port, Destination IP, Destination Port, Protocol,"
-    " Flow Duration, Total Fwd Packets, Total Backward Packets,"
+    " Destination Port, Flow Duration, Total Fwd Packets, Total Backward Packets,"
     "Total Length of Fwd Packets, Total Length of Bwd Packets,"
     " Fwd Packet Length Max, Fwd Packet Length Min, Fwd Packet Length Mean,"
     " Fwd Packet Length Std, Bwd Packet Length Max, Bwd Packet Length Min,"
@@ -21,7 +30,7 @@ _HEADER = (
 )
 
 _BENIGN_ROW = (
-    "192.168.1.10,51234,93.184.216.34,443,6,"
+    "443,"
     "1000000,5,4,600,400,"
     "150,100,120,15,"
     "120,80,100,12,"
@@ -31,7 +40,7 @@ _BENIGN_ROW = (
 )
 
 _DDOS_ROW = (
-    "192.168.1.10,51235,93.184.216.35,80,6,"
+    "80,"
     "500000,100,1,6000,60,"
     "60,60,60,0,"
     "60,60,60,0,"
@@ -40,18 +49,20 @@ _DDOS_ROW = (
     "0,DDoS"
 )
 
+# All TCP flag counts zero, on a well-known UDP port -- exercises the
+# fallback branch of `_infer_protocol`.
 _UDP_ROW = (
-    "192.168.1.11,53,93.184.216.36,53,17,200000,2,2,120,120,"
+    "53,200000,2,2,120,120,"
     "60,60,60,0,60,60,60,0,100000,0,100000,100000,0,0,0,0,0,0,BENIGN"
 )
 
 _MISSING_VALUE_ROW = (
-    "192.168.1.12,,93.184.216.37,443,6,1000000,5,4,600,400,"
+    ",1000000,5,4,600,400,"
     "150,100,120,15,120,80,100,12,50000,10000,80000,20000,1,4,1,0,3,0,BENIGN"
 )
 
-_INVALID_IP_ROW = (
-    "not-an-ip,51236,93.184.216.38,443,6,1000000,5,4,600,400,"
+_INVALID_VALUE_ROW = (
+    "not-a-port,1000000,5,4,600,400,"
     "150,100,120,15,120,80,100,12,50000,10000,80000,20000,1,4,1,0,3,0,BENIGN"
 )
 
@@ -72,7 +83,10 @@ def test_loads_valid_rows(tmp_path: Path) -> None:
     benign = result.labeled_flows[0]
     assert benign.label == "BENIGN"
     assert benign.flow.protocol is Protocol.TCP
-    assert benign.flow.source_ip.compressed == "192.168.1.10"
+    assert benign.flow.source_ip.compressed == _PLACEHOLDER_SOURCE_IP
+    assert benign.flow.destination_ip.compressed == _PLACEHOLDER_DESTINATION_IP
+    assert benign.flow.source_port is None
+    assert benign.flow.destination_port == 443
     assert benign.flow.packet_count == 9
     assert benign.flow.byte_count == 1000
     assert benign.flow.duration_seconds == 1.0  # microseconds -> seconds
@@ -80,7 +94,7 @@ def test_loads_valid_rows(tmp_path: Path) -> None:
     assert benign.flow.tcp_flags.ack == 4
 
     udp = result.labeled_flows[2]
-    assert udp.flow.protocol is Protocol.UDP
+    assert udp.flow.protocol is Protocol.UDP  # inferred: zero flags + well-known UDP port
 
 
 def test_missing_value_is_skipped_and_counted(tmp_path: Path) -> None:
@@ -91,8 +105,8 @@ def test_missing_value_is_skipped_and_counted(tmp_path: Path) -> None:
     assert result.skipped_rows == 1
 
 
-def test_invalid_ip_is_skipped_and_counted(tmp_path: Path) -> None:
-    csv_path = _write_csv(tmp_path / "cicids.csv", [_BENIGN_ROW, _INVALID_IP_ROW])
+def test_invalid_value_is_skipped_and_counted(tmp_path: Path) -> None:
+    csv_path = _write_csv(tmp_path / "cicids.csv", [_BENIGN_ROW, _INVALID_VALUE_ROW])
     result = load_cicids2017(csv_path)
 
     assert len(result.labeled_flows) == 1

@@ -1,21 +1,41 @@
 """CICIDS2017 -> canonical dataset adapter (spec §12, §13).
 
 Targets the widely-distributed CICFlowMeter-generated "MachineLearningCVE"
-per-flow CSVs (the files most commonly referred to as "CICIDS2017"), which
-include real Source/Destination IP and port columns. Column names in that
-distribution have inconsistent leading/trailing whitespace and mixed case,
-so every header is normalized (`strip().lower()`) before matching.
+per-flow CSVs (the files most commonly referred to as "CICIDS2017"). Column
+names in that distribution have inconsistent leading/trailing whitespace and
+mixed case, so every header is normalized (`strip().lower()`) before
+matching.
 
-Two CICIDS2017-specific unit quirks handled here, not left for callers to
-discover the hard way:
+**Verified against all 8 real "MachineLearningCVE" files (not assumed):**
+this distribution has **no Source IP, Source Port, Destination IP, or
+Protocol column at all** — only "Destination Port" identifies the
+connection, and there is nothing that names the transport protocol
+directly. An earlier version of this adapter assumed those columns existed
+(they don't, in the actual published release) and failed outright on real
+data. Handled the same honest way `unsw_adapter` handles UNSW-NB15's own
+missing IP/port columns, not silently:
 
-* `Flow Duration` is in **microseconds**, not seconds.
-* `Protocol` is the **numeric** IANA protocol number (6/17/1), not a string.
+* `source_ip`/`destination_ip` are a fixed documented placeholder
+  (`10.255.255.1`/`.2`) — this format carries no real network identity.
+* `source_port` is always `None` (not present).
+* `protocol` is **inferred**, not read directly, since no column names it:
+  any nonzero TCP flag count (SYN/ACK/FIN/RST/PSH/URG) means TCP (flags are
+  only ever set by TCP); failing that, a well-known-UDP-port match on
+  `destination_port` (DNS/DHCP/NTP/NetBIOS/SNMP/SSDP/mDNS/...) means UDP;
+  otherwise it defaults to TCP, since CICFlowMeter is known to report
+  all-zero flag counts for plenty of genuinely-TCP flows that timed out
+  without a captured FIN/RST (idle HTTPS keep-alives, etc.), and TCP is the
+  dominant protocol in this capture. This is a real, disclosed limitation of
+  training on this dataset variant, not a silently invented number — do not
+  treat `protocol_is_tcp`/`protocol_is_udp`/`protocol_is_icmp` as ground
+  truth from this adapter the way they would be from live packet capture.
 
-If your CSV doesn't have these columns (e.g. a stripped-down mirror without
-IP/port columns), this adapter will fail with a clear `DatasetError` naming
-the missing column — get the original CICFlowMeter output instead of a
-repackaged variant.
+One CICIDS2017-specific unit quirk handled here, not left for callers to
+discover the hard way: `Flow Duration` is in **microseconds**, not seconds.
+
+If your CSV doesn't have the columns checked below (e.g. a further
+stripped-down mirror), this adapter will fail with a clear `DatasetError`
+naming the missing column.
 """
 
 import csv
@@ -34,11 +54,7 @@ from pirewall.ml.preprocessing.common import (
 )
 
 _REQUIRED_COLUMNS = (
-    "source ip",
-    "source port",
-    "destination ip",
     "destination port",
-    "protocol",
     "flow duration",
     "total fwd packets",
     "total backward packets",
@@ -65,7 +81,21 @@ _REQUIRED_COLUMNS = (
     "label",
 )
 
-_PROTOCOL_BY_NUMBER = {6: Protocol.TCP, 17: Protocol.UDP, 1: Protocol.ICMP}
+_PLACEHOLDER_SOURCE_IP = "10.255.255.1"
+_PLACEHOLDER_DESTINATION_IP = "10.255.255.2"
+
+# Real, well-known UDP service ports -- used only as a fallback signal when
+# every TCP flag count is zero (see module docstring). Not exhaustive; a
+# real port assignment fact, not a fabricated one.
+_KNOWN_UDP_PORTS = frozenset({53, 67, 68, 69, 123, 137, 138, 161, 162, 500, 514, 520, 1900, 5353})
+
+
+def _infer_protocol(flag_sum: int, destination_port: int) -> Protocol:
+    if flag_sum > 0:
+        return Protocol.TCP
+    if destination_port in _KNOWN_UDP_PORTS:
+        return Protocol.UDP
+    return Protocol.TCP
 
 
 def _build_header_map(fieldnames: list[str]) -> dict[str, str]:
@@ -111,12 +141,7 @@ def _parse_row(raw_row: dict[str, str], header: dict[str, str], index: int) -> L
     def get(column: str) -> str:
         return raw_row[header[column]]
 
-    source_ip = get("source ip").strip()
-    destination_ip = get("destination ip").strip()
-    source_port = int(parse_float(raw_row, header["source port"]))
     destination_port = int(parse_float(raw_row, header["destination port"]))
-    protocol_number = int(parse_float(raw_row, header["protocol"]))
-    protocol = _PROTOCOL_BY_NUMBER.get(protocol_number, Protocol.OTHER)
 
     duration_seconds = parse_float(raw_row, header["flow duration"]) / 1_000_000.0
 
@@ -154,14 +179,16 @@ def _parse_row(raw_row: dict[str, str], header: dict[str, str], index: int) -> L
     psh = int(parse_float(raw_row, header["psh flag count"]))
     urg = int(parse_float(raw_row, header["urg flag count"]))
 
+    protocol = _infer_protocol(syn + ack + fin + rst + psh + urg, destination_port)
+
     label = get("label").strip()
 
     flow = Flow.model_validate(
         {
             "flow_id": f"cicids-{index}",
-            "source_ip": source_ip,
-            "destination_ip": destination_ip,
-            "source_port": source_port,
+            "source_ip": _PLACEHOLDER_SOURCE_IP,
+            "destination_ip": _PLACEHOLDER_DESTINATION_IP,
+            "source_port": None,
             "destination_port": destination_port,
             "protocol": protocol,
             "first_seen": SYNTHETIC_EPOCH,

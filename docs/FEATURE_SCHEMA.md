@@ -95,6 +95,16 @@ deviations" — summarized:
   forward/backward packet-size mean/std *separately*; combined into this
   schema's single overall `mean_packet_size`/`std_packet_size` via a
   pooled-variance formula (`pirewall.ml.preprocessing.common.combine_weighted_stats`).
+  The published "MachineLearningCVE" release (verified against all 8 real
+  files) has **no Source IP, Source Port, Destination IP, or Protocol
+  column at all** — `source_ip`/`destination_ip` are a fixed documented
+  placeholder (`10.255.255.1`/`.2`), `source_port` is always `None`, and
+  `protocol` is *inferred* from TCP flag counts (nonzero -> TCP) with a
+  well-known-UDP-port fallback, defaulting to TCP otherwise. Treat
+  `protocol_is_tcp`/`protocol_is_udp`/`protocol_is_icmp` trained from this
+  adapter as heuristic, not ground truth — see
+  `pirewall.ml.preprocessing.cicids_adapter`'s module docstring for the
+  exact rule.
 - **UNSW-NB15**: the training/testing-partition CSVs have no
   source/destination IP/port columns and no per-packet TCP flag counts.
   `source_ip`/`destination_ip` are a fixed documented placeholder

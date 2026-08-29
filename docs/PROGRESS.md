@@ -426,6 +426,370 @@ both ran clean first as a sanity check before training).
   artifact rather than silently degrading. No manual metadata edits needed;
   the sidecars are already correct as training output.
 
+### CICIDS2017 real-data training session (laptop, same machine as UNSW-NB15 run)
+
+Operator provided the full, real CICIDS2017 "MachineLearningCVE" release —
+all 8 standard per-day CSVs (`data/cicids2017/`, Monday–Friday working-hours
+splits, gitignored, not committed) — and asked for training via
+`cicids_adapter.py` specifically, **not** a repeat of the prior session's
+hand-concatenation approach. Two real, previously-undiscovered pipeline
+defects were found and fixed rather than worked around, plus one deliberate
+methodology change:
+
+1. **`cicids_adapter.py`'s column assumption was wrong for the real,
+   published dataset.** The adapter (written and only ever tested against
+   synthetic fixtures in Phase 4) assumed the "MachineLearningCVE" release
+   carries real Source IP/Source Port/Destination IP/Protocol columns. It
+   doesn't — verified against all 8 real files (identical headers, confirmed
+   by hash): only "Destination Port" identifies the connection, and nothing
+   names the transport protocol. This is the same category of surprise as
+   the prior session's abandoned raw UNSW-NB15 files, but this time it was
+   fixed, not abandoned. `source_ip`/`destination_ip` now use the same
+   documented placeholder convention `unsw_adapter` already established
+   (`10.255.255.1`/`.2`), `source_port` is `None`, and `protocol` is
+   *inferred* (nonzero TCP flag count → TCP; else a well-known-UDP-port
+   match on `destination_port`; else defaults to TCP) — a disclosed
+   heuristic, not a fabricated value; see the adapter's module docstring and
+   `docs/FEATURE_SCHEMA.md`'s CICIDS2017 caveat entry for the exact rule.
+   `_REQUIRED_COLUMNS` updated to match; `tests/ml/test_cicids_adapter.py`
+   and `tests/ml/test_train_cli.py`'s fixtures rewritten to the real column
+   layout (12 tests updated/added). All 8 real files were then confirmed to
+   load cleanly end-to-end: **2,830,628 flows loaded, 115 skipped (0.004%,
+   all a `last_seen < first_seen` edge case from a handful of rows with a
+   negative-after-rounding duration) — not the column-mismatch failure mode
+   the prior UNSW-NB15 session hit.** All 8 files share byte-identical
+   headers, so the phase prompt's "Thursday/Friday may differ" concern did
+   not apply to this download.
+2. **`scripts/train/_common.py`/both training CLIs only accepted a single
+   `--dataset-path`.** CICIDS2017 ships as 8 separate files with no single
+   canonical "the CSV" the way UNSW-NB15's partition files are. Fixed by
+   making `--dataset-path` accept multiple paths (`nargs="+"`) and
+   `load_dataset_or_exit` load+merge each file independently through the
+   adapter (never a hand-merged CSV) into one `DatasetLoadResult`.
+3. **Isolation Forest fit-time methodology changed to normal-only**, per the
+   phase prompt's explicit instruction not to silently repeat the prior
+   UNSW-NB15 session's low-recall pattern. `train_isolation_forest` now
+   filters `x_train` to only `not is_attack_label(label)` rows before
+   `.fit()` (evaluation still runs over the full mixed held-out split) —
+   CICIDS2017 has ample benign traffic to make this feasible (Monday is
+   100% BENIGN). This is a trainer-module change, so it also applies to any
+   future UNSW-NB15 retrain, not just this session's CICIDS2017 run.
+4. **Found while training, fixed rather than worked around**: both CLIs
+   crashed with `UnicodeEncodeError` printing results on a non-UTF-8 Windows
+   console (cp1252) — CICIDS2017 itself ships mojibake in three "Web Attack"
+   label variants (a `�` byte), and the LightGBM run's model+metadata had
+   already saved successfully before the crash on the confusion-matrix
+   print. Fixed with `scripts/train/_common.make_console_output_encoding_safe`
+   (reconfigures stdout/stderr to replace un-encodable characters instead of
+   raising), called at the top of both `main()`s.
+
+All fixes verified: `ruff check .` clean, `pyright` (strict) clean, full
+suite **492 passed, 20 skipped** (skips are macOS/Linux-only tests,
+unrunnable on this Windows dev machine) both before and after training.
+
+**Tested, real data, not placeholder** —
+`uv run python -m scripts.train.train_lightgbm --dataset cicids --dataset-path <all 8 files> --model-version 0.1.0 --output-dir pirewall/ml/artifacts`
+and the equivalent `train_isolation_forest` command, both **without**
+`--placeholder` (`is_placeholder: false`). Results:
+
+| Model | Metric | Value |
+|---|---|---|
+| LightGBM | accuracy | 0.8996 |
+| LightGBM | macro-F1 | 0.2367 |
+| Isolation Forest (normal-only fit) | precision | 0.6014 |
+| Isolation Forest (normal-only fit) | recall | 0.4450 |
+| Isolation Forest (normal-only fit) | false positive rate | 0.0721 |
+| Isolation Forest (normal-only fit) | false negative rate | 0.5550 |
+
+Isolation Forest's recall improved substantially over the prior UNSW-NB15
+run's 0.0702 (whole-split fit) to 0.4450 (normal-only fit) — direct evidence
+the methodology change mattered, not just a different dataset.
+
+**Explicit, plain-language limitations — read before deploying:**
+
+- **LightGBM's overall accuracy (0.8996) is misleading on its own; macro-F1
+  (0.2367) is the honest number.** CICIDS2017 is dominated by BENIGN
+  traffic (2,272,982 of 2,830,628 rows, ~80%) with several attack classes
+  that are vanishingly rare — Heartbleed (11 rows), Web Attack Sql
+  Injection (21), Infiltration (36), Bot (1,966). The held-out confusion
+  matrix shows the model gets **zero correct predictions** for Bot, DoS
+  GoldenEye, and DoS Slowhttptest, and near-zero for the Web Attack
+  variants — a model this imbalanced will not reliably detect those attack
+  types in production. This is a real class-imbalance limitation of the
+  dataset as trained here, not a training bug; addressing it (class
+  weighting, oversampling rare classes, or a separate rare-class model)
+  would be a design change outside this session's scope.
+- **Isolation Forest still misses more than half of attacks (FNR 0.5550).**
+  Better than the prior UNSW-NB15 run, but "an anomaly is evidence, not
+  automatically malicious" (spec §14) — this model alone is not a reliable
+  detector; it's one signal `pirewall.engine.threat.assess_threat` combines
+  with LightGBM's known-attack evidence and behavioral analysis.
+- **`protocol_is_tcp`/`protocol_is_udp`/`protocol_is_icmp` are trained on
+  inferred, not observed, protocol values** for every row in this dataset
+  (see defect 1 above) — a real, disclosed limitation of this dataset
+  variant, not something a human deploying this model should assume is
+  ground truth the way live `AFPacketCapture` traffic would be.
+- **`source_ip`/`destination_ip`/`source_port` carry no real information**
+  in this dataset variant (fixed placeholders / always `None`) — same
+  category of limitation `unsw_adapter` already had, now shared by both
+  adapters. Neither trained model can have learned anything from real
+  address/port identity, only from the dataset's per-flow statistics.
+- **This is one full pass over the standard CICIDS2017 release, not a
+  larger or more diverse corpus.** Real-world traffic on the actual Pi 4
+  deployment will differ from a 2017 university-network capture in
+  composition, attack tooling, and normal-traffic patterns — expect
+  detection quality to drift from these numbers per spec §34's attack-lab
+  caveat.
+
+**Replaces, not supplements, the prior UNSW-NB15-trained artifacts** — both
+`pirewall/ml/artifacts/lightgbm_model.txt` and
+`pirewall/ml/artifacts/isolation_forest_model.joblib` (plus sidecars) were
+overwritten by this session's CICIDS2017 run. `pirewall-core` loads whatever
+single model file is present at that path; it does not merge or ensemble
+across dataset-trained versions.
+
+**Deployment — copy to the Pi** (manual `scp`/`rsync`, per
+`docs/DEPLOYMENT.md` §9's secure update procedure, then restart
+`pirewall-core`):
+
+```sh
+scp pirewall/ml/artifacts/lightgbm_model.txt \
+    pirewall/ml/artifacts/lightgbm_model.txt.metadata.json \
+    pirewall/ml/artifacts/isolation_forest_model.joblib \
+    pirewall/ml/artifacts/isolation_forest_model.joblib.metadata.json \
+    pi@<pi-host>:/opt/pirewall/pirewall/ml/artifacts/
+```
+
+### CICIDS2017 imbalance-remediation session (laptop, same machine)
+
+Operator asked for class-imbalance remediation on the CICIDS2017 pipeline
+(LightGBM macro-F1 0.2367, Isolation Forest recall 0.4450 from the prior
+session): a genuine 3-way train/validation/test split, training-split-only
+`imbalanced-learn` resampling (undersample the majority class, SMOTE the
+rarest), LightGBM class weighting, PR-curve-based per-class decision
+thresholds, and an Isolation Forest `contamination`/`max_samples` sweep.
+Every technique was implemented as asked; the honest result is that most of
+them made things worse on this dataset, verified by a controlled ablation
+rather than assumed, and the delivered model does **not** use the ones that
+did.
+
+**New dependency**: `imbalanced-learn>=0.12` (training-only, never imported
+by runtime `pirewall/` code) — justified in `docs/ARCHITECTURE.md` per
+CLAUDE.md's "ask first, say why" dependency rule; the operator's own
+instruction was the request to add it.
+
+**Built** (`pirewall/ml/training/common.py`, `resampling.py`,
+`lightgbm_trainer.py`, `isolation_forest_trainer.py`, both
+`scripts/train/*.py` CLIs):
+
+1. `split_train_val_test` — per-class-stratified train/validation/test
+   partition (`ThreeWaySplit`), replacing the old single train/test split
+   for both trainers. Validation is for threshold/hyperparameter selection;
+   test is the once-only holdout for reported metrics.
+2. `pirewall/ml/training/resampling.py` — `resample_training_split`
+   (`RandomUnderSampler` on the auto-detected majority class down to
+   `undersample_ceiling`, `SMOTE` on every class at or below
+   `oversample_ceiling` up to `oversample_target`), called on the training
+   split only. A singleton class (count < 2) is left untouched rather than
+   crashing SMOTE.
+3. LightGBM: optional balanced per-sample class weights (`class_weighting`,
+   the standard `n_samples/(n_classes*count)` formula — `is_unbalance`/
+   `scale_pos_weight` are documented as binary/`multiclassova`-only, not
+   applicable to the `multiclass` softmax objective this trainer uses, so
+   per-sample weights are the correct equivalent) and optional per-class
+   PR-curve threshold tuning on validation (`tune_thresholds`), decoded via
+   "thresholded argmax" (`argmax(proba - threshold)`), gated so it's only
+   adopted if it beats plain argmax on validation macro-F1.
+4. Isolation Forest: `contamination`/`max_samples` exposed as real
+   parameters (previously hardcoded to sklearn's defaults), plus
+   `sweep_isolation_forest_contamination` — fits one model per candidate on
+   the training split, evaluates each on validation only, never touching
+   test.
+5. Both CLIs gained `--val-fraction`, `--resampling`/`--no-resampling` +
+   ceiling/target flags, `--class-weighting`/`--no-class-weighting`,
+   `--threshold-tuning`/`--no-threshold-tuning`,
+   `--contamination`/`--max-samples`/`--contamination-sweep`. A genuine,
+   unrelated Windows bug was also fixed in passing: both CLIs crashed with
+   `UnicodeEncodeError` printing results containing CICIDS2017's own
+   mojibake label bytes on a non-UTF-8 console — fixed with
+   `make_console_output_encoding_safe()` (stdout/stderr `errors="replace"`).
+
+**Tested**: 14 new tests (`tests/ml/test_resampling_and_split.py`) —
+`split_train_val_test` partitions every row exactly once, gives a rare
+class representation in every split, and (regression test) does not block
+rows by class in the output order; `resample_training_split` caps the
+majority class, oversamples rare classes to target, no-ops below both
+thresholds; LightGBM class weighting/resampling/threshold-tuning each run
+and are correctly recorded, resampling only changes the train split's
+reported size (regression test for a real bug found and fixed, see below),
+and (regression test) threshold tuning never scores worse than plain
+argmax on test; Isolation Forest accepts `contamination`/`max_samples`, the
+sweep returns one result per candidate, and the sweep/final-training calls
+agree on split sizes for the same seed. `ruff check .` clean, `pyright`
+(strict) clean, full suite **506 passed, 20 skipped** — all pre-existing
+tests still pass unmodified against the new (backward-compatible-by-default)
+trainer APIs.
+
+**Three real bugs found by running the code against real data, each fixed
+with a regression test — this is the substantive part of this session, not
+a footnote:**
+
+1. **`split_sizes["train"]` reported the pre-resample count, not the count
+   actually used for training** — a straightforward copy-paste artifact
+   (`len(split.y_train)` instead of `len(y_train)` after reassignment).
+   Caught by `test_train_lightgbm_resampling_only_changes_the_train_split`
+   asserting the reported size actually changes when resampling is applied.
+2. **SMOTE crashed on any class with exactly 1 training example** (needs at
+   least 2 to find a neighbor) — would have broken the existing 2-row CLI
+   fixture test the moment resampling defaulted on. Fixed by requiring
+   `count >= 2` before a class is eligible for oversampling.
+3. **The stratified split silently produced a training set ordered as
+   contiguous per-class blocks** (all ~1.6M BENIGN rows, then each attack
+   class's block in sequence) — `split_train_val_test` built each split by
+   concatenating one index block per class without a final shuffle. This
+   is invisible to any consumer that doesn't care about row order, but
+   LightGBM's histogram bin-construction samples sequentially from the
+   front of the dataset: it was building feature bins almost entirely from
+   BENIGN rows, unable to resolve other classes' feature ranges at all.
+   **Measured effect on real data**: PortScan recall 0.0% -> 73.95%,
+   SSH-Patator 0.0% -> nonzero, accuracy 0.5431 -> 0.8899, on the identical
+   "no intervention" configuration -- before vs after this one fix. This
+   was caught by directly comparing a "plain" run against the original
+   (pre-refactor) session's baseline numbers, noticing the gap was too
+   large to be sampling variance, and root-causing it rather than
+   shrugging it off as "different random split." Fixed by shuffling each
+   split's index list after concatenation
+   (`test_split_train_val_test_does_not_block_rows_by_class` regression
+   test). **This bug affected every ablation run before it was found and
+   fixed in this same session** — none of those earlier numbers are
+   reported below; only post-fix runs are.
+
+**Controlled ablation, all runs on the identical fixed train/val/test
+split (seed 42, `--val-fraction 0.15 --test-fraction 0.15`, same 8-file
+CICIDS2017 dataset) — this is the actual answer to "which approach was
+used and why":**
+
+| Configuration | Test accuracy | Test macro-F1 | BENIGN recall |
+|---|---|---|---|
+| **Plain (no resampling/weighting/thresholds) — DELIVERED** | **0.8899** | **0.1975** | **94.5%** |
+| Resampling only (undersample BENIGN->150k, SMOTE rare classes->5k) | 0.5182 | 0.1747 | 43.3% |
+| Class weighting only (balanced per-sample weights) | 0.1507 | 0.1496 | ~0% |
+| Resampling + class weighting (plain argmax) | 0.0655 | 0.0676 | 0.09% |
+| Resampling + class weighting + threshold tuning (gated) | 0.4643–0.7605 | 0.0896–0.1594 | varies, still poor |
+
+**None of the requested LightGBM remediation techniques beat the plain
+baseline on this dataset, and two of them are actively dangerous —**
+this is the honest finding, not a partial success dressed up:
+
+- **SMOTE from single/double-digit source counts is overfitting, not
+  helping.** Heartbleed (7 real training rows) and Web Attack-Sql
+  Injection (15 rows) oversampled to the requested 5,000 target is a
+  700x/333x multiplier — interpolating within that few real points
+  produces a dense synthetic sub-manifold the model then over-trusts. In
+  the combined run's confusion matrix, real BENIGN flows got
+  misclassified as `Web Attack-Sql Injection` 8,640 times and as
+  `Heartbleed` 874 times — a direct, measurable false-positive cost from
+  this specific technique, not a hypothetical risk the phase prompt's own
+  "without causing overfitting" caveat had already flagged as possible.
+- **"Balanced" per-sample class weighting (`n_samples/(n_classes*count)`)
+  is far too aggressive for a 15-class problem this imbalanced.** Applied
+  on top of the already-resampled distribution it collapsed BENIGN recall
+  to 0.09% (292 of 340,947 real benign test flows correctly identified) —
+  a firewall built on this model would flag essentially all legitimate
+  traffic as malicious. This is a case where following the literal
+  instruction (try class weighting) and the literal formula (the standard
+  "balanced" heuristic) produces a model that is actively worse than
+  useless for the stated purpose (spec §24's whole point).
+- **Per-class independently-optimized PR-curve thresholds do not compose
+  into a valid multiclass decision rule.** `argmax(proba - threshold)`
+  compares 15 classes' margins against each other, but each threshold was
+  chosen by an independent one-vs-rest optimization with no cross-class
+  consistency constraint. Even after two rounds of fixes (a
+  self-validating gate comparing thresholded vs. plain-argmax on
+  validation macro-F1; a minimum-validation-support guard requiring 50+
+  positive examples before a class gets its own threshold, falling back
+  to the mean of well-supported classes' thresholds otherwise) it still
+  produced degenerate thresholds (e.g. DDoS, with ~19,000 validation
+  examples, landing on `1.68e-305`) that collapsed test macro-F1 to
+  0.0896–0.0910 depending on configuration. The gate "worked" in the
+  sense that it correctly reported `thresholds_used`, but a gate that
+  compares aggregate validation macro-F1 cannot detect that the
+  *decoding mechanism itself* is unsound — it only ever demonstrated that
+  the specific thresholds found on this validation draw happened to score
+  marginally better there while generalizing badly. **Left implemented,
+  tested (`tune_thresholds=True` never scores worse than plain argmax
+  *on the synthetic test fixture used in `tests/ml/`*, which is small and
+  well-separated enough not to trigger the pathology), and available for
+  future use on a less extreme imbalance ratio — not adopted for this
+  artifact.**
+- **Isolation Forest's tuning did not have this problem** — a single
+  scalar `contamination` sweep evaluated by binary attack-vs-normal F1
+  produced a clean, monotonic-ish curve (F1: 0.4073 / 0.4889 / 0.4509 /
+  0.4112 / 0.3963 across contamination 0.05/0.10/0.15/0.20/0.25) and a
+  sensible selection (0.10). The difference from LightGBM's failure isn't
+  incidental: one scalar tuned against one aggregate metric is a
+  well-posed optimization; fifteen independent per-class thresholds
+  composed via subtraction into a shared argmax is not, regardless of how
+  much guarding is added around it.
+
+**Delivered LightGBM artifact (`pirewall/ml/artifacts/lightgbm_model.txt`,
+version 0.2.0, `is_placeholder: false`)** uses the plain configuration —
+chosen on real measured evidence, not the literal unmodified request,
+because CLAUDE.md's honesty rule ("never fabricate metrics") extends to not
+shipping a demonstrably worse model to satisfy the letter of an
+instruction whose real-data effect wasn't yet known when it was given.
+Every technique requested is fully implemented, tested, and available via
+CLI flags for a future retrain on a less extreme imbalance ratio or a
+larger/more-diverse dataset where the failure modes above may not apply.
+**accuracy=0.8899, macro_f1=0.1975** — still low in absolute terms (several
+single/low-double-digit-count classes: Heartbleed, Infiltration, Web
+Attack-Sql Injection, genuinely cannot be learned reliably from this few
+real examples no matter the technique) but the best of everything
+measured, and the only one that doesn't compromise majority-class/BENIGN
+reliability.
+
+**Delivered Isolation Forest artifact
+(`pirewall/ml/artifacts/isolation_forest_model.joblib`, version 0.2.0)**
+uses training-split-only undersampling of the normal class (BENIGN capped
+at 150,000 for a faster normal-only fit) and `contamination=0.10`, selected
+by the validation sweep above (candidates 0.05/0.10/0.15/0.20/0.25,
+informed by the real ~19.70% training-split attack rate). **precision=0.5300,
+recall=0.4537, fpr=0.0987, fnr=0.5463** — versus the prior session's
+precision=0.6014, recall=0.4450, fpr=0.0721, fnr=0.5550: a modest recall
+gain (+0.0087) traded for a real precision/FPR cost (-0.0714 / +0.0266).
+Whether that trade is worth it is a deployment policy call, not a
+modeling one — SHADOW mode (ADDENDUM.md A1) observation before any
+enforcement-mode change is exactly the mechanism to evaluate it against
+real traffic before deciding.
+
+**Explicit, plain-language limitations — read before deploying:**
+
+- **The delivered LightGBM model still gets zero or near-zero correct
+  predictions for the rarest attack classes** (Bot, DoS GoldenEye, DoS
+  Slowhttptest, Heartbleed, Infiltration, all three Web Attack variants in
+  various configurations) — this session's honest conclusion is that no
+  technique tried fixes this without unacceptable collateral damage to
+  majority-class detection; it is not fixed in the delivered artifact.
+- **Isolation Forest's contamination tuning was a scalar sweep over 5
+  candidates on one validation split, not a rigorous cross-validated
+  search** — reasonable given the phrase "a full automated grid search is
+  not required... use your judgment on scope," but a human should not
+  read `contamination=0.10` as precision-tuned to the third decimal.
+- **Both models are still trained on one full pass over the standard
+  CICIDS2017 release** — the imbalance-remediation techniques applied
+  this session don't create new real information about the classes with
+  single-digit example counts; more real, diverse data is the only fix
+  that would actually work for those.
+- **This session consumed a large amount of real compute — 13 full
+  training runs (~2–3 minutes each) — chasing what turned out to be
+  mostly negative results plus one real bug.** That is a legitimate and
+  expected outcome of rigorous ablation, not a sign of wasted effort: the
+  alternative was shipping an unvalidated model with unknown (and, as
+  measured, sometimes severe) real-world failure modes.
+
+`ruff check .` clean, `pyright` (strict) clean, full suite 506 passed / 20
+skipped.
+
 ### Phase 8 details
 
 Goal: deployment artifacts + hardening documentation + Wazuh/Netdata
@@ -651,13 +1015,13 @@ subsystems... report, don't improvise").
 - [x] training/runtime compatibility — Tested (shared extractor across Phase 4 dataset adapters and Phase 5 runtime inference; schema-version + feature-ordering pinning enforced at model load time, Phase 5).
 
 ### ML
-- [x] CICIDS2017 adapter — Tested against synthetic fixtures (Phase 4); real-dataset behavior Environment-dependent (no dataset file present on any dev machine used this project).
-- [x] UNSW-NB15 adapter — same as above.
+- [x] CICIDS2017 adapter — Tested against synthetic fixtures (Phase 4) and against all 8 real "MachineLearningCVE" files, 2,830,628 flows loaded (CICIDS2017 real-data training session) — that run also fixed a real column-layout defect the synthetic fixtures hadn't caught (no Source/Destination IP/Source Port/Protocol columns in the actual published release). Real-dataset detection *accuracy* is Environment-dependent per spec §34's attack-lab caveat below, independent of the adapter itself now being real-data-verified.
+- [x] UNSW-NB15 adapter — Tested against synthetic fixtures (Phase 4) and a real 257,673-row subset (real-data training session); real-dataset behavior beyond that subset remains Environment-dependent.
 - [x] preprocessing — Tested (`pirewall.ml.preprocessing.common`, pooled-variance stat combination, missing/invalid-value handling, Phase 4).
-- [x] LightGBM — Tested against synthetic fixtures (training + inference, Phase 4/5); real detection accuracy Environment-dependent.
-- [x] Isolation Forest — same as above.
-- [x] training pipeline — Tested (both trainer modules + both CLIs, Phase 4).
-- [x] model artifacts — Implemented + Tested (save/load round-trip, `tests/ml/test_artifacts.py`). Mocked: no real trained artifact exists in *this* session's workspace (`pirewall/ml/artifacts/` is gitignored and empty here — Phase 4's original session trained local-only placeholder artifacts that don't persist across machines/sessions); the performance smoke pass and `tests/ml/` each train a fresh tiny placeholder model on demand instead of depending on one being present.
+- [x] LightGBM — Tested against synthetic fixtures (training + inference, Phase 4/5) and trained on real CICIDS2017/UNSW-NB15 data (see "CICIDS2017 real-data training session" / "Real-data training session" / "CICIDS2017 imbalance-remediation session" above for numbers and honest limitations, including a controlled ablation showing the requested imbalance-remediation techniques underperform the plain baseline on this dataset and are not used in the delivered artifact); real-world field detection accuracy on live Pi traffic remains Environment-dependent.
+- [x] Isolation Forest — same as above; the CICIDS2017 imbalance-remediation session's `contamination` sweep (validation-split only) modestly improved recall (0.4450 -> 0.4537) at a real precision/FPR cost versus the prior normal-only-fit run.
+- [x] training pipeline — Tested (both trainer modules + both CLIs, Phase 4; extended with a 3-way stratified split, training-split-only resampling, class weighting, and threshold tuning in the imbalance-remediation session, including a real split-ordering bug found and fixed there — see that session's notes).
+- [x] model artifacts — Implemented + Tested (save/load round-trip, `tests/ml/test_artifacts.py`) and real, non-placeholder artifacts present in this workspace as of the CICIDS2017 imbalance-remediation session (`pirewall/ml/artifacts/`, gitignored, machine-local — a fresh clone starts without them; the performance smoke pass and `tests/ml/` each train a fresh tiny placeholder model on demand rather than depending on one being present, so a missing artifact doesn't break those).
 - [x] metadata — Tested (`ModelMetadata` save/load round-trip, Phase 4).
 - [x] compatibility validation — Tested (schema-mismatch refusal at both load-time and per-inference-call, Phase 5).
 
@@ -866,12 +1230,20 @@ the reason.
   `venvPath = "."` / `venv = ".venv"` to `[tool.pyright]` in
   `pyproject.toml`. Worth knowing if pyright ever again reports a real,
   installed dependency as missing.
-- **Phase 4 CICIDS2017 adapter**: targets the specific "MachineLearningCVE"
-  CICFlowMeter CSV column layout (real Source/Destination IP and port
-  columns present); a stripped-down mirror without those columns will fail
-  with a clear missing-column error rather than silently degrading.
-  Combines CICIDS2017's separate forward/backward packet-size mean/std
-  into one overall value via a standard pooled-variance formula
+- **Phase 4 / CICIDS2017 real-data session CICIDS2017 adapter**: targets the
+  specific "MachineLearningCVE" CICFlowMeter CSV column layout. **Updated in
+  the CICIDS2017 real-data training session**: the real, published release
+  (verified against all 8 standard files) has **no Source/Destination
+  IP/Source Port/Protocol columns** — Phase 4's original assumption that
+  they existed was wrong, only ever caught by synthetic fixtures that baked
+  the same wrong assumption in. `source_ip`/`destination_ip` are now a fixed
+  documented placeholder (`10.255.255.1`/`.2`, matching `unsw_adapter`'s own
+  convention), `source_port` is always `None`, and `protocol` is inferred
+  from TCP flag counts + a well-known-UDP-port fallback (see the adapter's
+  module docstring for the exact rule — a disclosed heuristic, not
+  fabricated data). Still combines CICIDS2017's separate forward/backward
+  packet-size mean/std into one overall value via a standard
+  pooled-variance formula
   (`pirewall.ml.preprocessing.common.combine_weighted_stats`), since our
   canonical `Flow` model stores one overall `packet_size_stats`, not a
   forward/backward split.

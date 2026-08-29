@@ -62,8 +62,12 @@ Two independent models, both consuming the same canonical `FeatureVector`s:
 - **LightGBM** — supervised known-attack classifier (binary or multi-class,
   depending on how many distinct labels the dataset carries).
   `pirewall.ml.training.lightgbm_trainer.train_lightgbm`.
-- **Isolation Forest** — unsupervised anomaly detector, trained only on
-  (implicitly or explicitly) normal traffic. `pirewall.ml.training.isolation_forest_trainer.train_isolation_forest`.
+- **Isolation Forest** — unsupervised anomaly detector, fit **only on
+  normal/benign-labeled rows** of the training split (`is_attack_label`
+  filters `x_train` before `.fit()` — the model never receives an attack
+  label as a supervised target, but dataset labels do select which rows
+  count as the normal baseline). Evaluation still runs over the full
+  held-out split (normal + attack). `pirewall.ml.training.isolation_forest_trainer.train_isolation_forest`.
 
 Run via the CLIs in `scripts/train/` (development machine only, spec §4 —
 never train on the Pi):

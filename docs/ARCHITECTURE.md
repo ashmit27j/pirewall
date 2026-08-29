@@ -220,6 +220,21 @@ is a compiled dependency and unnecessary for a protocol this small. Outside
 systemd `$NOTIFY_SOCKET` is unset and every method is a no-op, so
 `python -m pirewall.main` behaves identically from a shell.
 
+### `imbalanced-learn` for training-split resampling (imbalance-remediation session)
+
+CICIDS2017 is ~80% one class (BENIGN) with several attack classes under 50
+real-world rows (Heartbleed: 11, Web Attack-Sql Injection: 21,
+Infiltration: 36) — LightGBM's held-out macro-F1 was 0.2367 with zero
+correct predictions for several classes. `RandomUnderSampler`/`SMOTE`
+(training-split only, see `pirewall/ml/training/resampling.py`) are the
+standard, well-understood fix; hand-rolling equivalent stratified
+undersampling is straightforward but SMOTE's k-nearest-neighbor
+interpolation is not — reimplementing it would be the kind of "invent a
+worse version of a well-known library" CLAUDE.md's dependency policy exists
+to avoid. Added on explicit operator instruction, training-only (dev
+machine, spec §4) — never imported by `pirewall/` runtime code, so it never
+reaches the Pi.
+
 ## Process split (ADDENDUM.md A4)
 
 `pirewall-core` (capture/flow/ML/detection/engine/firewall, Phases 2-6) and

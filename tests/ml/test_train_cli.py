@@ -8,8 +8,7 @@ from scripts.train.train_isolation_forest import main as isolation_forest_main
 from scripts.train.train_lightgbm import main as lightgbm_main
 
 _CICIDS_HEADER = (
-    " Source IP, Source Port, Destination IP, Destination Port, Protocol,"
-    " Flow Duration, Total Fwd Packets, Total Backward Packets,"
+    " Destination Port, Flow Duration, Total Fwd Packets, Total Backward Packets,"
     "Total Length of Fwd Packets, Total Length of Bwd Packets,"
     " Fwd Packet Length Max, Fwd Packet Length Min, Fwd Packet Length Mean,"
     " Fwd Packet Length Std, Bwd Packet Length Max, Bwd Packet Length Min,"
@@ -19,11 +18,11 @@ _CICIDS_HEADER = (
     " URG Flag Count, Label"
 )
 _BENIGN_ROW = (
-    "192.168.1.10,51234,93.184.216.34,443,6,1000000,5,4,600,400,"
+    "443,1000000,5,4,600,400,"
     "150,100,120,15,120,80,100,12,50000,10000,80000,20000,1,4,1,0,3,0,BENIGN"
 )
 _DDOS_ROW = (
-    "192.168.1.10,51235,93.184.216.35,80,6,500000,100,1,6000,60,"
+    "80,500000,100,1,6000,60,"
     "60,60,60,0,60,60,60,0,5000,1000,8000,2000,100,1,0,0,0,0,DDoS"
 )
 

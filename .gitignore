@@ -22,6 +22,10 @@ uv.lock.bak
 # Datasets — never commit raw dataset files
 data/
 datasets/
+# Cached feature matrix built from the raw dataset (derived data, same rule)
+.cache_ml/
+# Generated evaluation reports (regenerate from the training/eval scripts)
+reports/
 *.csv
 *.pcap
 *.pcapng

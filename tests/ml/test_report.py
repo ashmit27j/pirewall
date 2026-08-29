@@ -86,9 +86,9 @@ def test_excluded_rows_still_cost_the_trained_class_that_absorbs_them() -> None:
 def test_write_report_uses_utf8_regardless_of_platform_default(tmp_path: Path) -> None:
     """CICIDS2017 labels are non-ASCII; the platform default can't be trusted."""
     path = tmp_path / "r.txt"
-    report = _report(["BENIGN"], ["BENIGN"]) + "Web Attack – Brute Force\n"
+    report = _report(["BENIGN"], ["BENIGN"]) + "Web Attack – Brute Force\n"  # noqa: RUF001
 
     write_report(path, report)
 
     assert path.read_text(encoding="utf-8") == report
-    assert "–".encode() in path.read_bytes()
+    assert "–".encode() in path.read_bytes()  # noqa: RUF001

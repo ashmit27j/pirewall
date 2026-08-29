@@ -85,7 +85,7 @@ class TestExclusionPolicy:
         [
             "Web Attack � Sql Injection",  # as published (U+FFFD)
             "Web Attack - Sql Injection",  # hyphen
-            "Web Attack – Sql Injection",  # en dash
+            "Web Attack – Sql Injection",  # noqa: RUF001 - en dash is the point
             "web attack sql injection",  # already normalised
             "  Web Attack � Sql Injection  ",  # padded
         ],

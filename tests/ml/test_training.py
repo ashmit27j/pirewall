@@ -150,3 +150,56 @@ def test_isolation_forest_artifact_round_trips_through_metadata_sidecar(tmp_path
     assert model_path.is_file()
     loaded_metadata = load_metadata(model_path)
     assert loaded_metadata == result.metadata
+
+
+def test_lambda_l2_is_applied_and_defaults_to_a_nonzero_value() -> None:
+    """Regression: lambda_l2 = 0 makes multiclass boosting diverge.
+
+    A leaf's output is -sum(grad) / (sum(hess) + lambda_l2). Under the
+    multiclass softmax the hessian p*(1-p) vanishes as the model grows
+    confident, so with no L2 term the denominator collapses and leaf values
+    grow without bound. On the real CICIDS2017 split that drove max |raw
+    score| to 6.4e6 and macro-F1 from 0.8053 (round 10) down to 0.2519
+    (round 100) -- the cause of the v0.2.0 artifact's 0.1975.
+
+    This pins the default to something nonzero so the divergence cannot
+    return by way of LightGBM's own default of 0.0.
+    """
+    import inspect
+
+    signature = inspect.signature(train_lightgbm)
+    default = signature.parameters["lambda_l2"].default
+    assert isinstance(default, float)
+    assert default > 0.0, "lambda_l2 must default to a nonzero value"
+
+
+def test_trained_booster_records_the_l2_parameter() -> None:
+    """The parameter must actually reach LightGBM, not just the signature."""
+    flows: list[LabeledFlow] = []
+    for i in range(12):
+        flows.append(LabeledFlow(flow=make_flow(flow_id=f"b-{i}"), label="BENIGN"))
+    for i in range(12):
+        flows.append(
+            LabeledFlow(
+                flow=make_flow(
+                    flow_id=f"a-{i}",
+                    packet_count=1000,
+                    byte_count=100_000,
+                    forward_packet_count=900,
+                    backward_packet_count=100,
+                    forward_byte_count=90_000,
+                    backward_byte_count=10_000,
+                    duration_seconds=1.0,
+                ),
+                label="Attack",
+            )
+        )
+    result = train_lightgbm(
+        flows,
+        training_dataset_name="synthetic_fixture",
+        model_version="0.0.1-placeholder",
+        is_placeholder=True,
+        notes="NOT trained on real data",
+        lambda_l2=2.5,
+    )
+    assert result.booster.params.get("lambda_l2") == 2.5

@@ -57,6 +57,7 @@ def train_lightgbm(
     resampling: ResamplingConfig | None = None,
     class_weighting: bool = False,
     tune_thresholds: bool = False,
+    lambda_l2: float = 1.0,
 ) -> LightGBMTrainingResult:
     """Train a LightGBM classifier on `labeled_flows` and evaluate on a held-out **test** split.
 
@@ -107,6 +108,27 @@ def train_lightgbm(
         "verbosity": -1,
         "min_data_in_leaf": 1,
         "min_data_in_bin": 1,
+        # L2 regularisation is NOT optional here, and its LightGBM default
+        # (0.0) is unsafe for this problem. A leaf's output is
+        # -sum(grad) / (sum(hess) + lambda_l2); under the multiclass softmax
+        # the hessian is p*(1-p), which vanishes as the model grows
+        # confident. With lambda_l2 = 0 the only thing bounding a leaf is
+        # min_sum_hessian_in_leaf (1e-3), so leaf values grow without bound
+        # and boosting DIVERGES rather than converges.
+        #
+        # Measured on the real CICIDS2017 split (docs/ML_DATA_AUDIT.md §F),
+        # 12 classes, identical data and seed, varying only this parameter:
+        #
+        #   lambda_l2 = 0    round 10 macro-F1 0.8053 -> round 100 0.2519
+        #                    max |raw score| 2.8e4    -> 6.4e6
+        #   lambda_l2 = 1    round 10 macro-F1 0.8039 -> round 100 0.8636
+        #                    max |raw score| 21.5     -> 27.8
+        #
+        # Without it, more boosting makes the model monotonically worse and
+        # several classes collapse to 0% recall -- which is what produced
+        # the 0.1975 macro-F1 of the v0.2.0 artifact. With it, macro-F1
+        # improves monotonically with boosting, as it should.
+        "lambda_l2": lambda_l2,
         "seed": seed,
     }
     if num_class > 2:

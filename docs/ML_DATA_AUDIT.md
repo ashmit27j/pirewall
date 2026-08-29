@@ -369,10 +369,20 @@ These are two to three orders of magnitude above the excluded three; their
 0.00% recall in the delivered artifact is an imbalance-handling failure,
 not data scarcity, which is what section 4 tests.
 
-Enforced by `is_excluded_from_supervised_training` — the single shared
-function both training and evaluation call. `normalize_label` collapses
-punctuation and case so an encoding difference (U+FFFD vs hyphen vs en
-dash) cannot silently re-admit an excluded class.
+Implemented as `is_excluded_from_supervised_training` in
+`pirewall.ml.labels`, with `normalize_label` collapsing punctuation and
+case so an encoding difference (U+FFFD vs hyphen vs en dash) cannot
+silently re-admit an excluded class.
+
+**Correction — it is not currently wired in.** An earlier version of this
+section said it was "the single shared function both training and
+evaluation call". That was false: `grep` finds **no production caller** —
+the function is defined and tested, and referenced in a docstring, but
+neither trainer nor any evaluation path invokes it. Only the throwaway
+ablation harness did. This is deliberate as of the decision entry in
+`docs/PROGRESS.md` (the measured evidence says excluding these classes
+*costs* 0.018 macro-F1), but the previous wording claimed a wiring that
+does not exist.
 
 ## §D. Duplicate flows and train/test leakage (section 2)
 

@@ -1541,18 +1541,37 @@ on one fixed split: plain 0.8724 > rare-class exclusion 0.8546 >
 under/oversampling 0.8291 > two-stage 0.8217 > class weighting 0.8075.
 Flat multiclass, no imbalance intervention, wins.
 
-**NOT done — the artifact was not regenerated.** `pirewall/ml/artifacts/`
-still holds the broken **v0.2.0** model. The retrain through
-`scripts/train/train_lightgbm` drove swap to 4.2 GB on this 8 GB machine
-and was stopped before finishing:
-`build_feature_matrix` materialises `list[list[float]]` (~5-8 GB for 2.83M
-flows vs 657 MB as numpy). **Until that is fixed and the retrain run, the
-deployed model is still the diverged one.** This is the single most
-important follow-up.
+**DONE — artifact regenerated (Tested).** `pirewall/ml/artifacts/` now
+holds **v0.3.0** (`lightgbm_model.txt`, 4,400,528 bytes, 2026-08-30
+02:08:18, `is_placeholder: false`), produced by the real training CLI:
+**accuracy 0.9970560180878248, macro-F1 0.8724113675173262** — matching the
+ablation's projection exactly.
 
-**Also not done this session:** section 5 runtime wiring (moot until a new
-artifact exists), section 6 threat-scoring recalibration, and a UNSW-NB15
-audit (that dataset is not on this machine).
+Getting there required fixing a second, separate defect. The first retrain
+attempt drove 4.2 GB of swap and had to be abandoned. The cause was **not**
+`build_feature_matrix` as first assumed — measured per row on the real
+corpus, the Pydantic `LabeledFlow` objects cost **3,857 B/row (10.17 GB)**
+against the list-of-lists' 764 B/row (2.01 GB), peaking near **12.18 GB**.
+A numpy-only rewrite would have saved 1.4 GB of 12.18 and crashed again.
+Fixed by streaming (`iter_cicids2017` -> `build_feature_matrix_streaming`
+-> `train_lightgbm_from_arrays`): **peak RSS 1.23 GB**. The split logic is
+now shared via `split_indices_train_val_test` and verified bit-identical —
+it still reproduces v0.2.0's recorded metrics to full precision.
+
+**Runtime (Tested):** adopting v0.3.0 needed no code change. The
+schema-compatibility gate accepts it, `pirewall.detection.known_attack`
+classifies against it unmodified, and per-flow latency improved to
+0.181 ms mean / 0.242 ms p95 (from 0.272 ms).
+
+**Still not done:** section 6 threat-scoring recalibration
+(`pirewall.engine.scoring` weights remain the untuned 50/25/25), and a
+UNSW-NB15 audit (that dataset is not on this machine).
+
+**Correction to an earlier claim in this file:** the rare-class exclusion
+function was described as wired into training and evaluation. It is not —
+`grep` finds no production caller. It is implemented and tested in
+`pirewall.ml.labels`, and deliberately unused pending the decision entry
+above, but the earlier wording claimed a wiring that does not exist.
 
 **Reproducibility gap found:** the split is a deterministic function of the
 order the 8 CSVs are concatenated, and nothing recorded that order —

@@ -167,44 +167,109 @@ shell command. Evidence flows onward into `pirewall.engine.threat.assess_threat`
   accuracy on the real CICIDS2017 dataset is no longer environment-dependent
   — see "Current real-data results" below.
 
-## Current real-data results (CICIDS2017)
+## Current real-data results (CICIDS2017, model version 0.3.0)
 
-**Artifact status, stated precisely.** The shipped artifact is still
-**v0.2.0** — the broken one. The `lambda_l2` fix is committed in
-`pirewall.ml.training.lightgbm_trainer`, but the retrained artifact was
-**not produced on this machine**: the retrain exhausted memory and was
-stopped (see "Retraining is memory-bound" below). The figures below were
-measured by an analysis harness using the identical parameters, data,
-split and seed, **not** emitted by `scripts/train/train_lightgbm`. Treat
-them as a validated projection of what the fixed trainer produces, not as
-the metadata of a delivered model.
+**Shipped.** `pirewall/ml/artifacts/lightgbm_model.txt` is model version
+**0.3.0**, `is_placeholder: false`, produced by
+`scripts/train/train_lightgbm.py` on all 8 "MachineLearningCVE" CSVs
+(2,830,628 flows; 115 rows skipped for negative `Flow Duration`).
+Split 1,981,438 / 424,595 / 424,595; metrics from the untouched test split.
 
-Measured on all 8 "MachineLearningCVE" CSVs (2,830,628 flows), 70/15/15
-stratified split, metrics from the untouched test split. Full detail is in
-`docs/ML_DATA_AUDIT.md`.
-
-| metric | v0.2.0 (on disk) | fixed config (measured, not shipped) |
+| metric | v0.2.0 | **v0.3.0** |
 |---|---:|---:|
-| accuracy | 0.8899 | **0.9971** |
-| multiclass macro-F1 (15 classes) | 0.1975 | **0.8724** |
+| accuracy | 0.8899468905663044 | **0.9970560180878248** |
+| multiclass macro-F1 (15 classes) | 0.1974519339696516 | **0.8724113675173262** |
 | binary precision | 0.7762 | **0.9927** |
 | binary recall | 0.7719 | **0.9932** |
 | binary false-positive rate | 0.0546 | **0.0018** |
 
-### Retraining is memory-bound — fix before the next retrain
+Per-class recall, v0.2.0 -> v0.3.0 (test n / caught):
 
-`pirewall.ml.training.common.build_feature_matrix` materialises
-`list[list[float]]`: for 2.83M flows that is 2.83M Python list objects each
-holding 29 boxed floats, roughly 5-8 GB, against 657 MB for the equivalent
-`float64` numpy array. Retraining on the full dataset on an 8 GB machine
-drove swap usage to **4.2 GB** and had not finished when it was stopped.
+| class | test n | v0.2.0 | **v0.3.0** |
+|---|---:|---:|---:|
+| BENIGN | 340,947 | 94.54% | **99.82%** |
+| DoS Hulk | 34,661 | 85.51% | **99.36%** |
+| PortScan | 23,840 | 73.95% | **99.97%** |
+| DDoS | 19,204 | 43.05% | **99.93%** |
+| DoS GoldenEye | 1,544 | 0.00% | **99.03%** |
+| FTP-Patator | 1,191 | 0.34% | **99.92%** |
+| SSH-Patator | 885 | 0.00% | **98.76%** |
+| DoS slowloris | 869 | 0.00% | **99.19%** |
+| DoS Slowhttptest | 825 | 0.00% | **99.39%** |
+| Bot | 295 | 0.00% | **44.75%** |
+| Web Attack - Brute Force | 226 | 0.00% | **51.33%** |
+| Web Attack - XSS | 98 | 0.00% | **15.31%** |
+| Infiltration | 5 | 0.00% | 100.00% (5/5) |
+| Web Attack - Sql Injection | 3 | 0.00% | 66.67% (2/3) |
+| Heartbleed | 2 | 0.00% | 100.00% (2/2) |
 
-**Consequence:** the retraining procedure documented above cannot currently
-be executed end-to-end on this dataset on a machine with 8 GB of RAM.
-Building the feature matrix directly into a preallocated numpy array would
-remove the problem; that changes the types flowing through
-`build_feature_matrix` and `split_train_val_test`, so it is real work
-rather than a one-line change, and it is **not** done.
+**The entire difference is one parameter.** v0.2.0 trained without
+`lambda_l2`; under the multiclass softmax the hessian `p*(1-p)` vanishes as
+the model gains confidence, and with LightGBM's default `lambda_l2 = 0.0`
+leaf values grow unbounded, so boosting *diverged* — macro-F1 fell from
+0.8053 at round 10 to 0.2519 at round 100, with max |raw score| reaching
+6.4e6. This was **not** an imbalance problem and **not** a data limit;
+`docs/ML_DATA_AUDIT.md` §F has the mechanism and the wrong hypotheses.
+
+**Architecture** — chosen by a full-scale five-way ablation on one fixed
+split, not assumed:
+
+| configuration | macro-F1 | leak-free macro-F1 |
+|---|---:|---:|
+| **flat multiclass, plain (shipped)** | **0.8724** | **0.8855** |
+| flat multiclass + rare-class exclusion | 0.8546 | 0.8542 |
+| flat multiclass + under/oversampling | 0.8291 | 0.8310 |
+| two-stage (binary gate -> attack-type) | 0.8217 | 0.8173 |
+| flat multiclass + balanced class weighting | 0.8075 | 0.8150 |
+
+Every imbalance intervention *costs* macro-F1 once the divergence is fixed.
+The two-stage gate is near-perfect alone (99.69% accuracy) and still loses
+end-to-end, so the second artifact and second inference call buy nothing.
+
+**Runtime**: no code change was needed to adopt v0.3.0 — the
+schema-compatibility gate accepts it, `pirewall.detection.known_attack`
+classifies against it unmodified, and measured per-flow latency *improved*
+to 0.181 ms mean / 0.242 ms p95 (from 0.272 ms), because L2 yields
+shallower trees.
+
+**Known remaining weaknesses — stated plainly:**
+
+- **Web Attack - XSS 15.31%** (98 test rows), **Bot 44.75%** (295),
+  **Web Attack - Brute Force 51.33%** (226) are still weak. No technique
+  tried here fixed them; XSS is mostly confused with Brute Force and BENIGN.
+- **Heartbleed, Infiltration and Web Attack - Sql Injection are caught, but
+  on 2, 5 and 3 test rows.** Do not read those as reliable detection; they
+  have 11, 36 and 21 total examples.
+- **17.71% of test rows are exact duplicates of a training row**
+  (`docs/ML_DATA_AUDIT.md` §D), so absolute figures carry some
+  memorisation. PortScan (55.6% leaked) and SSH-Patator (49.7%) are worst
+  affected; DDoS (0.01%) and Bot (2.03%) are essentially clean.
+- **One 2017 dataset.** Nothing here measures performance on real traffic.
+
+### Retraining used to be memory-bound — fixed by streaming
+
+The full-corpus retrain previously drove **4.2 GB of swap** on an 8 GB
+machine and could not finish. An earlier version of this section blamed
+`build_feature_matrix`'s `list[list[float]]`, estimating 5-8 GB. **That
+attribution was wrong.** Measured per row on the real corpus (2,830,628
+rows):
+
+| representation | bytes/row | full corpus |
+|---|---:|---:|
+| **`LabeledFlow` objects (Pydantic)** | **3,857** | **10.17 GB** |
+| `list[list[float]]` | 764 | 2.01 GB |
+| `float64` numpy array | 232 | 0.61 GB |
+| peak, flows and lists both live | | **12.18 GB** |
+
+The list-of-lists was only 2.01 GB; the Pydantic `Flow` objects are 5x
+larger. A numpy-only rewrite would have saved 1.4 GB of 12.18 and crashed
+again.
+
+**Fixed by streaming** (`iter_cicids2017` ->
+`build_feature_matrix_streaming` -> `train_lightgbm_from_arrays`), so no
+flow list is ever materialised. Measured after: **peak RSS 1.23 GB, 237 s**
+for the full corpus. The training CLI uses this path; `train_lightgbm` and
+`load_cicids2017` keep their old signatures for existing callers and tests.
 
 **The entire difference is one parameter.** v0.2.0 was trained without
 `lambda_l2`; under the multiclass softmax the hessian `p*(1-p)` vanishes as

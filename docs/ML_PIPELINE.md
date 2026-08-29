@@ -162,8 +162,87 @@ shell command. Evidence flows onward into `pirewall.engine.threat.assess_threat`
   both training CLIs, schema-mismatch refusal (load-time and per-call), and
   successful inference — all against small synthetic fixture data
   (`tests/ml/`).
-- **Environment-dependent**: real detection *accuracy* against real attacks
-  needs the spec §34 attack-lab exercise against a model trained on a real,
-  complete dataset — not this repository's synthetic-fixture placeholders.
-  See `docs/PROGRESS.md` Phase 4 for exactly what a human needs to do to
-  get real numbers.
+- **Environment-dependent**: real detection accuracy against *live* attack
+  traffic on the Pi still needs the spec §34 attack-lab exercise. Held-out
+  accuracy on the real CICIDS2017 dataset is no longer environment-dependent
+  — see "Current real-data results" below.
+
+## Current real-data results (CICIDS2017)
+
+**Artifact status, stated precisely.** The shipped artifact is still
+**v0.2.0** — the broken one. The `lambda_l2` fix is committed in
+`pirewall.ml.training.lightgbm_trainer`, but the retrained artifact was
+**not produced on this machine**: the retrain exhausted memory and was
+stopped (see "Retraining is memory-bound" below). The figures below were
+measured by an analysis harness using the identical parameters, data,
+split and seed, **not** emitted by `scripts/train/train_lightgbm`. Treat
+them as a validated projection of what the fixed trainer produces, not as
+the metadata of a delivered model.
+
+Measured on all 8 "MachineLearningCVE" CSVs (2,830,628 flows), 70/15/15
+stratified split, metrics from the untouched test split. Full detail is in
+`docs/ML_DATA_AUDIT.md`.
+
+| metric | v0.2.0 (on disk) | fixed config (measured, not shipped) |
+|---|---:|---:|
+| accuracy | 0.8899 | **0.9971** |
+| multiclass macro-F1 (15 classes) | 0.1975 | **0.8724** |
+| binary precision | 0.7762 | **0.9927** |
+| binary recall | 0.7719 | **0.9932** |
+| binary false-positive rate | 0.0546 | **0.0018** |
+
+### Retraining is memory-bound — fix before the next retrain
+
+`pirewall.ml.training.common.build_feature_matrix` materialises
+`list[list[float]]`: for 2.83M flows that is 2.83M Python list objects each
+holding 29 boxed floats, roughly 5-8 GB, against 657 MB for the equivalent
+`float64` numpy array. Retraining on the full dataset on an 8 GB machine
+drove swap usage to **4.2 GB** and had not finished when it was stopped.
+
+**Consequence:** the retraining procedure documented above cannot currently
+be executed end-to-end on this dataset on a machine with 8 GB of RAM.
+Building the feature matrix directly into a preallocated numpy array would
+remove the problem; that changes the types flowing through
+`build_feature_matrix` and `split_train_val_test`, so it is real work
+rather than a one-line change, and it is **not** done.
+
+**The entire difference is one parameter.** v0.2.0 was trained without
+`lambda_l2`; under the multiclass softmax the hessian `p*(1-p)` vanishes as
+the model gains confidence, and with LightGBM's default `lambda_l2 = 0.0`
+leaf values grow unbounded, so boosting *diverged*. Macro-F1 fell from
+0.8053 at round 10 to 0.2519 at round 100, and max |raw score| reached
+6.4e6. This was **not** an imbalance problem and **not** a data limit —
+`docs/ML_DATA_AUDIT.md` §F has the mechanism, the measured before/after,
+and the three hypotheses that were wrong.
+
+**Architecture** — chosen by a full-scale five-way ablation on one fixed
+split, not assumed:
+
+| configuration | macro-F1 | leak-free macro-F1 |
+|---|---:|---:|
+| **flat multiclass, plain (kept)** | **0.8724** | **0.8855** |
+| flat multiclass + rare-class exclusion | 0.8546 | 0.8542 |
+| flat multiclass + under/oversampling | 0.8291 | 0.8310 |
+| two-stage (binary gate -> attack-type) | 0.8217 | 0.8173 |
+| flat multiclass + balanced class weighting | 0.8075 | 0.8150 |
+
+Every imbalance intervention *costs* macro-F1 once the divergence is fixed.
+The two-stage gate is near-perfect on its own (99.69% accuracy) and still
+loses end-to-end, so the extra artifact, the extra inference call and the
+composed failure mode buy nothing — architecture A stays.
+
+**Known remaining weaknesses — stated plainly:**
+
+- **Web Attack – XSS 15.31% recall** (98 test rows), **Bot 44.75%** (295),
+  **Web Attack – Brute Force 51.33%** (226). These are the genuinely weak
+  classes now, and no technique tried here fixed them.
+- **Heartbleed, Infiltration and Web Attack – Sql Injection are caught
+  (2/2, 5/5, 2/3) but on 2-5 test rows each.** Do not read those as
+  reliable detection; they have 11, 36 and 21 total examples.
+- **17.71% of test rows are exact duplicates of a training row**
+  (`docs/ML_DATA_AUDIT.md` §D), so absolute figures carry some
+  memorisation. The leak-free column above excludes them. PortScan (55.6%
+  leaked) and SSH-Patator (49.7%) are the most affected; DDoS (0.01%) and
+  Bot (2.03%) are essentially clean.
+- **Trained and evaluated on one 2017 dataset.** Nothing here measures
+  performance on this project's actual traffic.

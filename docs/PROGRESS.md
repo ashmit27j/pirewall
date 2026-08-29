@@ -1451,3 +1451,117 @@ dataset file locations, Admin PC IP, actual WAN/LAN interface names).
     confirm it reads `srw-rw---- pirewall-core pirewall-ipc`, then confirm
     a process running as neither `pirewall-core` nor a member of
     `pirewall-ipc` gets `Permission denied` connecting to it.
+
+## Decision entry — rare-class exclusion (section 3) needs a human call
+
+**Status: implemented, tested, and deliberately NOT enabled by default.
+Flagged for review rather than silently decided.**
+
+The exclusion policy in `pirewall.ml.labels`
+(`is_excluded_from_supervised_training`, threshold
+`MIN_SUPERVISED_TRAINING_EXAMPLES = 100`) was requested on the reasoning
+that Heartbleed (11 examples), Web Attack – Sql Injection (21) and
+Infiltration (36) are "near-unlearnable" — evidenced by their 0% recall in
+the v0.2.0 artifact.
+
+**That evidence turned out to be an artifact of a training bug, not a
+property of the data.** The 0% recall came from divergent boosting
+(missing `lambda_l2`, see `docs/ML_DATA_AUDIT.md` §F). With the bug fixed,
+the same plain configuration catches them:
+
+| class | total examples | test n | caught | recall |
+|---|---:|---:|---:|---:|
+| Heartbleed | 11 | 2 | 2 | 100.00% |
+| Infiltration | 36 | 5 | 5 | 100.00% |
+| Web Attack – Sql Injection | 21 | 3 | 2 | 66.67% |
+
+And measured on the full dataset, excluding them **costs** macro-F1:
+
+| configuration | macro-F1 | leak-free macro-F1 |
+|---|---:|---:|
+| plain, all 15 classes | **0.8724** | **0.8855** |
+| plain, 12 classes (exclusion applied) | 0.8546 | 0.8542 |
+
+**Why this is still a genuine judgement call and not simply "don't
+exclude":**
+
+- 2, 5 and 3 test rows respectively. 100% recall on two rows is not
+  evidence of generalisation, and the macro-F1 gap is largely *driven* by
+  those three high-variance terms — it is not a like-for-like comparison.
+- The original argument for exclusion was about **statistical support**
+  (11 total examples cannot support a reliable classifier), and that
+  argument is untouched by the new numbers. What has collapsed is only the
+  supporting claim that the model gets them wrong anyway.
+- Against exclusion: Heartbleed and Infiltration are high-severity
+  attacks. Excluding them means the supervised classifier can never flag
+  them, deferring entirely to Isolation Forest and behaviour analysis.
+
+**Recommendation: leave exclusion available but off**, which is the
+current state — the v0.3.0 artifact is trained on all 15 classes. A human
+should decide whether the statistical-support argument outweighs losing
+supervised coverage of two high-severity classes. Enabling it is a
+one-line change at the trainer's call site; the function, its threshold
+and its boundary tests already exist.
+
+**Also revised by the same bug:** the "Controlled ablation" table earlier
+in this file concluded that resampling, class weighting and threshold
+tuning all underperform the plain baseline. That conclusion still holds on
+re-measurement with the fix (plain 0.8724 > resampling 0.8291 > weighting
+0.8075), but the original comparisons were between differently-diverged
+models and were not valid evidence at the time they were made.
+
+
+## Session outcome — ML quality pass (2026-08-30)
+
+**Headline: the v0.2.0 macro-F1 of 0.1975 was a training bug, not a data or
+imbalance limit.** LightGBM's `lambda_l2` defaults to 0.0; under the
+multiclass softmax the hessian `p*(1-p)` vanishes as the model gains
+confidence, leaving leaf values unbounded, so boosting diverged. Measured:
+macro-F1 0.8053 at round 10 falling to 0.2519 at round 100, with max
+|raw score| reaching 6.4e6. Setting `lambda_l2 = 1.0` bounds raw scores at
+~28 and macro-F1 then *rises* monotonically with boosting. Full mechanism,
+before/after, and the three wrong hypotheses are in
+`docs/ML_DATA_AUDIT.md` §F.
+
+**Fixed (Tested)** — `pirewall.ml.training.lightgbm_trainer` now sets
+`lambda_l2` (default 1.0, exposed as a parameter, pinned by regression
+tests).
+
+**Fixed (Tested)** — `pirewall.detection.known_attack.classify` decoded a
+multiclass booster's `(1, num_class)` output along the batch axis, raising
+`TypeError` on every flow. The known-attack evidence path was entirely
+non-functional against the shipped 15-class artifact. Every existing
+fixture was 2-class, so the branch had no coverage; a 3-class regression
+test now covers it.
+
+**Measured, not shipped** — with the fix, the same plain configuration
+reaches accuracy 0.9971 / macro-F1 0.8724 (binary precision 0.9927, recall
+0.9932, FPR 0.0018). Architecture chosen by a full-scale five-way ablation
+on one fixed split: plain 0.8724 > rare-class exclusion 0.8546 >
+under/oversampling 0.8291 > two-stage 0.8217 > class weighting 0.8075.
+Flat multiclass, no imbalance intervention, wins.
+
+**NOT done — the artifact was not regenerated.** `pirewall/ml/artifacts/`
+still holds the broken **v0.2.0** model. The retrain through
+`scripts/train/train_lightgbm` drove swap to 4.2 GB on this 8 GB machine
+and was stopped before finishing:
+`build_feature_matrix` materialises `list[list[float]]` (~5-8 GB for 2.83M
+flows vs 657 MB as numpy). **Until that is fixed and the retrain run, the
+deployed model is still the diverged one.** This is the single most
+important follow-up.
+
+**Also not done this session:** section 5 runtime wiring (moot until a new
+artifact exists), section 6 threat-scoring recalibration, and a UNSW-NB15
+audit (that dataset is not on this machine).
+
+**Reproducibility gap found:** the split is a deterministic function of the
+order the 8 CSVs are concatenated, and nothing recorded that order —
+reproducing the v0.2.0 metrics took a five-way search over candidate
+orderings. `ModelMetadata` should carry a dataset fingerprint (row count
+plus ordered source-file list, or a hash of the label sequence).
+
+**Prior conclusions revised:** the earlier "controlled ablation" concluding
+that resampling, class weighting and threshold tuning all underperform the
+plain baseline reached the right ranking, but every run in it was a
+diverging model, so it was not valid evidence at the time. Re-measured with
+the fix, the ranking holds.

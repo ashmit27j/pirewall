@@ -13,7 +13,8 @@ versions were committed and reported.
 
 Scope: §A artifact findings, §B section-1 reproduction, §C class
 distribution and the rare-class exclusion policy, §D duplicate flows and
-train/test leakage, §E what remains blocked.
+train/test leakage, §F the root cause of the low macro-F1, §G what
+remains blocked.
 
 Linked from `docs/ML_PIPELINE.md`.
 
@@ -427,7 +428,95 @@ Every configuration in section 4 is therefore reported **twice** — on the
 full test split (comparable with prior sessions) and on the leak-free
 subset with every twinned row removed (the honest generalisation number).
 
-## §E. Still blocked
+## §F. Root cause of the 0.1975 macro-F1: divergent boosting (missing L2)
+
+**The v0.2.0 artifact's macro-F1 of 0.1975 is a training bug, not a data
+limit and not an imbalance problem.**
+
+### F1. The symptom
+
+Holding data, split and seed fixed and varying only the number of boosting
+rounds, the model gets monotonically *worse* the longer it trains:
+
+| rounds | accuracy | macro-F1 | DDoS recall | max \|raw score\| |
+|---:|---:|---:|---:|---:|
+| 10 | 0.9941 | **0.8053** | 99.79% | 2.8e4 |
+| 25 | 0.9809 | 0.6004 | 99.76% | 2.6e5 |
+| 50 | 0.8562 | 0.2680 | 48.52% | 5.2e6 |
+| 100 | 0.8415 | 0.2519 | 53.80% | **6.4e6** |
+
+A converged gradient-boosted model does not behave this way. The raw
+scores are the tell: LightGBM multiclass raw scores are normally single or
+low double digits, and these reach **6.4 million**.
+
+### F2. The mechanism
+
+A leaf's output value is
+
+```
+leaf = -sum(gradient) / (sum(hessian) + lambda_l2)
+```
+
+Under the multiclass softmax the per-sample hessian is `p*(1-p)`, which
+**vanishes as the model becomes confident**. LightGBM's default
+`lambda_l2` is **0.0**, so once probabilities saturate the denominator
+collapses toward zero and the only remaining bound on a leaf value is
+`min_sum_hessian_in_leaf` (default 1e-3) — good for a factor of ~10^3 per
+tree. Accumulated over 100 rounds that is exactly the ~10^6 observed.
+Boosting diverges rather than converges, and several classes collapse to
+0% recall along the way.
+
+### F3. The fix, measured
+
+Identical data, split, seed and rounds; the **only** change is `lambda_l2`:
+
+| config | F1 @10 | @25 | @50 | @100 | max \|raw\| @100 |
+|---|---:|---:|---:|---:|---:|
+| trainer params, `lambda_l2=0` | 0.8053 | 0.6004 | 0.2680 | 0.2519 | 6.4e6 |
+| stock LightGBM defaults, `lambda_l2=0` | 0.7768 | 0.6355 | 0.3508 | 0.3307 | 3.0e6 |
+| trainer params + **`lambda_l2=1`** | 0.8039 | 0.8239 | 0.8463 | **0.8636** | **27.8** |
+| defaults + **`lambda_l2=1`** | 0.8016 | 0.8215 | 0.8617 | **0.8671** | **23.8** |
+
+With L2 the raw scores stay bounded and **macro-F1 improves monotonically
+with boosting**, as it should. Accuracy 0.9967, DDoS 99.86%, BENIGN
+99.78%.
+
+Fixed in `pirewall.ml.training.lightgbm_trainer` (`lambda_l2: float = 1.0`,
+exposed as a parameter, pinned by a regression test).
+
+### F4. What this was NOT — hypotheses killed by measurement
+
+Recorded because each was plausible and each was wrong; the sequence is
+part of the evidence:
+
+1. **`min_data_in_leaf: 1` / `min_data_in_bin: 1`.** These are unusual
+   (they exist so the tiny synthetic test fixtures can train) and were the
+   obvious suspect. But **stock LightGBM defaults diverge too** — in fact
+   slightly worse at round 100. Not the cause.
+2. **Conflicting labels / irreducible noise.** Only **1,249** distinct
+   feature vectors carry more than one label, covering 62,736 rows
+   (2.22%). The **Bayes-optimal ceiling for this feature schema is 99.87%
+   accuracy**; per-class ceiling recall is ≥98.5% for every class except
+   Web Attack – Sql Injection (71.43%, on 21 rows). The data comfortably
+   supports a near-perfect classifier. Not the cause.
+3. **Class-blocked row ordering.** Real — and reintroduced this session in
+   an analysis helper, the same defect `docs/PROGRESS.md` records being
+   fixed in `split_train_val_test`. Fixing it changed the numbers but did
+   not stop the collapse. Not the cause.
+4. **Duplicate-row leakage** (§D) inflates absolute figures but cannot
+   explain the collapse: DDoS has 0.01% leakage and swings 99.79% -> 0%.
+
+### F5. Consequence for everything previously reported
+
+Every LightGBM number this project has published — the 0.1975 baseline and
+the entire imbalance ablation in `docs/PROGRESS.md` — was produced by a
+diverging model at 100 rounds. That ablation concluded resampling,
+class weighting and threshold tuning all *hurt*; those comparisons were
+made between differently-diverged models and cannot be read as evidence
+about the techniques themselves. They need re-running on the fixed
+trainer before any conclusion about imbalance handling is trustworthy.
+
+## §G. Still blocked
 
 **UNSW-NB15 is not present** — `data/` holds only the 8 CICIDS2017 files,
 and a full filesystem search found no `UNSW_NB15_*.csv`. Its class

@@ -22,7 +22,12 @@ def classify(
     num_class = len(class_mapping)
 
     if num_class > 2:
-        class_probabilities = {index_to_label[i]: float(raw[i]) for i in range(num_class)}
+        # A multiclass booster returns shape (1, num_class) for our single input
+        # row — index the row first. Indexing `raw` directly treats the leading
+        # batch axis as the class axis, which raises TypeError on the real
+        # 15-class CICIDS2017 artifact (regression: test_classify_multiclass_*).
+        row = raw[0]
+        class_probabilities = {index_to_label[i]: float(row[i]) for i in range(num_class)}
     else:
         positive_probability = float(raw[0])
         class_probabilities = {

@@ -15,6 +15,7 @@ from pirewall.core.enums import ModelType
 from pirewall.core.models.model_metadata import ModelMetadata
 from pirewall.features.schema import FEATURE_NAMES, SCHEMA_VERSION
 from pirewall.ml.artifacts.metadata import save_metadata
+from pirewall.ml.labels import is_excluded_from_supervised_training
 from pirewall.ml.preprocessing.common import LabeledFlow
 from pirewall.ml.training.common import (
     build_feature_matrix_streaming,
@@ -60,6 +61,13 @@ class LightGBMTrainingResult:
     """Per-class PR-curve thresholds if `tune_thresholds` was requested, whether or not adopted."""
     thresholds_used: bool = False
     """Whether thresholded decoding won on validation macro-F1 and was used for the test metrics."""
+    excluded_labels: tuple[str, ...] = ()
+    """Classes withheld from the training target by the rare-class policy.
+
+    Empty when `exclude_rare_classes=False`. These still appear in the test
+    split and in `per_class`/`confusion_matrix`, but never in
+    `class_mapping`, and never contribute to `macro_f1`.
+    """
 
 
 def train_lightgbm(
@@ -77,6 +85,7 @@ def train_lightgbm(
     class_weighting: bool = False,
     tune_thresholds: bool = False,
     lambda_l2: float = 1.0,
+    exclude_rare_classes: bool = True,
 ) -> LightGBMTrainingResult:
     """Train a LightGBM classifier on `labeled_flows` and evaluate on a held-out **test** split.
 
@@ -121,6 +130,7 @@ def train_lightgbm(
         class_weighting=class_weighting,
         tune_thresholds=tune_thresholds,
         lambda_l2=lambda_l2,
+        exclude_rare_classes=exclude_rare_classes,
     )
 
 
@@ -140,6 +150,7 @@ def train_lightgbm_from_arrays(
     class_weighting: bool = False,
     tune_thresholds: bool = False,
     lambda_l2: float = 1.0,
+    exclude_rare_classes: bool = True,
 ) -> LightGBMTrainingResult:
     """Train from an already-built feature array — the memory-safe entry point.
 
@@ -162,6 +173,21 @@ def train_lightgbm_from_arrays(
     train_idx, val_idx, test_idx = split_indices_train_val_test(
         labels, val_fraction=val_fraction, test_fraction=test_fraction, seed=seed
     )
+
+    # Rare-class exclusion (docs/ML_DATA_AUDIT.md §C). Applied to train and
+    # validation only: a class with too few real examples to support a
+    # classifier must not become a supervised target, but its rows are NOT
+    # deleted -- they stay in the test split and are reported separately,
+    # because those flows really do arrive at inference time and pretending
+    # otherwise would flatter the metrics.
+    excluded_labels: tuple[str, ...] = ()
+    if exclude_rare_classes:
+        excluded_labels = tuple(
+            sorted({label for label in labels if is_excluded_from_supervised_training(label)})
+        )
+        train_idx = [i for i in train_idx if not is_excluded_from_supervised_training(labels[i])]
+        val_idx = [i for i in val_idx if not is_excluded_from_supervised_training(labels[i])]
+
     if not train_idx:
         raise ValueError("training split is empty; provide more labeled flows or smaller val/test fractions")
 
@@ -188,7 +214,11 @@ def train_lightgbm_from_arrays(
         x_train = np.asarray(resampling_result.x_train, dtype=np.float64)
         y_train = resampling_result.y_train
 
-    class_mapping = {label: index for index, label in enumerate(sorted(set(labels)))}
+    # Only the classes the model is actually trained on may appear in the
+    # mapping: a class the booster never saw must not be a predictable
+    # output, and macro-F1 is taken over exactly these.
+    trained_labels = sorted(set(labels) - set(excluded_labels))
+    class_mapping = {label: index for index, label in enumerate(trained_labels)}
     num_class = len(class_mapping)
     y_train_encoded = [class_mapping[label] for label in y_train]
 
@@ -260,10 +290,17 @@ def train_lightgbm_from_arrays(
         predicted_labels = []
 
     labels_sorted = sorted(class_mapping)
+    # Excluded classes are still present in the test split, so the
+    # confusion matrix and the per-class table must cover them or they
+    # would silently vanish from the report (and `confusion_matrix` would
+    # KeyError on an actual label it was not given). macro-F1, however, is
+    # taken over the *trained* classes only: a class the model was never
+    # taught is not a fair term in its average.
+    reported_labels = sorted(set(labels_sorted) | set(excluded_labels))
     acc = accuracy(split.y_test, predicted_labels) if split.y_test else 0.0
-    per_class = per_class_metrics(split.y_test, predicted_labels, labels_sorted) if split.y_test else {}
-    macro = macro_f1(per_class)
-    matrix = confusion_matrix(split.y_test, predicted_labels, labels_sorted) if split.y_test else {}
+    per_class = per_class_metrics(split.y_test, predicted_labels, reported_labels) if split.y_test else {}
+    macro = macro_f1({label: per_class[label] for label in labels_sorted}) if per_class else 0.0
+    matrix = confusion_matrix(split.y_test, predicted_labels, reported_labels) if split.y_test else {}
 
     metadata = ModelMetadata(
         model_type=ModelType.LIGHTGBM,
@@ -292,6 +329,7 @@ def train_lightgbm_from_arrays(
         class_weighting_used=class_weighting,
         thresholds=thresholds,
         thresholds_used=use_thresholds,
+        excluded_labels=excluded_labels,
     )
 
 

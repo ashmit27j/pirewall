@@ -81,6 +81,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-threshold-tuning", dest="threshold_tuning", action="store_false")
     parser.add_argument(
+        "--exclude-rare-classes",
+        dest="exclude_rare_classes",
+        action="store_true",
+        default=True,
+        help=(
+            "Withhold classes below pirewall.ml.labels."
+            "MIN_SUPERVISED_TRAINING_EXAMPLES from the supervised target "
+            "(default: on). Their rows stay in the test split and are "
+            "reported separately."
+        ),
+    )
+    parser.add_argument(
+        "--no-exclude-rare-classes", dest="exclude_rare_classes", action="store_false"
+    )
+    parser.add_argument(
         "--placeholder",
         action="store_true",
         help="Mark this artifact as NOT trained on real data for real detection use.",
@@ -123,11 +138,16 @@ def main(argv: list[str] | None = None) -> int:
         resampling=resampling_config,
         class_weighting=args.class_weighting,
         tune_thresholds=args.threshold_tuning,
+        exclude_rare_classes=args.exclude_rare_classes,
     )
 
     model_path = save_lightgbm_artifact(result, args.output_dir)
     print(f"saved model to {model_path}")
     print(f"split_sizes={result.split_sizes}")
+    print(
+        f"trained_classes={len(result.class_mapping)} "
+        f"excluded_from_training={list(result.excluded_labels)}"
+    )
     if result.resampling is not None:
         print(f"resampling_before={result.resampling.before_counts}")
         print(f"resampling_after={result.resampling.after_counts}")

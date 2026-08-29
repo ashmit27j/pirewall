@@ -35,9 +35,13 @@ import argparse
 import sys
 from pathlib import Path
 
-from pirewall.ml.training.lightgbm_trainer import save_lightgbm_artifact, train_lightgbm
+from pirewall.ml.training.lightgbm_trainer import save_lightgbm_artifact, train_lightgbm_from_arrays
 from pirewall.ml.training.resampling import ResamplingConfig
-from scripts.train._common import DATASET_CHOICES, load_dataset_or_exit, make_console_output_encoding_safe
+from scripts.train._common import (
+    DATASET_CHOICES,
+    make_console_output_encoding_safe,
+    stream_feature_matrix_or_exit,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -89,9 +93,12 @@ def main(argv: list[str] | None = None) -> int:
     make_console_output_encoding_safe()
     args = build_parser().parse_args(argv)
 
-    dataset = load_dataset_or_exit(args.dataset, args.dataset_path)
-    if dataset is None:
+    loaded = stream_feature_matrix_or_exit(args.dataset, args.dataset_path)
+    if loaded is None:
         return 1
+    features, labels = loaded
+    print(f"loaded {features.shape[0]} flows into a {features.dtype} array "
+          f"({features.nbytes / 2**20:.0f} MB)")
 
     resampling_config = (
         ResamplingConfig(
@@ -103,8 +110,9 @@ def main(argv: list[str] | None = None) -> int:
         else None
     )
 
-    result = train_lightgbm(
-        dataset.labeled_flows,
+    result = train_lightgbm_from_arrays(
+        features,
+        labels,
         training_dataset_name=args.dataset,
         model_version=args.model_version,
         is_placeholder=args.placeholder,

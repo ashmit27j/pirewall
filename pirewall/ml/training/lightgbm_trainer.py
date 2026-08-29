@@ -16,11 +16,30 @@ from pirewall.core.models.model_metadata import ModelMetadata
 from pirewall.features.schema import FEATURE_NAMES, SCHEMA_VERSION
 from pirewall.ml.artifacts.metadata import save_metadata
 from pirewall.ml.preprocessing.common import LabeledFlow
-from pirewall.ml.training.common import build_feature_matrix, split_train_val_test
+from pirewall.ml.training.common import (
+    build_feature_matrix_streaming,
+    split_indices_train_val_test,
+)
 from pirewall.ml.training.metrics import accuracy, confusion_matrix, macro_f1, per_class_metrics
 from pirewall.ml.training.resampling import ResamplingConfig, ResamplingResult, resample_training_split
 
 PREPROCESSING_VERSION = "1.0.0"
+
+
+@dataclass(frozen=True, slots=True)
+class _ArraySplit:
+    """A train/val/test partition whose feature blocks are numpy arrays.
+
+    The array-path analogue of `ThreeWaySplit`, which holds
+    `list[list[float]]` and is 3.3x larger per row (measured).
+    """
+
+    x_train: npt.NDArray[np.float64]
+    y_train: list[str]
+    x_val: npt.NDArray[np.float64]
+    y_val: list[str]
+    x_test: npt.NDArray[np.float64]
+    y_test: list[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,18 +105,88 @@ def train_lightgbm(
     if not labeled_flows:
         raise ValueError("cannot train on an empty dataset")
 
-    features, labels = build_feature_matrix(labeled_flows)
-    split = split_train_val_test(
-        features, labels, val_fraction=val_fraction, test_fraction=test_fraction, seed=seed
+    features, labels = build_feature_matrix_streaming(labeled_flows)
+    return train_lightgbm_from_arrays(
+        features,
+        labels,
+        training_dataset_name=training_dataset_name,
+        model_version=model_version,
+        is_placeholder=is_placeholder,
+        notes=notes,
+        num_boost_round=num_boost_round,
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
+        seed=seed,
+        resampling=resampling,
+        class_weighting=class_weighting,
+        tune_thresholds=tune_thresholds,
+        lambda_l2=lambda_l2,
     )
-    if not split.y_train:
+
+
+def train_lightgbm_from_arrays(
+    features: npt.NDArray[np.float64],
+    labels: Sequence[str],
+    *,
+    training_dataset_name: str,
+    model_version: str,
+    is_placeholder: bool = False,
+    notes: str | None = None,
+    num_boost_round: int = 50,
+    val_fraction: float = 0.15,
+    test_fraction: float = 0.15,
+    seed: int = 42,
+    resampling: ResamplingConfig | None = None,
+    class_weighting: bool = False,
+    tune_thresholds: bool = False,
+    lambda_l2: float = 1.0,
+) -> LightGBMTrainingResult:
+    """Train from an already-built feature array — the memory-safe entry point.
+
+    `train_lightgbm` is a thin wrapper over this that builds the array from
+    flows first. Callers with a full-size corpus should stream flows
+    themselves (`pirewall.ml.preprocessing.cicids_adapter.iter_cicids2017`)
+    into `build_feature_matrix_streaming` and call this directly, so the
+    2.83M Pydantic `Flow` objects (~10.2 GB, measured) never coexist.
+
+    Splitting is done on row indices via `split_indices_train_val_test`, the
+    same function `split_train_val_test` uses, so this path produces exactly
+    the partition the list-based path would for a given seed.
+    """
+    if features.shape[0] != len(labels):
+        raise ValueError("features and labels must have the same length")
+    if features.shape[0] == 0:
+        raise ValueError("cannot train on an empty dataset")
+
+    labels = list(labels)
+    train_idx, val_idx, test_idx = split_indices_train_val_test(
+        labels, val_fraction=val_fraction, test_fraction=test_fraction, seed=seed
+    )
+    if not train_idx:
         raise ValueError("training split is empty; provide more labeled flows or smaller val/test fractions")
 
-    x_train, y_train = split.x_train, split.y_train
+    split = _ArraySplit(
+        x_train=features[train_idx],
+        y_train=[labels[i] for i in train_idx],
+        x_val=features[val_idx],
+        y_val=[labels[i] for i in val_idx],
+        x_test=features[test_idx],
+        y_test=[labels[i] for i in test_idx],
+    )
+
+    x_train: npt.NDArray[np.float64] = split.x_train
+    y_train = split.y_train
     resampling_result: ResamplingResult | None = None
     if resampling is not None:
-        resampling_result = resample_training_split(x_train, y_train, resampling, seed=seed)
-        x_train, y_train = resampling_result.x_train, resampling_result.y_train
+        # `resample_training_split` is list-based (imbalanced-learn's
+        # RandomUnderSampler/SMOTE round-trip through Python lists here), so
+        # this re-materialises the training split as list[list[float]] —
+        # roughly 1.4 GB for a full-size CICIDS2017 training split. Fine on
+        # a machine with headroom; the plain configuration this project
+        # ships does not enable resampling at all.
+        resampling_result = resample_training_split(x_train.tolist(), y_train, resampling, seed=seed)
+        x_train = np.asarray(resampling_result.x_train, dtype=np.float64)
+        y_train = resampling_result.y_train
 
     class_mapping = {label: index for index, label in enumerate(sorted(set(labels)))}
     num_class = len(class_mapping)
@@ -142,7 +231,7 @@ def train_lightgbm(
 
     thresholds: dict[str, float] | None = None
     use_thresholds = False
-    if tune_thresholds and split.x_val:
+    if tune_thresholds and split.x_val.size:
         val_proba = _predict_proba_matrix(booster, split.x_val, num_class)
         thresholds = _tune_class_thresholds(val_proba, split.y_val, class_mapping)
         # Self-validating gate: per-class F1-optimal thresholds are picked
@@ -160,7 +249,7 @@ def train_lightgbm(
         thresholded_val_f1 = macro_f1(thresholded_val_per_class)
         use_thresholds = thresholded_val_f1 > argmax_val_f1
 
-    if split.x_test:
+    if split.x_test.size:
         test_proba = _predict_proba_matrix(booster, split.x_test, num_class)
         predicted_labels = (
             _decode_with_thresholds(test_proba, class_mapping, thresholds)
@@ -230,7 +319,7 @@ def _train_booster(
 
 
 def _predict_proba_matrix(
-    booster: lgb.Booster, x: list[list[float]], num_class: int
+    booster: lgb.Booster, x: list[list[float]] | npt.NDArray[np.float64], num_class: int
 ) -> npt.NDArray[np.float64]:
     """Booster.predict, normalized to a `(n_samples, num_class)` probability matrix in both objectives.
 

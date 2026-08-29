@@ -39,6 +39,7 @@ naming the missing column.
 """
 
 import csv
+from collections.abc import Iterator
 from datetime import timedelta
 from pathlib import Path
 
@@ -49,6 +50,7 @@ from pirewall.ml.preprocessing.common import (
     SYNTHETIC_EPOCH,
     DatasetLoadResult,
     LabeledFlow,
+    SkipCounter,
     combine_weighted_stats,
     parse_float,
 )
@@ -106,12 +108,19 @@ def _build_header_map(fieldnames: list[str]) -> dict[str, str]:
     return normalized
 
 
-def load_cicids2017(path: Path) -> DatasetLoadResult:
-    """Load a CICIDS2017 per-flow CSV into a `DatasetLoadResult`.
+def iter_cicids2017(path: Path, skips: SkipCounter | None = None) -> Iterator[LabeledFlow]:
+    """Yield one `LabeledFlow` per parseable row, holding only one at a time.
 
-    Raises `DatasetError` if the file can't be opened or is missing a
-    required column. Per-row parse failures (bad IP, non-numeric field) are
-    skipped and counted in the result, not raised.
+    The streaming counterpart to `load_cicids2017`. It exists because
+    `Flow` is a Pydantic model costing ~3.9 KB per row: materialising all
+    2.83M CICIDS2017 flows at once needs ~10.2 GB, which does not fit on a
+    typical development machine (measured, see `docs/ML_DATA_AUDIT.md` §H).
+    Callers that only need features should consume this and let each flow
+    be collected immediately.
+
+    Per-row parse failures are recorded in `skips` (if given) and the row
+    skipped, matching `load_cicids2017`'s behaviour rather than aborting
+    the whole load (spec §13).
     """
     if not path.is_file():
         raise DatasetError(
@@ -121,7 +130,6 @@ def load_cicids2017(path: Path) -> DatasetLoadResult:
             "script at the extracted CSV file."
         )
 
-    result = DatasetLoadResult()
     with path.open(newline="", encoding="utf-8", errors="replace") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None:
@@ -130,10 +138,24 @@ def load_cicids2017(path: Path) -> DatasetLoadResult:
 
         for index, raw_row in enumerate(reader):
             try:
-                result.labeled_flows.append(_parse_row(raw_row, header, index))
+                yield _parse_row(raw_row, header, index)
             except ValueError as exc:
-                result.record_skip(str(exc))
+                if skips is not None:
+                    skips.record_skip(str(exc))
 
+
+def load_cicids2017(path: Path) -> DatasetLoadResult:
+    """Load a CICIDS2017 per-flow CSV into a `DatasetLoadResult`.
+
+    Raises `DatasetError` if the file can't be opened or is missing a
+    required column. Per-row parse failures (bad IP, non-numeric field) are
+    skipped and counted in the result, not raised.
+
+    **This holds every flow in memory at once** (~3.9 KB per row). For a
+    full-size dataset use `iter_cicids2017` instead — see its docstring.
+    """
+    result = DatasetLoadResult()
+    result.labeled_flows.extend(iter_cicids2017(path, skips=result))
     return result
 
 

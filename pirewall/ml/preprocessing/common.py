@@ -10,6 +10,7 @@ on those `Flow`s, never reimplementing feature math for training data
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Protocol
 
 from pirewall.core.models.flow import Flow
 
@@ -19,6 +20,17 @@ from pirewall.core.models.flow import Flow
 # same synthetic timestamp rather than trying to parse each dataset's own
 # (inconsistent, sometimes ambiguous) timestamp format.
 SYNTHETIC_EPOCH = datetime(2000, 1, 1, tzinfo=UTC)
+
+
+class SkipCounter(Protocol):
+    """Anything that can record a skipped row, so streaming loaders can report.
+
+    `DatasetLoadResult` satisfies this. Streaming loaders take one of these
+    rather than returning a result object, because the whole point of
+    streaming is not to accumulate anything per-row.
+    """
+
+    def record_skip(self, reason: str) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)

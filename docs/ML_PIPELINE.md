@@ -4,6 +4,12 @@ Covers: dataset adapters, preprocessing, training, model artifacts, and
 runtime inference's schema-compatibility gate. See `docs/FEATURE_SCHEMA.md`
 for the canonical feature list both training and inference share.
 
+**See also `docs/ML_DATA_AUDIT.md`** — verified findings about the delivered
+artifacts, including a fixed bug that made multiclass inference fail
+outright, two open data-hygiene issues (NaN/Infinity acceptance, label
+mojibake), a label-leakage check on `destination_port`, and measured
+per-flow inference latency for both models.
+
 ## Pipeline overview
 
 ```text

@@ -158,7 +158,7 @@ have **exactly zero** gain and zero splits — the model never uses them. Four
 more (`protocol_is_tcp`, `fin_count`, `rst_count`, `protocol_is_udp`) round
 to 0.000%. Worth revisiting when the schema is next versioned.
 
-### A5. Isolation Forest inference is ~48x slower than LightGBM, and it is fixable
+### A5. Isolation Forest per-call overhead — independent re-measurement of an already-known finding
 
 Measured per-flow latency through the real runtime call paths
 (`detection.known_attack.classify` / `detection.anomaly.detect`), 2000
@@ -183,15 +183,22 @@ a large *fixed per-call* cost that is nearly independent of batch size
 | `score_samples(X)` with 256 rows | 13.392 ms | **0.052 ms** |
 
 **Batching 256 flows into one call costs ~7% more wall-clock than scoring a
-single flow, i.e. ~240x more throughput per flow.** The runtime currently
-scores one flow per call and pays the full fixed cost every time. This is
-the single largest available throughput win in the ML path and it is a
-pure runtime-shape change — no retrain, no accuracy tradeoff.
+single flow, i.e. ~240x more throughput per flow.**
 
-**Not implemented in this pass:** it changes the detection pipeline's
-call shape (a batching/queue boundary in `pirewall/runtime/`), which is
-outside the `ml/` + `detection/` + `config/` scope this session was given
-and deserves its own reviewed change.
+**This is not a new finding.** A prior session already measured and
+documented it — `docs/PROGRESS.md` line 105 (~15.6 ms/call, ~0.088 ms/flow
+at batch 200, "~178x faster — the overhead is per-call, not tree
+traversal") and the open question at line 1387, which estimates 10-20
+flows/s on a Pi 4 and lists remediation options. The numbers here were
+measured independently this session and **reproduce that result** on
+different hardware (12.5 ms vs 15.6 ms per call; 240x vs 178x gap — same
+effect, machine-dependent magnitude). Recorded here as confirmation, and
+because it bears directly on the architecture-choice latency budget.
+
+Still open, still for the same reason given there: the remedy changes the
+shape of `pirewall.detection.anomaly.detect` and its caller, which is
+design work outside the `ml/` + `detection/` + `config/` scope of this
+session.
 
 ---
 

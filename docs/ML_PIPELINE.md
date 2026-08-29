@@ -167,84 +167,146 @@ shell command. Evidence flows onward into `pirewall.engine.threat.assess_threat`
   accuracy on the real CICIDS2017 dataset is no longer environment-dependent
   — see "Current real-data results" below.
 
-## Current real-data results (CICIDS2017, model version 0.3.0)
+## Current real-data results (CICIDS2017, model version 0.4.0)
 
 **Shipped.** `pirewall/ml/artifacts/lightgbm_model.txt` is model version
-**0.3.0**, `is_placeholder: false`, produced by
-`scripts/train/train_lightgbm.py` on all 8 "MachineLearningCVE" CSVs
-(2,830,628 flows; 115 rows skipped for negative `Flow Duration`).
-Split 1,981,438 / 424,595 / 424,595; metrics from the untouched test split.
+**0.4.0** (4,039,527 bytes, 2026-08-30 02:28:07, `is_placeholder: false`),
+produced by `scripts/train/train_lightgbm.py` over all 8
+"MachineLearningCVE" CSVs (2,830,628 flows; 115 rows skipped for negative
+`Flow Duration`). Split train 1,981,390 / val 424,585 / test 424,595.
+**12 trained classes** — the rare-class exclusion policy is applied.
 
-| metric | v0.2.0 | **v0.3.0** |
-|---|---:|---:|
-| accuracy | 0.8899468905663044 | **0.9970560180878248** |
-| multiclass macro-F1 (15 classes) | 0.1974519339696516 | **0.8724113675173262** |
-| binary precision | 0.7762 | **0.9927** |
-| binary recall | 0.7719 | **0.9932** |
-| binary false-positive rate | 0.0546 | **0.0018** |
-
-Per-class recall, v0.2.0 -> v0.3.0 (test n / caught):
-
-| class | test n | v0.2.0 | **v0.3.0** |
+| metric | v0.2.0 | v0.3.0 | **v0.4.0** |
 |---|---:|---:|---:|
-| BENIGN | 340,947 | 94.54% | **99.82%** |
-| DoS Hulk | 34,661 | 85.51% | **99.36%** |
-| PortScan | 23,840 | 73.95% | **99.97%** |
-| DDoS | 19,204 | 43.05% | **99.93%** |
-| DoS GoldenEye | 1,544 | 0.00% | **99.03%** |
-| FTP-Patator | 1,191 | 0.34% | **99.92%** |
-| SSH-Patator | 885 | 0.00% | **98.76%** |
-| DoS slowloris | 869 | 0.00% | **99.19%** |
-| DoS Slowhttptest | 825 | 0.00% | **99.39%** |
-| Bot | 295 | 0.00% | **44.75%** |
-| Web Attack - Brute Force | 226 | 0.00% | **51.33%** |
-| Web Attack - XSS | 98 | 0.00% | **15.31%** |
-| Infiltration | 5 | 0.00% | 100.00% (5/5) |
-| Web Attack - Sql Injection | 3 | 0.00% | 66.67% (2/3) |
-| Heartbleed | 2 | 0.00% | 100.00% (2/2) |
+| accuracy | 0.889947 | 0.997056 | **0.997146** |
+| macro-F1 | 0.197452 (15 cls) | 0.872411 (15 cls) | **0.854589 (12 cls)** |
+| binary precision | 0.7762 | 0.992687 | **0.993021** |
+| binary recall | 0.7719 | 0.993186 | **0.993329** |
+| binary FPR | 0.0546 | 0.001795 | **0.001713** |
 
-**The entire difference is one parameter.** v0.2.0 trained without
-`lambda_l2`; under the multiclass softmax the hessian `p*(1-p)` vanishes as
-the model gains confidence, and with LightGBM's default `lambda_l2 = 0.0`
-leaf values grow unbounded, so boosting *diverged* — macro-F1 fell from
-0.8053 at round 10 to 0.2519 at round 100, with max |raw score| reaching
-6.4e6. This was **not** an imbalance problem and **not** a data limit;
-`docs/ML_DATA_AUDIT.md` §F has the mechanism and the wrong hypotheses.
+**Reading the macro-F1 change honestly.** 0.8546 (12 classes) versus
+0.8724 (15) is *not* a like-for-like drop. Recomputing v0.3.0 over the same
+12 classes gives **0.857181**, so applying the exclusion policy costs
+**-0.002592** — noise. v0.3.0's higher headline came from three classes
+with 2, 5 and 3 test rows scoring F1 1.0, 1.0 and 0.8: the 15-class average
+was flattering itself. Binary precision and false-positive rate both
+*improved*.
 
-**Architecture** — chosen by a full-scale five-way ablation on one fixed
-split, not assumed:
+### Full per-class table (v0.4.0, held-out test split)
 
-| configuration | macro-F1 | leak-free macro-F1 |
-|---|---:|---:|
-| **flat multiclass, plain (shipped)** | **0.8724** | **0.8855** |
-| flat multiclass + rare-class exclusion | 0.8546 | 0.8542 |
-| flat multiclass + under/oversampling | 0.8291 | 0.8310 |
-| two-stage (binary gate -> attack-type) | 0.8217 | 0.8173 |
-| flat multiclass + balanced class weighting | 0.8075 | 0.8150 |
+| class | test n | caught | recall | precision | F1 |
+|---|---:|---:|---:|---:|---:|
+| BENIGN | 340,947 | 340,363 | 99.83% | 99.84% | 0.9983 |
+| DDoS | 19,204 | 19,191 | 99.93% | 99.98% | 0.9996 |
+| PortScan | 23,840 | 23,837 | 99.99% | 99.32% | 0.9966 |
+| DoS Hulk | 34,661 | 34,456 | 99.41% | 99.18% | 0.9929 |
+| DoS slowloris | 869 | 863 | 99.31% | 99.88% | 0.9960 |
+| FTP-Patator | 1,191 | 1,189 | 99.83% | 100.00% | 0.9992 |
+| DoS Slowhttptest | 825 | 821 | 99.52% | 98.44% | 0.9898 |
+| SSH-Patator | 885 | 875 | 98.87% | 98.20% | 0.9854 |
+| DoS GoldenEye | 1,544 | 1,529 | 99.03% | 96.04% | 0.9751 |
+| **Bot** | 295 | 134 | **45.42%** | 90.54% | 0.6050 |
+| **Web Attack - Brute Force** | 226 | 114 | **50.44%** | 60.32% | 0.5494 |
+| **Web Attack - XSS** | 98 | 11 | **11.22%** | 33.33% | 0.1679 |
 
-Every imbalance intervention *costs* macro-F1 once the divergence is fixed.
-The two-stage gate is near-perfect alone (99.69% accuracy) and still loses
-end-to-end, so the second artifact and second inference call buy nothing.
+Excluded from supervised training (still in the test split, reported for
+transparency, **not** in macro-F1):
 
-**Runtime**: no code change was needed to adopt v0.3.0 — the
+| class | total examples | test n | caught | recall |
+|---|---:|---:|---:|---:|
+| Infiltration | 36 | 5 | 0 | 0.00% |
+| Web Attack - Sql Injection | 21 | 3 | 0 | 0.00% |
+| Heartbleed | 11 | 2 | 0 | 0.00% |
+
+### Rare-class exclusion policy — settled
+
+**Threshold: `MIN_SUPERVISED_TRAINING_EXAMPLES = 100`**
+(`pirewall.ml.labels`). Read off the real distribution: counts run
+Heartbleed 11, Web Attack - Sql Injection 21, Infiltration 36, then Web
+Attack - XSS **652** — an 18x gap. Any cutoff in (36, 652] selects the same
+three classes, so the number is not knife-edge; 100 also sits where the
+70/15/15 split stops resolving (below it a class lands <=5 test rows).
+
+**First enforced in v0.4.0.** v0.3.0 and every earlier artifact were
+trained *with* those rows — 7 Heartbleed, 15 SQL Injection, 26
+Infiltration, 48 in total — because the policy function existed and was
+unit-tested but had no production caller. The v0.4.0 training split is
+1,981,390 rows against v0.3.0's 1,981,438: exactly those 48 removed.
+`tests/ml/test_exclusion_is_wired.py` is an integration guard that fails if
+the filter ever regresses to defined-but-never-called.
+
+Detection of those three classes now rests entirely on the Isolation Forest
+and `pirewall.detection.behavior`, as intended.
+
+### Architecture decision — flat multiclass, on evidence
+
+Full-scale five-way ablation, one fixed split, 1,981,438 training rows:
+
+| configuration | classes | macro-F1 | leak-free macro-F1 |
+|---|---:|---:|---:|
+| flat multiclass, no exclusion | 15 | 0.8724 | 0.8855 |
+| **flat multiclass + exclusion (shipped)** | 12 | **0.8546** | **0.8542** |
+| flat multiclass + under/oversampling | 12 | 0.8291 | 0.8310 |
+| two-stage (binary gate -> attack-type) | 12 | 0.8217 | 0.8173 |
+| flat multiclass + balanced class weighting | 12 | 0.8075 | 0.8150 |
+
+The two-stage architecture **was** built and evaluated at full scale, not
+skipped: a binary gate reaching **99.69%** accuracy, then an attack-type
+classifier trained on 390,302 attack-only rows over 11 classes, composed on
+stage 1's *real* predictions rather than oracle labels. The like-for-like
+comparison is both 12-class rows: **flat 0.8546 vs two-stage 0.8217**. Flat
+wins by 0.033 while needing one artifact, one inference call and no
+composed failure mode. Every imbalance intervention also *costs* macro-F1
+once the divergence bug is fixed.
+
+**Runtime**: adopting v0.4.0 required no code change — the
 schema-compatibility gate accepts it, `pirewall.detection.known_attack`
-classifies against it unmodified, and measured per-flow latency *improved*
-to 0.181 ms mean / 0.242 ms p95 (from 0.272 ms), because L2 yields
-shallower trees.
+classifies against it unmodified, the three excluded classes are absent
+from the predictable output set, and per-flow latency is 0.239 ms mean /
+0.326 ms p95.
 
-**Known remaining weaknesses — stated plainly:**
+### The three weak classes — assessment and recommendation
 
-- **Web Attack - XSS 15.31%** (98 test rows), **Bot 44.75%** (295),
-  **Web Attack - Brute Force 51.33%** (226) are still weak. No technique
-  tried here fixed them; XSS is mostly confused with Brute Force and BENIGN.
-- **Heartbleed, Infiltration and Web Attack - Sql Injection are caught, but
-  on 2, 5 and 3 test rows.** Do not read those as reliable detection; they
-  have 11, 36 and 21 total examples.
-- **17.71% of test rows are exact duplicates of a training row**
-  (`docs/ML_DATA_AUDIT.md` §D), so absolute figures carry some
-  memorisation. PortScan (55.6% leaked) and SSH-Patator (49.7%) are worst
-  affected; DDoS (0.01%) and Bot (2.03%) are essentially clean.
-- **One 2017 dataset.** Nothing here measures performance on real traffic.
+**Bot 45.42%, Web Attack - Brute Force 50.44%, Web Attack - XSS 11.22%.**
+These have 1,966 / 1,507 / 652 real examples, so this is not the
+data-scarcity problem the excluded classes have.
+
+Where their test flows actually go:
+
+| class | -> BENIGN | -> correct | -> other web attack |
+|---|---:|---:|---:|
+| Web Attack - XSS | **50.0%** | 11.2% | 36.7% (Brute Force) |
+| Bot | **54.6%** | 45.4% | - |
+| Web Attack - Brute Force | **44.2%** | 50.4% | 5.3% (XSS) |
+
+**The dominant error is being missed as BENIGN, not confused between attack
+types.** That is a detection failure, not a labelling one.
+
+**The obvious lever exists and was measured.** Balanced class weighting
+(already implemented, `--class-weighting`) moves recall substantially on
+exactly these classes — but at a precision cost that makes it unusable as
+the primary classifier:
+
+| class | plain: recall / precision / F1 | weighted: recall / precision / F1 |
+|---|---|---|
+| Bot | 45.42% / 90.54% / 0.6050 | **98.31%** / **20.47%** / 0.3388 |
+| WA - Brute Force | 50.44% / 60.32% / 0.5494 | 63.27% / 23.10% / 0.3385 |
+| WA - XSS | 11.22% / 33.33% / 0.1679 | 54.08% / 9.27% / 0.1582 |
+
+Bot recall more than doubles, but 4 in 5 "Bot" alerts become wrong. F1
+falls for all three.
+
+**Recommendation: treat this as close to the ceiling for this feature
+schema, and do not spend another session on it.** The 29 canonical features
+are flow-level only — packet counts, byte counts, timing, TCP flags, port.
+They contain **no payload or HTTP semantics whatsoever**, and XSS versus
+Brute Force differ almost entirely in payload: same tool, same target, same
+port, similar flow shape. The 36.7% XSS->Brute Force confusion is the
+expected consequence. Options, none cheap: add payload/L7 features (a
+schema change and a scope change, since the design is deliberately
+flow-level), or expose the recall/precision trade per-deployment via the
+existing `--class-weighting` flag for operators who would rather alert
+loudly in SHADOW mode. Neither is worth doing speculatively.
 
 ### Retraining used to be memory-bound — fixed by streaming
 

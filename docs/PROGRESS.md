@@ -1584,3 +1584,94 @@ that resampling, class weighting and threshold tuning all underperform the
 plain baseline reached the right ranking, but every run in it was a
 diverging model, so it was not valid evidence at the time. Re-measured with
 the fix, the ranking holds.
+
+
+## ML-improvement pass — final state (2026-08-30)
+
+**Shipped artifact: LightGBM v0.4.0**, 12 trained classes,
+accuracy 0.997146, macro-F1 0.854589, binary precision 0.993021 /
+recall 0.993329 / FPR 0.001713. Full per-class table and every caveat in
+`docs/ML_PIPELINE.md`.
+
+### What actually caused the 0.1975 — and the wrong turns on the way
+
+Useful history for anyone retraining on similar hardware:
+
+1. **The 0.1975 macro-F1 was a training bug, not imbalance and not a data
+   limit.** LightGBM defaults `lambda_l2` to 0.0; under the multiclass
+   softmax the hessian `p*(1-p)` vanishes as the model gains confidence,
+   leaving leaf values unbounded, so boosting *diverged* — macro-F1 0.8053
+   at round 10 down to 0.2519 at round 100, max |raw score| 6.4e6. Setting
+   `lambda_l2 = 1.0` bounds raw scores at ~28 and macro-F1 rises
+   monotonically. **Three hypotheses were wrong first** and were killed by
+   controlled measurement, not argument: `min_data_in_leaf`/`min_data_in_bin`
+   (stock LightGBM defaults diverge too), label noise (only 2.22% of rows
+   sit on an ambiguous feature vector; the Bayes ceiling is 99.87%
+   accuracy), and class-blocked row ordering.
+
+2. **The retrain then failed on memory, and the first diagnosis of that was
+   also wrong.** `build_feature_matrix`'s `list[list[float]]` was blamed at
+   an estimated 5-8 GB. Measured, it is 2.01 GB; the **Pydantic
+   `LabeledFlow` objects are 3,857 B/row = 10.17 GB**, peaking near
+   12.18 GB against 8 GB of RAM. A numpy-only rewrite would have saved
+   1.4 GB of 12.18 and crashed again. **The fix had to be streaming**, not
+   dtype tuning: `iter_cicids2017` -> `build_feature_matrix_streaming` ->
+   `train_lightgbm_from_arrays`. Measured after: **peak RSS 1.23 GB, 237 s**
+   for the full corpus. If you retrain this on a memory-constrained
+   machine, use the streaming path; `load_cicids2017` still materialises
+   everything and is fine only for fixtures.
+
+3. **The rare-class exclusion policy was implemented, unit-tested,
+   documented as wired — and had zero production callers.** v0.3.0 trained
+   on 7 Heartbleed, 15 SQL Injection and 26 Infiltration rows as a result.
+   Caught by counting what actually reached the booster, not by reading
+   code. Fixed in v0.4.0 (training split 1,981,390 vs 1,981,438 — exactly
+   those 48 rows), with `tests/ml/test_exclusion_is_wired.py` as an
+   integration guard verified to fail against a no-op implementation.
+
+### Decisions, settled
+
+- **Exclusion threshold: `MIN_SUPERVISED_TRAINING_EXAMPLES = 100`**, first
+  enforced in **v0.4.0**. Counts jump 36 -> 652 (18x), so any cutoff in
+  that gap picks the same three classes. Cost measured like-for-like:
+  **-0.002592 macro-F1** over the same 12 classes, with binary precision
+  and FPR both improving. The earlier decision entry above asked for a
+  human call on this; the measurement makes it cheap, so it is applied.
+- **Architecture: flat multiclass.** Two-stage was built and evaluated at
+  full scale (stage-1 gate 99.69% accuracy, stage 2 on 390,302 attack-only
+  rows, composed on real stage-1 predictions) and lost like-for-like,
+  0.8546 vs 0.8217, while costing a second artifact and a second inference
+  call.
+- **Scoring weights: 60 / 15 / 25** (was 50/25/25), set from measured
+  detector reliability — LightGBM precision 0.9927 / FPR 0.0018 against
+  Isolation Forest precision 0.5300 / FPR 0.0987. Anomaly at 15 cannot
+  reach `low_threshold` (25) alone. Per-class weighting was considered and
+  rejected (spec §18 explainability; it would bake dataset constants into
+  the engine and go stale on retrain).
+
+### Remaining limitations — stated plainly, not smoothed over
+
+- **Bot 45.42%, Web Attack - Brute Force 50.44%, Web Attack - XSS 11.22%.**
+  Their dominant error is being missed as BENIGN (54.6% / 44.2% / 50.0%),
+  a detection failure rather than attack-type confusion. Class weighting
+  raises Bot recall to 98.31% but collapses its precision to 20.47%, so it
+  is not deployable as the primary classifier. Assessed as close to the
+  ceiling for a flow-level feature schema that carries no payload or HTTP
+  semantics — see `docs/ML_PIPELINE.md` for the full reasoning and options.
+- **The three excluded classes are undetectable by the classifier by
+  construction** and depend entirely on Isolation Forest and behaviour
+  analysis, neither of which has been validated against them specifically.
+- **17.71% of test rows are exact duplicates of a training row.** Absolute
+  figures carry some memorisation; PortScan (55.6% leaked) and SSH-Patator
+  (49.7%) are worst affected, DDoS (0.01%) and Bot (2.03%) essentially
+  clean. Ablation results are reported with a leak-free column throughout.
+- **Isolation Forest is unchanged** (v0.2.0, precision 0.5300, recall
+  0.4537). It was not retrained this pass; the divergence bug is specific
+  to gradient boosting and does not apply to it.
+- **UNSW-NB15 is deferred, not dropped.** The dataset is not present on
+  this machine (only the 8 CICIDS2017 CSVs are), so its class distribution
+  could not be audited. Doing so needs the dataset copied here and is the
+  obvious next data-side task.
+- **Everything is one 2017 dataset.** No number here measures performance
+  on this project's real traffic; that remains the spec §34 attack-lab
+  exercise and is still Environment-dependent.

@@ -265,6 +265,116 @@ classifies against it unmodified, the three excluded classes are absent
 from the predictable output set, and per-flow latency is 0.239 ms mean /
 0.326 ms p95.
 
+### Train/test leakage — audited, and it does NOT inflate the results
+
+**Method.** "Duplicate" here means **bit-identical across all 29 canonical
+features** — `np.unique` over a structured byte view, exact float64
+equality, no rounding or normalisation. Near-duplicates are therefore
+**not** detected, so every figure below is a lower bound.
+
+**Taxonomy** (2,830,628 rows, 2,402,181 unique vectors, 428,447 duplicate
+rows = 15.14%):
+
+| | count |
+|---|---:|
+| distinct vectors appearing more than once | 123,458 |
+| ...spanning **both** train and test — real leakage | **41,959** (34%) |
+| ...never spanning train+test — over-representation only | 81,499 (66%) |
+
+Per test row (424,595 total):
+
+| | rows | share |
+|---|---:|---:|
+| exact twin in the v0.4.0 training split — **real leakage** | 75,079 | **17.68%** |
+| duplicated but no train twin — over-representation only | 7,616 | 1.79% |
+| wholly unique in the corpus | 341,900 | 80.52% |
+
+So the leakage is real: about a third of duplicate groups straddle the
+split, and 17.68% of test rows have a training twin. The split is
+per-row, and CICIDS2017 genuinely contains identical flows.
+
+**But it is not inflating the metrics.** Re-evaluating the *shipped
+v0.4.0 artifact* — no retraining — against only the 349,516 test rows with
+no training twin:
+
+| metric | full test | leakage-free | delta |
+|---|---:|---:|---:|
+| accuracy | 0.997146 | **0.998137** | +0.00099 |
+| macro-F1 (12 classes) | 0.854589 | **0.854239** | **-0.00035** |
+| binary precision | 0.993021 | **0.996234** | +0.0032 |
+| binary recall | 0.993329 | **0.994116** | +0.0008 |
+| binary FPR | 0.001713 | **0.000789** | better |
+
+macro-F1 moves by 0.00035. Accuracy, precision and false-positive rate all
+*improve* on the clean subset.
+
+**The two most-duplicated classes specifically**, since they are also two of
+the best-scoring:
+
+| class | leak% of its test rows | full-test recall | leakage-free recall (n) |
+|---|---:|---:|---:|
+| PortScan | 55.12% | 99.99% | **99.97%** (10,699) |
+| SSH-Patator | 45.76% | 98.87% | **99.58%** (480) |
+
+PortScan holds at 99.97% on rows with no training twin; SSH-Patator scores
+*higher* on its clean subset. Their performance is genuine generalisation,
+not memorisation — which is mechanically unsurprising: a port-scan probe is
+a near-degenerate flow (a couple of packets, fixed size, no payload), so
+identical feature vectors recur naturally rather than indicating a copied
+record.
+
+**Conclusion: v0.4.0's reported numbers stand.** No version bump; the
+leakage-free column is recorded alongside them (`reports/v040_leakfree.txt`)
+rather than replacing them. **Recommended for future retrains**: use a
+group-aware split keyed on the feature-vector hash so duplicate groups land
+wholly in one split. That is a correctness improvement for the methodology,
+not a correction to these numbers.
+
+### Detection coverage for the excluded classes — one real gap
+
+The exclusion policy is justified by "Isolation Forest and behaviour
+analysis catch these instead". That was an assumption. Measured, running the
+shipped Isolation Forest (v0.2.0) over every real flow of each class:
+
+| class | flows | flagged anomalous | verdict |
+|---|---:|---:|---|
+| BENIGN (false-positive baseline) | 2,272,982 | **9.93%** | the bar to beat |
+| All attacks (baseline) | 557,646 | 45.35% | |
+| **Heartbleed** | 11 | **100.00%** | strongly covered |
+| **Infiltration** | 36 | **86.11%** | strongly covered |
+| **Web Attack - Sql Injection** | 21 | **0.00%** | **no coverage at all** |
+
+Heartbleed and Infiltration are caught far above both baselines, so for
+those two the safety story is substantiated with numbers rather than
+assumed.
+
+**Web Attack - Sql Injection has no detection coverage anywhere in the
+pipeline.** Not from LightGBM (excluded from training by policy, 0% by
+construction), and not from the Isolation Forest, which flags **0 of 21** —
+below even the 9.93% benign false-positive rate.
+
+**Behaviour analysis does not close this gap either.** All eight
+deterministic signals are volume, rate or diversity measures over a source
+IP's history: `REPEATED_CONNECTIONS` (>=20 to one destination),
+`HIGH_FREQUENCY` (>=2/s), `BURST` (>=10 in 5s), `PERSISTENCE`,
+`DESTINATION_DIVERSITY` (>=15 destinations), `SCANNING` (>=10 ports),
+`REPEATED_FAILURES` (>=10 unanswered), `TEMPORAL_PATTERN`. CICIDS2017's SQL
+injection is 21 protocol-valid HTTP requests to a single web server on a
+single port that receive real responses: it hits one destination (so not
+`DESTINATION_DIVERSITY`), one port (not `SCANNING`), and completes its TCP
+handshakes (not `REPEATED_FAILURES`). `PERSISTENCE` or
+`REPEATED_CONNECTIONS` might fire incidentally, but they would fire
+identically for a user making twenty requests to one site — nothing here is
+specific to SQL injection.
+
+**This is a genuine, currently-undetected coverage gap, recorded rather
+than solved.** Closing it needs payload/L7 inspection, which the
+flow-level feature schema deliberately does not do. It is *not* an argument
+against the exclusion policy: with 21 total examples the supervised
+classifier could not learn it reliably either, and v0.3.0 — which did train
+on its 15 rows — caught 2 of 3 test rows on a sample far too small to mean
+anything.
+
 ### The three weak classes — assessment and recommendation
 
 **Bot 45.42%, Web Attack - Brute Force 50.44%, Web Attack - XSS 11.22%.**

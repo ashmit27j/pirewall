@@ -1658,13 +1658,32 @@ Useful history for anyone retraining on similar hardware:
   is not deployable as the primary classifier. Assessed as close to the
   ceiling for a flow-level feature schema that carries no payload or HTTP
   semantics — see `docs/ML_PIPELINE.md` for the full reasoning and options.
-- **The three excluded classes are undetectable by the classifier by
-  construction** and depend entirely on Isolation Forest and behaviour
-  analysis, neither of which has been validated against them specifically.
-- **17.71% of test rows are exact duplicates of a training row.** Absolute
-  figures carry some memorisation; PortScan (55.6% leaked) and SSH-Patator
-  (49.7%) are worst affected, DDoS (0.01%) and Bot (2.03%) essentially
-  clean. Ablation results are reported with a leak-free column throughout.
+- **Excluded-class coverage: verified, and one real gap found.** The
+  "Isolation Forest catches these instead" story was an assumption; it is
+  now measured against every real flow of each class (benign
+  false-positive baseline 9.93%):
+  **Heartbleed 100.00% flagged (11/11)** and **Infiltration 86.11%
+  (31/36)** — both far above baseline, so the safety net genuinely holds
+  for those two. **Web Attack - Sql Injection: 0.00% (0 of 21)** — below
+  even the benign false-positive rate. Combined with 0% from LightGBM
+  (excluded by policy), **SQL Injection has no detection coverage anywhere
+  in the pipeline.** Behaviour analysis does not close it: all eight
+  signals are volume/rate/diversity measures, and 21 protocol-valid HTTP
+  requests to one port on one host trip none of them specifically. Closing
+  this needs payload/L7 inspection, which the flow-level schema
+  deliberately excludes. Documented as a known gap, not solved here.
+- **Train/test leakage: audited and resolved — it does NOT inflate the
+  results.** 17.68% of test rows have a bit-identical twin in the v0.4.0
+  training split (41,959 of 123,458 duplicate groups straddle the split;
+  the other 81,499 are over-representation within one split). Re-evaluating
+  the shipped artifact on only the 349,516 rows with no training twin moves
+  macro-F1 by **-0.00035** (0.854589 -> 0.854239), while accuracy,
+  precision and false-positive rate all *improve*. The two most-duplicated
+  classes hold up specifically: PortScan 99.99% -> **99.97%** on 10,699
+  clean rows, SSH-Patator 98.87% -> **99.58%** on 480. v0.4.0's numbers
+  stand as reported, no version bump. Future retrains should use a
+  group-aware split keyed on the feature-vector hash — a methodology
+  improvement, not a correction.
 - **Isolation Forest is unchanged** (v0.2.0, precision 0.5300, recall
   0.4537). It was not retrained this pass; the divergence bug is specific
   to gradient boosting and does not apply to it.
@@ -1675,3 +1694,42 @@ Useful history for anyone retraining on similar hardware:
 - **Everything is one 2017 dataset.** No number here measures performance
   on this project's real traffic; that remains the spec §34 attack-lab
   exercise and is still Environment-dependent.
+
+
+## Leakage audit and excluded-class coverage (2026-08-30, post-v0.4.0)
+
+Three follow-ups resolved without changing the shipped artifact.
+
+**1. Leakage is real but harmless.** Duplicate == bit-identical across all
+29 canonical features (exact float64, no rounding, so near-duplicates are
+not detected and these are lower bounds). 41,959 of 123,458 duplicate
+groups span train and test; 17.68% of test rows have a training twin.
+Re-evaluating the shipped v0.4.0 on the 349,516 leakage-free rows changes
+macro-F1 by -0.00035. PortScan (55.12% leaked) still scores 99.97% and
+SSH-Patator (45.76% leaked) scores 99.58% on their clean subsets — higher
+than on the full split. **v0.4.0 stands; no version bump.** Full detail and
+the leakage-free per-class table in `docs/ML_PIPELINE.md` and
+`reports/v040_leakfree.txt`.
+
+**2. Excluded-class coverage is 2-of-3, not 3-of-3.** Heartbleed 100.00%
+and Infiltration 86.11% flagged by the Isolation Forest against a 9.93%
+benign baseline; **Web Attack - Sql Injection 0.00% (0/21)**. That class has
+no coverage from any detector in the pipeline. Recorded as a limitation.
+
+**3. What the "divergence bug" was, since it was referenced without
+explanation.** In `lightgbm_trainer.py`, `lambda_l2` was never set and took
+LightGBM's default of 0.0. A boosted leaf's value is
+`-sum(grad) / (sum(hess) + lambda_l2)`; under the multiclass softmax the
+hessian `p*(1-p)` vanishes as the model gains confidence, so with no L2 term
+the denominator collapses and the only remaining bound is
+`min_sum_hessian_in_leaf` (1e-3) — about 10^3 per tree, and ~10^6 after 100
+rounds, which is what was measured. Boosting diverged instead of
+converging. **It cannot apply to the Isolation Forest**: that trainer calls
+sklearn's `IsolationForest` — an unsupervised ensemble of independent
+random isolation trees with no gradient, no hessian, no leaf output value
+and no additive accumulation across estimators (a score is just path
+length). `grep` for `lambda|gradient|hessian|boost|leaf` in
+`isolation_forest_trainer.py` returns nothing. Its one untuned knob is
+`contamination`, chosen by a 5-candidate validation sweep — coarse tuning,
+not a divergence failure mode. Original explanation: commit `3ea9f87` and
+`docs/ML_DATA_AUDIT.md` §F.

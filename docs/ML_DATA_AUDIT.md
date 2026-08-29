@@ -1,13 +1,18 @@
 # pirewall — ML Data & Artifact Audit
 
-Status of this document: **partial.** It records what was independently
-verified on 2026-08-29 by running real commands against the real artifacts
-in `pirewall/ml/artifacts/`. Every number below was produced by a command
-that was actually run, not recalled from a prior session's transcript.
+Every number in this document was produced by a command that was actually
+run against the real artifacts in `pirewall/ml/artifacts/` and the real
+CICIDS2017 CSVs in `data/`. Nothing here is recalled from a prior
+session's transcript.
 
-**The dataset-derived half of the audit is BLOCKED** — see
-"§B. Blocked: dataset absent". Nothing in this file depends on the dataset;
-nothing that does is claimed.
+Two findings in §A were **corrected** after the dataset arrived and the
+claims could be tested directly rather than inferred from reading the
+code — A2 (overstated) and A3 (wrong root cause). Both corrections are
+written in place rather than quietly edited out, because the earlier
+versions were committed and reported.
+
+Scope: §A artifact findings, §B section-1 reproduction, §C class
+distribution and the rare-class exclusion policy, §D what remains blocked.
 
 Linked from `docs/ML_PIPELINE.md`.
 
@@ -49,35 +54,52 @@ Fixed by indexing the row first. Regression test
 `test_classify_multiclass_decodes_every_class` builds a 3-class fixture and
 was confirmed to fail against the old code and pass against the new.
 
-### A2. `parse_float` does **not** reject NaN/Infinity (open)
+### A2. `parse_float` accepts NaN/Infinity — a latent defect this dataset does not trigger
 
 `pirewall/ml/preprocessing/common.py:71-81` documents its contract as
 preventing "one bad row silently corrupt[ing] the training set with a
-NaN/garbage feature". It does not do this. Measured behaviour:
+NaN/garbage feature". It does not do that. Measured:
 
 | input | result |
 |---|---|
-| `'NaN'` | **accepted** as `nan` |
-| `'nan'` | **accepted** as `nan` |
-| `'Infinity'` | **accepted** as `inf` |
-| `'inf'` / `'-inf'` | **accepted** as `inf` / `-inf` |
+| `'NaN'` / `'nan'` | **accepted** as `nan` |
+| `'Infinity'` / `'inf'` / `'-inf'` | **accepted** as `inf` / `-inf` |
 | `'1e400'` | **accepted** as `inf` (overflow) |
-| `''` / `'  '` | `ValueError` (the only rejected cases) |
+| `''` / `'  '` | `ValueError` — the only rejected cases |
 
-Only missing/empty values are skipped-and-counted. CICFlowMeter is
-specifically known to emit literal `NaN` and `Infinity` in rate-based
-columns (`Flow Bytes/s`, `Flow Packets/s`) on zero-duration flows, so
-these are the exact strings this dataset produces — and they flow straight
-into `Flow` objects, feature extraction, and the training matrix.
+CICFlowMeter does emit those literals, and this copy of CICIDS2017 contains
+them: **2,867 rows across all 8 files** carry `Infinity` or `NaN`.
 
-This is currently **whatever happened to be there, not a deliberate
-choice** — which is precisely what this audit was asked to determine. It
-needs an explicit decision (reject-and-count vs. impute) once the dataset
-is available to quantify how many rows are affected. **Not changed in this
-pass**, because choosing between rejecting and imputing without being able
-to measure the affected row count would be guessing.
+**But none of them reach the model.** Verified two ways:
 
-### A3. Attack-class labels are corrupted by mojibake in the shipped artifact (open)
+1. Every occurrence is in CSV columns 15 and 16 — `Flow Bytes/s` and
+   `Flow Packets/s`. Those two columns are **not** in the adapter's
+   `_REQUIRED_COLUMNS` and are never read. pirewall derives
+   `bytes_per_second` / `packets_per_second` itself from byte/packet counts
+   and duration, with an explicit zero-duration guard.
+2. The full 2,830,628-row feature matrix built through the real extractor
+   contains **zero** non-finite values — 0 NaN, 0 +Inf, 0 -Inf, across all
+   29 features. `rows_with_any_nonfinite: 0`.
+
+So the correct characterisation is: **a real latent defect in `parse_float`
+that this dataset happens not to exercise**, because the only NaN-bearing
+columns are exactly the ones pirewall recomputes rather than ingests. It
+would bite a future adapter or dataset that did read a rate column
+directly.
+
+**Not changed in this pass.** Tightening `parse_float` to reject
+non-finite values is a one-line change, but it alters the documented
+skip-and-count contract for every adapter, and with a measured zero
+impact on the current training set it belongs in its own reviewed change
+rather than bundled into a model-quality pass.
+
+**Separately — 115 rows were skipped**, every one of them for
+`last_seen must not precede first_seen`: CICIDS2017 contains rows with a
+**negative `Flow Duration`**. All 115 were BENIGN (raw BENIGN 2,273,097 vs
+2,272,982 after the adapter). The adapter rejects them correctly and counts
+them, which is the intended spec §13 behaviour.
+
+### A3. Attack-class labels carry U+FFFD — corruption is in the published dataset, not in pirewall
 
 The delivered model's `class_mapping` contains:
 
@@ -87,35 +109,40 @@ The delivered model's `class_mapping` contains:
 'Web Attack \ufffd XSS'
 ```
 
-Root cause, reproduced exactly: CICIDS2017's Thursday web-attack labels
-contain byte `0x96` — an en dash in cp1252. `cicids_adapter.py:125` opens
-the CSVs with `encoding="utf-8", errors="replace"`, which turns `0x96`
-into U+FFFD (`\ufffd`). Verified:
+**Correction to an earlier version of this document.** It first recorded
+the cause as pirewall reading a cp1252 en dash (`0x96`) as UTF-8 with
+`errors="replace"` at `cicids_adapter.py:125`. That mechanism produces an
+identical string, so it looked right — but it is **not** what happened
+here. Checking the actual bytes of the source CSV:
 
 ```
-b'Web Attack \x96 Brute Force'.decode('utf-8', errors='replace')
-    == 'Web Attack \ufffd Brute Force'   -> True  (matches the artifact exactly)
-b'Web Attack \x96 Brute Force'.decode('cp1252')
-    == 'Web Attack – Brute Force'        (the correct label)
+,Web Attack \xef\xbf\xbd Brute Force
 ```
 
-Two consequences:
+`EF BF BD` is the UTF-8 encoding of U+FFFD. **The replacement character is
+already in the published dataset file**; `0x96` does not appear at all.
+pirewall's `errors="replace"` is a no-op on these rows — it reads
+faithfully what the file contains. The corruption happened upstream, when
+the dataset was produced or converted.
 
-1. **This is the recurring "Windows console encoding crash" root cause.**
-   U+FFFD is not encodable in cp1252, so printing these labels to a
-   Windows console raises `UnicodeEncodeError`. Fixing the *read* encoding
-   fixes the crash at its source; writing reports as UTF-8 only treats the
-   symptom.
-2. It does **not** split one class into several — the substitution is
-   deterministic, so all rows of a given class still collapse to one
-   consistent (if corrupted) string. Class counts are therefore unaffected.
-   The damage is cosmetic-but-real: corrupted class names are baked into a
-   shipped artifact and every report derived from it.
+Two consequences, both different from what the earlier version said:
 
-Recommended fix: read the CICIDS2017 CSVs as `cp1252` (or `latin-1`), which
-is what the files actually are. **Not changed in this pass** — it changes
-the class-mapping keys of any future artifact, so it belongs with the
-retrain, not ahead of it.
+1. **Re-reading as cp1252 would make it strictly worse**, decoding those
+   three bytes to `ï¿½`. That earlier recommendation is withdrawn.
+2. The right fix is a **label-normalisation step** mapping the corrupted
+   string to a canonical name (e.g. `Web Attack - Brute Force`), not an
+   encoding change.
+
+It still does **not** split one class into several: the corrupted bytes are
+identical on every row, so each class collapses to one consistent key.
+Verified against real counts — exactly 3 distinct `Web Attack` strings,
+1,507 / 652 / 21 rows.
+
+It remains true that U+FFFD is unencodable in cp1252 and so raises
+`UnicodeEncodeError` when printed to a Windows console. Since the source
+text cannot be fixed by changing how it is read, writing reports as
+explicit UTF-8 (`pirewall.ml.training.report.write_report`) is the actual
+remedy, not a workaround.
 
 ### A4. Label-leakage check: `destination_port` does **not** dominate this model
 
@@ -202,48 +229,154 @@ session.
 
 ---
 
-## §B. Blocked: dataset absent
+## §B. Reproducing the delivered artifact (section 1)
 
-Every remaining item of the requested audit — exact per-class counts across
-the 8 CICIDS2017 files, NaN/Infinity row counts, exact/near-duplicate flow
-detection, train/test leakage from duplicates, the `destination_port`
-ablation, label-string consistency across days, and the UNSW-NB15
-distribution audit — requires the raw datasets. **They are not present on
-this machine.** Verified:
+The dataset was not on this machine when the audit began; it was provided
+mid-session at `./data` (the 8 "MachineLearningCVE" CSVs, ~884 MB). Every
+number below is computed from it.
 
-- No `data/` or `datasets/` directory in the repo (both are gitignored).
-- A full `find` over `/Users/MyLogin` returned **zero** CICIDS2017 or
-  UNSW-NB15 CSVs. The only `.csv` files present are scikit-learn/numpy test
-  fixtures inside `.venv`.
-- `/Volumes` holds no mounted dataset media.
+**Load result** — via the real adapter and the canonical extractor
+(`load_cicids2017` -> `Flow` -> `pirewall.features.extractor`):
 
-The prior training runs were performed on a different machine — the task
-description references `D:\CodingProjects_D\pirewall`, a Windows path. This
-repo is the macOS checkout at
-`/Users/MyLogin/Desktop/CodingProjects/pirewall`. The model artifacts are
-present here (they were copied or synced), but the data they were trained
-on is not.
+| | |
+|---|---|
+| rows loaded | **2,830,628** |
+| rows skipped | 115 |
+| skip reason | **every one** `last_seen must not precede first_seen` |
+| non-finite feature values | **0** (0 NaN, 0 +Inf, 0 -Inf across all 29 features) |
 
-Consequently the prior session's headline result (**macro-F1 0.1975** and
-its per-class recall table) **could not be reproduced or re-derived this
-session.** Per this project's honesty rules it is recorded here as
-*unverified-this-session*, carried forward from
-`pirewall/ml/artifacts/lightgbm_model.txt.metadata.json` and
-`docs/PROGRESS.md` rather than confirmed.
+The 115 skips are CICIDS2017 rows with a **negative `Flow Duration`**, all
+of them BENIGN (raw BENIGN 2,273,097 vs 2,272,982 after the adapter). The
+adapter rejects and counts them, which is the intended §13 behaviour.
 
-### One prior claim that *was* checkable, and is already recorded
+### B1. The recorded metrics reproduce exactly — once the file order is right
 
-The Isolation Forest's real detection metrics were reported as missing
-("the prior session's report was LightGBM-only"). They are in fact already
-present in `isolation_forest_model.joblib.metadata.json`, from a real run:
+The prior session's `accuracy 0.8899468905663044` / `macro_f1
+0.19745193396965163` did **not** reproduce on a first attempt (glob file
+order gave 0.8898833005570014 / 0.1972942200360728 — off by 6.4e-5 and
+1.6e-4).
 
-```
-precision            0.5299949729095682
-recall               0.45373469778117825
-false_positive_rate  0.09871915576321247
-false_negative_rate  0.5462653022188217
-```
+The cause is that `split_train_val_test` shuffles a global index list, so
+the split is a deterministic function of **the order the 8 CSVs were
+concatenated**. Testing candidate orderings by permuting cached blocks:
 
-These are the saved v0.2.0 test-split metrics (contamination 0.10, chosen
-by a validation sweep). They are read from the artifact, not recomputed —
-recomputation needs the dataset.
+| file order | accuracy | macro-F1 | |
+|---|---|---|---|
+| sorted (glob) | 0.8898833005570014 | 0.1972942200360728 | |
+| chronological | 0.8900128357611371 | 0.1974704335059114 | |
+| **chronological, PortScan before DDos** | **0.8899468905663044** | **0.1974519339696516** | **exact match** |
+| reverse sorted | 0.8901588572639809 | 0.1978076251452134 | |
+| chronological reversed | 0.8903072339523546 | 0.1976074246910626 | |
+
+Both metrics match to full float precision on exactly one ordering:
+Monday, Tuesday, Wednesday, Thursday-WebAttacks,
+Thursday-Infilteration, Friday-Morning, **Friday-PortScan,
+Friday-DDos**. Section 1 is therefore reproduced, and every evaluation in
+this session uses that ordering (`canonical_order.py`).
+
+**Process gap worth fixing:** nothing in the repo recorded which order was
+used, so this took a five-way search to recover. `ModelMetadata` should
+carry a dataset fingerprint — row count plus an ordered list of source
+files, or a hash of the label sequence — so a future session can confirm
+it is on the same split instead of inferring it.
+
+### B2. The real per-class table for the delivered artifact
+
+Reproduced on the verified split. **This supersedes the per-class figures
+quoted in the task prompt**, which do not match: the prompt cites DDoS
+81.34% and "three classes at 0%", against a measured DDoS 43.05% and
+**nine** classes at 0.00%. Since accuracy and macro-F1 both match to 16
+significant digits, the table below is the artifact's ground truth. (The
+prompt's DoS Hulk 86.34% / PortScan 74.31% / SSH-Patator 0.11% are close
+to but not equal to the measured 85.51% / 73.95% / 0.00%, so those figures
+appear to come from a different run.) `PROGRESS.md`'s own limitations list
+— which names eight classes with "zero or near-zero correct predictions" —
+agrees with the measurement, not with the prompt.
+
+| class | test n | caught | recall | precision | F1 |
+|---|---:|---:|---:|---:|---:|
+| BENIGN | 340,947 | 322,329 | 94.54% | 94.41% | 0.9447 |
+| DoS Hulk | 34,661 | 29,638 | 85.51% | 67.12% | 0.7520 |
+| PortScan | 23,840 | 17,629 | 73.95% | 73.57% | 0.7376 |
+| DDoS | 19,204 | 8,267 | 43.05% | 66.62% | 0.5230 |
+| FTP-Patator | 1,191 | 4 | 0.34% | 0.63% | 0.0044 |
+| Bot | 295 | 0 | 0.00% | 0.00% | 0.0000 |
+| DoS GoldenEye | 1,544 | 0 | 0.00% | 0.00% | 0.0000 |
+| DoS Slowhttptest | 825 | 0 | 0.00% | 0.00% | 0.0000 |
+| DoS slowloris | 869 | 0 | 0.00% | 0.00% | 0.0000 |
+| SSH-Patator | 885 | 0 | 0.00% | 0.00% | 0.0000 |
+| Web Attack – Brute Force | 226 | 0 | 0.00% | 0.00% | 0.0000 |
+| Web Attack – XSS | 98 | 0 | 0.00% | 0.00% | 0.0000 |
+| Web Attack – Sql Injection | 3 | 0 | 0.00% | 0.00% | 0.0000 |
+| Infiltration | 5 | 0 | 0.00% | 0.00% | 0.0000 |
+| Heartbleed | 2 | 0 | 0.00% | 0.00% | 0.0000 |
+
+Binary (any-attack vs BENIGN): precision 0.776178, recall 0.771853,
+F1 0.774009, FPR 0.054607, FNR 0.228147 (tp 64,564 / fp 18,618 /
+fn 19,084 / tn 322,329).
+
+### B3. Isolation Forest — metrics already existed
+
+The task recorded these as missing ("the prior session's report was
+LightGBM-only"). They are in fact already in
+`isolation_forest_model.joblib.metadata.json` from a real run:
+precision 0.529995, recall 0.453735, FPR 0.098719, FNR 0.546265
+(contamination 0.10, chosen by a validation sweep).
+
+---
+
+## §C. Class distribution and the rare-class exclusion policy (sections 2-3)
+
+Real totals, train+val+test combined, all 8 files, 2,830,628 rows:
+
+| class | count | share |
+|---|---:|---:|
+| BENIGN | 2,272,982 | 80.2996% |
+| DoS Hulk | 231,073 | 8.1633% |
+| PortScan | 158,930 | 5.6147% |
+| DDoS | 128,027 | 4.5229% |
+| DoS GoldenEye | 10,293 | 0.3636% |
+| FTP-Patator | 7,938 | 0.2804% |
+| SSH-Patator | 5,897 | 0.2083% |
+| DoS slowloris | 5,796 | 0.2048% |
+| DoS Slowhttptest | 5,499 | 0.1943% |
+| Bot | 1,966 | 0.0695% |
+| Web Attack – Brute Force | 1,507 | 0.0532% |
+| Web Attack – XSS | 652 | 0.0230% |
+| **Infiltration** | **36** | 0.0013% |
+| **Web Attack – Sql Injection** | **21** | 0.0007% |
+| **Heartbleed** | **11** | 0.0004% |
+
+Imbalance ratio BENIGN:Heartbleed is **206,635 : 1**.
+
+**Threshold: `MIN_SUPERVISED_TRAINING_EXAMPLES = 100`**, in
+`pirewall.ml.labels`. It is read off the distribution, not assumed: the
+counts jump from 36 to 652, an **18x gap**, and any cutoff inside that gap
+selects exactly the same three classes — so the choice is robust rather
+than knife-edge. 100 is also where the 70/15/15 split stops resolving:
+below it a class lands single-digit rows in test (Heartbleed gets 2,
+Web Attack – Sql Injection 3, Infiltration 5), and a recall figure over 2
+rows carries no information.
+
+**Excluded (3):** Heartbleed (11), Web Attack – Sql Injection (21),
+Infiltration (36).
+
+**Deliberately kept (per the task's expectation, and the counts agree):**
+Bot (1,966), Web Attack – Brute Force (1,507), Web Attack – XSS (652).
+These are two to three orders of magnitude above the excluded three; their
+0.00% recall in the delivered artifact is an imbalance-handling failure,
+not data scarcity, which is what section 4 tests.
+
+Enforced by `is_excluded_from_supervised_training` — the single shared
+function both training and evaluation call. `normalize_label` collapses
+punctuation and case so an encoding difference (U+FFFD vs hyphen vs en
+dash) cannot silently re-admit an excluded class.
+
+## §D. Still blocked
+
+**UNSW-NB15 is not present** — `data/` holds only the 8 CICIDS2017 files,
+and a full filesystem search found no `UNSW_NB15_*.csv`. Its class
+distribution could not be audited. UNSW-NB15 is documented as having a far
+milder imbalance than CICIDS2017 (its published train/test partitions are
+deliberately rebalanced), but that is a literature claim, not a
+measurement from this machine, and is recorded here as such.

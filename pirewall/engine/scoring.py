@@ -2,9 +2,30 @@
 
 Every weight/threshold used here comes from `config.threat`
 (`pirewall.config.models.ThreatConfig`) — no magic constants inline
-(CLAUDE.md). The formula is deliberately simple and explainable rather
-than empirically tuned: it hasn't been validated against real attack
-traffic (see `docs/PROGRESS.md` — that's Environment-dependent, spec §34).
+(CLAUDE.md). The formula stays deliberately simple and explainable
+(spec §18); what changed as of model v0.4.0 is that the **weights** are now
+set from measured per-detector reliability rather than an even split:
+
+    known-attack (LightGBM)     precision 0.9927, FPR 0.0018  -> weight 60
+    anomaly (Isolation Forest)  precision 0.5300, FPR 0.0987  -> weight 15
+    behavior (deterministic)    no labelled ground truth      -> weight 25
+
+The anomaly detector is correct roughly half the times it fires, at ~55x
+the classifier's false-positive rate; at 15 it cannot reach
+`low_threshold` (25) alone, only contribute in combination. See
+`docs/ML_PIPELINE.md` for where those numbers come from.
+
+**Deliberately not done: per-class weighting.** Per-class precision on this
+dataset ranges from 0.357 (Web Attack - XSS) to 0.9997 (DDoS), so scaling
+the known-attack contribution by the predicted class's precision is
+tempting. It is rejected because it would bake dataset-specific constants
+into the engine, go stale silently on the next retrain, and make a score
+impossible to explain without a lookup table — all three against spec §18.
+Per-class precision is recorded in the model metadata for anything that
+wants it.
+
+Still Environment-dependent: none of this is validated against *live*
+traffic on the Pi (spec §34).
 
 Formula, per evidence type, each contributing independently up to its
 configured weight:

@@ -44,14 +44,14 @@ def test_strong_known_attack_evidence_produces_high_or_critical_level() -> None:
         None,
         NOW,
     )
-    assert assessment.threat_score == 50.0
-    assert assessment.threat_level is ThreatLevel.MEDIUM  # 50.0 == medium_threshold
+    assert assessment.threat_score == 60.0
+    assert assessment.threat_level is ThreatLevel.MEDIUM  # 60.0 is >= medium, < high
     assert "DDoS" in assessment.explanation
     assert "known_evidence:DDoS" in assessment.contributing_evidence
 
 
 def test_threat_level_thresholds_are_respected() -> None:
-    # known_attack_weight=50 * confidence=1.0 -> score 50.0 -> exactly medium_threshold
+    # known_attack_weight=60 * confidence=1.0 -> score 60.0 -> medium band
     at_medium = assess_threat(
         CONFIG, "f", IPv4Address("10.0.0.5"), IPv4Address("10.0.0.10"), _known("A", 1.0), None, None, NOW
     )

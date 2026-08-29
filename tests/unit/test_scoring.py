@@ -9,7 +9,7 @@ from pirewall.core.models.evidence import AnomalyEvidence, KnownEvidence
 from pirewall.engine.scoring import score_evidence
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
-CONFIG = ThreatConfig()  # known_attack_weight=50, anomaly_weight=25, behavior_weight=25
+CONFIG = ThreatConfig()  # known_attack_weight=60, anomaly_weight=15, behavior_weight=25
 
 
 def _known(predicted_class: str, confidence: float) -> KnownEvidence:
@@ -61,20 +61,59 @@ def test_benign_known_evidence_contributes_nothing() -> None:
 
 def test_weak_known_attack_evidence() -> None:
     breakdown = score_evidence(CONFIG, _known("PortScan", confidence=0.4), None, None)
-    assert breakdown.known_attack_contribution == 50.0 * 0.4
-    assert breakdown.total == 20.0
+    assert breakdown.known_attack_contribution == 60.0 * 0.4
+    assert breakdown.total == 24.0
 
 
 def test_strong_known_attack_evidence() -> None:
     breakdown = score_evidence(CONFIG, _known("DDoS", confidence=1.0), None, None)
-    assert breakdown.known_attack_contribution == 50.0
-    assert breakdown.total == 50.0
+    assert breakdown.known_attack_contribution == 60.0
+    assert breakdown.total == 60.0
 
 
 def test_anomaly_only_contributes_full_flat_weight() -> None:
     breakdown = score_evidence(CONFIG, None, _anomaly(is_anomaly=True), None)
-    assert breakdown.anomaly_contribution == 25.0
-    assert breakdown.total == 25.0
+    assert breakdown.anomaly_contribution == 15.0
+    assert breakdown.total == 15.0
+
+
+# --- calibration properties (docs/ML_PIPELINE.md) -------------------------
+# These pin the *reasoning* behind the weights, not just their values, so a
+# future retune has to consciously restate the intent rather than quietly
+# drift past it.
+
+
+def test_anomaly_alone_cannot_reach_even_the_low_threshold() -> None:
+    """Isolation Forest precision is 0.5300 — right about half the time.
+
+    A detector that is a coin flip must not be able to raise a flow to an
+    actionable level unaided; it may only push a score over a line in
+    combination with other evidence.
+    """
+    breakdown = score_evidence(CONFIG, None, _anomaly(is_anomaly=True), None)
+    assert breakdown.total < CONFIG.low_threshold
+
+
+def test_confident_known_attack_alone_clears_medium_but_not_high() -> None:
+    """LightGBM binary precision is 0.9927 — the most reliable single signal.
+
+    It should be able to raise a flow on its own, but stop short of `high`
+    so that enforcement still wants corroboration.
+    """
+    breakdown = score_evidence(CONFIG, _known("DDoS", confidence=1.0), None, None)
+    assert breakdown.total >= CONFIG.medium_threshold
+    assert breakdown.total < CONFIG.high_threshold
+
+
+def test_known_attack_outweighs_anomaly_by_its_measured_reliability() -> None:
+    """The ordering is the point: 0.9927 precision must outrank 0.5300."""
+    assert CONFIG.known_attack_weight > CONFIG.behavior_weight > CONFIG.anomaly_weight
+
+
+def test_weights_still_sum_to_a_full_score() -> None:
+    """All three firing at maximum reaches exactly 100 — no dead range."""
+    total = CONFIG.known_attack_weight + CONFIG.anomaly_weight + CONFIG.behavior_weight
+    assert total == 100.0
 
 
 def test_non_anomalous_evidence_contributes_nothing() -> None:

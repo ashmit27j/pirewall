@@ -112,8 +112,23 @@ class ThreatConfig(PirewallModel):
     high_threshold: float = Field(default=75.0, ge=0.0, le=100.0)
     critical_threshold: float = Field(default=90.0, ge=0.0, le=100.0)
 
-    known_attack_weight: float = Field(default=50.0, ge=0.0, le=100.0)
-    anomaly_weight: float = Field(default=25.0, ge=0.0, le=100.0)
+    # Weights are data-informed as of model v0.4.0, no longer a flat guess.
+    # Measured on the held-out CICIDS2017 test split (docs/ML_PIPELINE.md):
+    #
+    #   known-attack (LightGBM)   precision 0.9927   FPR 0.0018
+    #   anomaly (IsolationForest) precision 0.5300   FPR 0.0987
+    #
+    # The anomaly detector is right about half the times it fires and has
+    # ~55x the classifier's false-positive rate, so it must not be able to
+    # raise a flow to an actionable level on its own: at 15 it cannot even
+    # reach `low_threshold` (25) unaided, only push a score over a line in
+    # combination. A confident known-attack detection alone reaches 60 —
+    # past `medium` (50) but short of `high` (75), so enforcement still
+    # wants corroboration. Behavior stays at 25: it is deterministic
+    # pattern matching with no labelled ground truth, so there is no
+    # measurement to justify moving it and inventing one would be worse.
+    known_attack_weight: float = Field(default=60.0, ge=0.0, le=100.0)
+    anomaly_weight: float = Field(default=15.0, ge=0.0, le=100.0)
     behavior_weight: float = Field(default=25.0, ge=0.0, le=100.0)
 
     @model_validator(mode="after")

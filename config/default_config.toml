@@ -72,11 +72,20 @@ high_threshold = 75.0
 critical_threshold = 90.0
 
 # Maximum 0-100 contribution each evidence type can add to the overall
-# threat score (pirewall.engine.scoring). Documented default split:
-# known-attack evidence is weighted highest since it comes from a
-# supervised classifier trained on labeled attacks.
-known_attack_weight = 50.0
-anomaly_weight = 25.0
+# threat score (pirewall.engine.scoring). Data-informed as of model
+# v0.4.0, measured on the held-out CICIDS2017 test split:
+#
+#   known-attack (LightGBM)    precision 0.9927, false-positive rate 0.0018
+#   anomaly (Isolation Forest) precision 0.5300, false-positive rate 0.0987
+#
+# The anomaly detector fires correctly about half the time and at ~55x the
+# classifier's false-positive rate, so at 15 it cannot reach low_threshold
+# (25) on its own — it can only contribute in combination. A confident
+# known-attack detection alone reaches 60: past medium (50), short of high
+# (75), so enforcement still requires corroboration. Behavior is unchanged
+# at 25 — deterministic, with no labelled ground truth to tune against.
+known_attack_weight = 60.0
+anomaly_weight = 15.0
 behavior_weight = 25.0
 
 [firewall]

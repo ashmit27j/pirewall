@@ -104,7 +104,16 @@ def _daemon(
 
 def test_daemon_starts_serves_rpc_and_stops_cleanly(socket_path: str) -> None:
     """The minimum bar for `systemctl start`: it comes up, answers, and goes down."""
-    daemon, _, _ = _daemon(socket_path, _one_completed_session())
+    # Point ML at paths that are guaranteed absent. Relying on the repo's
+    # artifacts dir being empty made this assert the state of the developer's
+    # working tree rather than the daemon's behaviour: model files are
+    # gitignored, so it held in CI but failed on any machine that had
+    # actually trained a model.
+    missing: dict[str, object] = {
+        "lightgbm_model_path": "/nonexistent/pirewall-test/lightgbm_model.txt",
+        "isolation_forest_model_path": "/nonexistent/pirewall-test/isolation_forest.joblib",
+    }
+    daemon, _, _ = _daemon(socket_path, _one_completed_session(), ml=missing)
     daemon.start()
     try:
         assert Path(socket_path).exists()
@@ -112,8 +121,8 @@ def test_daemon_starts_serves_rpc_and_stops_cleanly(socket_path: str) -> None:
         status = client.get_status()
         assert status.enforcement_mode is EnforcementMode.SHADOW  # A1 default
         assert status.uptime_seconds >= 0.0
-        # No trained artifacts are committed (they are gitignored), so the
-        # daemon must have started with ML degraded rather than refusing to.
+        # Artifacts are absent, so the daemon must have started with ML
+        # degraded rather than refusing to come up at all.
         assert status.lightgbm_loaded is False
         assert status.isolation_forest_loaded is False
     finally:

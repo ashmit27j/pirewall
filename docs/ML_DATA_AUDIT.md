@@ -12,7 +12,8 @@ written in place rather than quietly edited out, because the earlier
 versions were committed and reported.
 
 Scope: §A artifact findings, §B section-1 reproduction, §C class
-distribution and the rare-class exclusion policy, §D what remains blocked.
+distribution and the rare-class exclusion policy, §D duplicate flows and
+train/test leakage, §E what remains blocked.
 
 Linked from `docs/ML_PIPELINE.md`.
 
@@ -372,7 +373,61 @@ function both training and evaluation call. `normalize_label` collapses
 punctuation and case so an encoding difference (U+FFFD vs hyphen vs en
 dash) cannot silently re-admit an excluded class.
 
-## §D. Still blocked
+## §D. Duplicate flows and train/test leakage (section 2)
+
+Exact-duplicate detection over the full 29-feature rows of all 2,830,628
+flows:
+
+| | |
+|---|---|
+| unique feature rows | 2,402,181 (84.864%) |
+| **exact-duplicate rows** (beyond first occurrence) | **428,447 (15.136%)** |
+| distinct rows appearing more than once | 123,458 |
+| largest single duplicate group | **16,421 identical rows** |
+
+Per class, and — the part that actually matters — how much of each class's
+test split has an exact twin somewhere in **train**:
+
+| class | rows | unique | dup% | test n | leaked | **leak%** |
+|---|---:|---:|---:|---:|---:|---:|
+| BENIGN | 2,272,982 | 1,978,541 | 12.95% | 340,947 | 52,062 | 15.27% |
+| DoS Hulk | 231,073 | 171,997 | 25.57% | 34,661 | 8,968 | 25.87% |
+| PortScan | 158,930 | 90,819 | 42.86% | 23,840 | 13,257 | **55.61%** |
+| DDoS | 128,027 | 128,015 | 0.01% | 19,204 | 2 | 0.01% |
+| DoS GoldenEye | 10,293 | 10,281 | 0.12% | 1,544 | 3 | 0.19% |
+| FTP-Patator | 7,938 | 5,933 | 25.26% | 1,191 | 333 | 27.96% |
+| SSH-Patator | 5,897 | 3,155 | 46.50% | 885 | 440 | **49.72%** |
+| DoS slowloris | 5,796 | 5,382 | 7.14% | 869 | 65 | 7.48% |
+| DoS Slowhttptest | 5,499 | 5,227 | 4.95% | 825 | 58 | 7.03% |
+| Bot | 1,966 | 1,949 | 0.86% | 295 | 6 | 2.03% |
+| Web Attack – Brute Force | 1,507 | 1,427 | 5.31% | 226 | 14 | 6.19% |
+| Web Attack – XSS | 652 | 652 | 0.00% | 98 | 2 | 2.04% |
+| Infiltration | 36 | 36 | 0.00% | 5 | 0 | 0.00% |
+| Web Attack – Sql Injection | 21 | 20 | 4.76% | 3 | 2 | 66.67% |
+| Heartbleed | 11 | 11 | 0.00% | 2 | 0 | 0.00% |
+
+**Overall: 75,212 of 424,595 test rows (17.71%) are exact copies of a
+training row.** The project's split is random over rows, and CICIDS2017
+contains many identical flows, so this is structural — not a bug in
+`split_train_val_test`, which correctly assigns each *row* to exactly one
+split. Rows are disjoint; flow *content* is not.
+
+**Consequence, and its limits.** Any recall figure for PortScan (55.6%
+leaked), SSH-Patator (49.7%), FTP-Patator (28.0%) or DoS Hulk (25.9%) is
+inflated to an unknown degree by memorisation. This applies to **every
+number this project has reported to date, including the 0.1975 baseline**,
+not only to new results.
+
+It is equally important not to over-claim: **DDoS (0.01%), DoS GoldenEye
+(0.19%), Bot (2.03%) and Web Attack – XSS (2.04%) are essentially
+leak-free**, so a change in those classes' recall is real learning, not
+leakage. Leakage is a per-class caveat here, not a blanket invalidation.
+
+Every configuration in section 4 is therefore reported **twice** — on the
+full test split (comparable with prior sessions) and on the leak-free
+subset with every twinned row removed (the honest generalisation number).
+
+## §E. Still blocked
 
 **UNSW-NB15 is not present** — `data/` holds only the 8 CICIDS2017 files,
 and a full filesystem search found no `UNSW_NB15_*.csv`. Its class

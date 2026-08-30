@@ -1,0 +1,256 @@
+========================================================================
+pirewall — real-hardware performance benchmark, results
+Raspberry Pi 4 Model B Rev 1.5 (4 GB) · benchmark run 2026-08-30
+Generated 2026-08-31T00:33:24+05:30
+Full write-up, caveats and honesty labels: REPORT.md
+========================================================================
+
+### analyze.py — per-load-step throughput/latency and phase summaries
+
+[
+  {
+    "name": "01-100pps",
+    "observed_pps": 99.90729269286719,
+    "packet_path_ms": 0.2569951241666667,
+    "e2e_ms": null,
+    "flows": 0,
+    "flows_per_s": 0.0
+  },
+  {
+    "name": "02-250pps",
+    "observed_pps": 249.79908139468677,
+    "packet_path_ms": 0.21929665383333335,
+    "e2e_ms": 36.777495,
+    "flows": 20,
+    "flows_per_s": 0.08326636046489559
+  },
+  {
+    "name": "03-400pps",
+    "observed_pps": 391.96443624816567,
+    "packet_path_ms": 0.11138489314516128,
+    "e2e_ms": 33.80176,
+    "flows": 20,
+    "flows_per_s": 0.0831843031086939
+  },
+  {
+    "name": "05-400pps-500-flows",
+    "observed_pps": 392.3406660349007,
+    "packet_path_ms": 0.12542567057450535,
+    "e2e_ms": 30.5476825,
+    "flows": 40,
+    "flows_per_s": 0.166501794508472
+  },
+  {
+    "name": "06-max-pps-2000-flows",
+    "observed_pps": 599.9451034157706,
+    "packet_path_ms": 0.11578448079629028,
+    "e2e_ms": 65.75459110320284,
+    "flows": 562,
+    "flows_per_s": 2.3370866098722742
+  },
+  {
+    "name": "04-max-pps",
+    "observed_pps": 704.359503766521,
+    "packet_path_ms": 0.09371674812973471,
+    "e2e_ms": 37.133115,
+    "flows": 20,
+    "flows_per_s": 0.0831784771897333
+  }
+]
+
+### runtime_idle.csv — 372 samples
+  packet_rate_pps          mean=     0.00 min=     0.00 max=     0.20 p95=     0.00
+  core_cpu_pct             mean=     0.30 min=     0.00 max=     1.40 p95=     0.80
+  core_rss_mb              mean=   147.81 min=   147.80 max=   147.83 p95=   147.83
+  api_rss_mb               mean=    56.80 min=    56.80 max=    56.80 p95=    56.80
+  host_cpu_pct             mean=    10.68 min=     8.45 max=    33.97 p95=    13.55
+  host_mem_used_pct        mean=    61.00 min=    60.64 max=    62.09 p95=    61.38
+  state_flow_records       mean=   227.00 min=   227.00 max=   227.00 p95=   227.00
+  flow_completion_rate_per_s mean=     0.00 min=     0.00 max=     0.00 p95=     0.00
+  rpc_poll_ms              mean=    28.51 min=     1.11 max=   165.24 p95=   105.36
+  packets_seen delta: 1
+  kernel drops total: 0 (summed per-tick, NOT differenced — the counter resets on read)
+
+### runtime_loaded.csv — 360 samples
+  packet_rate_pps          mean=   334.72 min=     0.00 max=  2224.36 p95=  2108.76
+  core_cpu_pct             mean=    15.56 min=     0.00 max=   111.40 p95=    99.60
+  core_rss_mb              mean=   152.06 min=   147.83 max=   168.78 p95=   168.78
+  api_rss_mb               mean=    56.80 min=    56.80 max=    56.80 p95=    56.80
+  host_cpu_pct             mean=    16.06 min=     3.79 max=    96.32 p95=    36.24
+  host_mem_used_pct        mean=    57.10 min=    36.61 max=    65.55 p95=    64.24
+  state_flow_records       mean=   316.18 min=   227.00 max=   500.00 p95=   500.00
+  flow_completion_rate_per_s mean=     2.58 min=     0.00 max=    29.07 p95=    28.47
+  rpc_poll_ms              mean=    55.17 min=     1.04 max=   726.86 p95=   219.89
+  packets_seen delta: 602502
+  kernel drops total: 5050 (summed per-tick, NOT differenced — the counter resets on read)
+    drop event at 23.75 min: 771 of 6253 packets in that tick (12.3 %)
+    drop event at 24.00 min: 4279 of 11122 packets in that tick (38.5 %)
+
+charts written to charts
+
+========================================================================
+### Per-stage pipeline latency (ms/operation), real Pi 4, real models
+    uncontended = flows finalized after the capture window closed
+    contended   = flows completed while load generator + daemon +
+                  observer were all running (right-hand columns)
+========================================================================
+stage                             n      mean       p50       p95       max   |      mean      p50      p95
+packet parse                 586125    0.0665    0.0408    0.1669   10.3425   | (per packet)
+flow aggregation             586125    0.0601    0.0421    0.1220  274.0817   | (per packet)
+feature extraction             4000     0.092     0.082     0.124     0.667   |     0.132    0.096    0.284
+LightGBM inference             4000     1.693     1.472     2.966     6.459   |     2.538    1.600    5.763
+Isolation Forest infer.        4000    30.695    29.780    38.898   105.320   |    56.934   36.484  122.737
+behavior analysis              4000     0.732     0.701     0.894     2.453   |     0.979    0.788    1.467
+threat assessment              4000     0.184     0.163     0.246     0.932   |     0.262    0.188    0.562
+decision                       4000     0.055     0.050     0.065     0.426   |     0.073    0.053    0.140
+candidate generation           4000     0.004     0.003     0.005     0.040   |     0.005    0.004    0.011
+END-TO-END pkt->decision       4000    33.454    32.422    42.059   113.403   |    60.922   39.382  130.422
+
+contended n = 662   uncontended n = 4000   total flows = 4662
+Isolation Forest = 91.8 % of end-to-end cost
+Flow-path ceiling = 29.9 decisions/s (1000 / 33.454 ms)
+
+NOTE: the 274 ms flow-aggregation maximum is 1 sample of 586,125 and is NOT
+an LRU eviction (the table peaked at 4,500 flows against max_flows=100,000).
+Left unattributed; plan against the p95 of 0.12 ms.
+
+========================================================================
+### Per-load-step, daemon-side (pirewall-core process)
+    drops are SUMMED over each fresh 15 s tick, never differenced:
+    getsockopt(PACKET_STATISTICS) zeroes tp_drops on every read, so
+    CaptureStatistics.packets_dropped is a per-interval value, not a
+    counter. Differencing it reports zero drops. See REPORT.md §4.
+========================================================================
+step                            pps   packets   drops   drop%  cpu mean%  cpu p95%  rss max MB
+00-no-load                      0.0         0       0    0.00        0.4       1.0      147.84
+01-100pps                      98.9     23259       0    0.00        4.2       5.2      147.86
+02-250pps                     251.0     59002       0    0.00        8.8       9.6      148.23
+03-400pps                     396.2     93146       0    0.00        6.4      12.0      148.60
+04-max-pps                    696.5    167165       0    0.00        8.7      10.2      149.05
+05-400pps-500-flows           410.5     96467       0    0.00        7.4      12.4      150.43
+06-max-pps-2000-flows         676.7    159046    5050    3.18       21.8      94.0      159.33
+07-drain                       25.2      4417       0    0.00       71.8     108.4      168.78
+
+total packets: 602502  total drops: 5050
+
+========================================================================
+### Detection-queue depth (systemd StatusText), changes only
+========================================================================
+  2026-08-30T21:15:37+05:30, queued_flows=488
+  2026-08-30T21:15:52+05:30, queued_flows=275
+  2026-08-30T21:16:08+05:30, queued_flows=0
+  2026-08-30T21:19:09+05:30, queued_flows=797
+  2026-08-30T21:19:24+05:30, queued_flows=367
+  2026-08-30T21:19:39+05:30, queued_flows=3084
+  2026-08-30T21:19:54+05:30, queued_flows=2648
+  2026-08-30T21:20:09+05:30, queued_flows=2221
+  2026-08-30T21:20:25+05:30, queued_flows=1782
+  2026-08-30T21:20:40+05:30, queued_flows=1342
+  2026-08-30T21:20:55+05:30, queued_flows=905
+  2026-08-30T21:21:10+05:30, queued_flows=467
+  2026-08-30T21:21:25+05:30, queued_flows=27
+
+  peak 3,084 flows, drained to 27 in 106 s = 28.8 flows/s
+  — independently corroborates the 30.7 ms/flow Isolation Forest cost.
+  No flows were dropped for backpressure; the queue absorbed the backlog.
+
+========================================================================
+### Rule-path latency (spec §40 'rule-deployment latency')
+    validation chain = real FirewallManager + FakeFirewallBackend
+    nft timings      = real nft binary, read-only commands only
+========================================================================
+{
+  "generated_at": "2026-08-30T15:55:03.993748+00:00",
+  "candidates": 200,
+  "rate_cap_batch_size": 20,
+  "validation_chain_fake_backend": {
+    "accepted": {
+      "count": 200,
+      "mean_ms": 0.21967691493046004,
+      "p50_ms": 0.18518299839342944,
+      "p95_ms": 0.37855099799344316,
+      "p99_ms": 0.6694000003335532,
+      "min_ms": 0.14420200022868812,
+      "max_ms": 1.4576119974663015,
+      "ops_per_second": 4552.139674378419
+    },
+    "rejected": {},
+    "rejection_reasons": {}
+  },
+  "real_nft_read_only": {
+    "list_chain_inet_pirewall_adaptive": {
+      "count": 50,
+      "mean_ms": 7.3814588003006065,
+      "p50_ms": 6.701769001665525,
+      "p95_ms": 10.497573002794525,
+      "p99_ms": 12.768786000378896,
+      "min_ms": 6.524251999508124,
+      "max_ms": 12.768786000378896,
+      "ops_per_second": 135.47457583306914
+    },
+    "list_tables_health_check": {
+      "count": 50,
+      "mean_ms": 9.884606859995984,
+      "p50_ms": 9.38791999942623,
+      "p95_ms": 12.254921999556245,
+      "p99_ms": 14.921516998583684,
+      "min_ms": 8.526468001946341,
+      "max_ms": 14.921516998583684,
+      "ops_per_second": 101.16740242316591
+    }
+  }
+}
+========================================================================
+### scripts/diagnostics/performance_smoke.py re-run on this Pi 4
+    Same script, same Fake backends, same freshly-trained placeholder
+    models as the dev-machine numbers in docs/PROGRESS.md Phase 9.
+========================================================================
+(deployed 1993/2000 rules with action=block)
+========================================================================
+pirewall performance smoke pass — Fake backends, this dev machine ONLY
+NOT representative of real Raspberry Pi 4 hardware (spec §40, §46).
+========================================================================
+stage                          count     mean (ms)         ops/sec
+packet capture+parse            4000        0.0892         11216.7
+flow aggregation                4000        0.1329          7527.1
+feature extraction              2000        0.0409         24431.1
+lightgbm inference              2000        0.3338          2995.9
+isolation-forest inference      2000       33.0409            30.3
+threat assessment               2000        0.0510         19597.7
+rule deployment                 2000       18.6751            53.5
+========================================================================
+
+  dev machine (x86_64 macOS) -> Raspberry Pi 4, same script:
+    packet capture+parse        0.032 ->  0.089 ms   (2.8x slower)
+    flow aggregation            0.041 ->  0.133 ms   (3.2x)
+    feature extraction          0.016 ->  0.041 ms   (2.6x)
+    LightGBM inference          0.089 ->  0.334 ms   (3.8x)
+    Isolation Forest inference 12.068 -> 33.041 ms   (2.7x)
+    threat assessment           0.022 ->  0.051 ms   (2.3x)
+    rule deployment (Fake)      5.064 -> 18.675 ms   (3.7x)
+
+  Real CICIDS2017 models vs placeholder, both on the Pi:
+    LightGBM inference          0.334 ->  1.693 ms   (5.1x, 12-class v0.4.0)
+    Isolation Forest inference 33.041 -> 30.695 ms   (0.93x — barely moved,
+      confirming the cost is scikit-learn per-call overhead, not tree count)
+
+========================================================================
+### What this run did NOT measure
+========================================================================
+  - Real traffic. wlan0 had no associated stations: empty station dump,
+    zero packets in 12 s of tcpdump, one packet in 31 min. Load was
+    generated from the Pi as broadcast UDP on wlan0.
+  - iperf3 between two LAN devices — there is no second device.
+  - Throughput in bits/second. 802.11 broadcast caps at ~700 pps /
+    ~0.8 Mbit/s regardless of sender count.
+  - Real end-to-end nftables deployment (would mutate the live ruleset).
+  - Detection accuracy. All 4,662 flows scored LOW -> ALLOW -> no
+    candidate rule. Zero adaptive rules were created. Spec §34 attack lab
+    remains outstanding.
+  - A headless baseline. A desktop session and the driving CLI were
+    running, so HOST cpu/memory are not a clean pirewall baseline; the
+    per-process pirewall-core figures are.
+
+========================================================================
+END — see REPORT.md for interpretation, caveats and honesty labels.
+========================================================================

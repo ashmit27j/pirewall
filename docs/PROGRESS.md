@@ -205,6 +205,111 @@ could rewrite `enforcement_mode` or `admin_pc_ip` over HTTP would make one
 stolen session equivalent to owning the firewall (spec §45). Configuration
 changes stay an out-of-band, SSH-and-restart operation.
 
+### Real-hardware performance benchmark session (spec §40) — 2026-08-30
+
+**The first measurements taken on the actual Raspberry Pi 4**, against the
+running `pirewall-core` service rather than Fake implementations. Full report,
+data and charts: **`benchmarks/2026-08-30/REPORT.md`**. Observation only — no
+runtime code changed, enforcement mode (`assisted`) and the nftables ruleset
+untouched, zero adaptive rules created during the run.
+
+Host: Raspberry Pi 4 Model B Rev 1.5, 4 GB, Raspberry Pi OS aarch64, Python
+3.12.14. Two phases: 31 min idle and 30 min under a generated-load ladder,
+both sampled every 5 s.
+
+**Tested** (real Pi 4, real `AF_PACKET` capture, real CICIDS2017 artifacts —
+LightGBM v0.4.0 + Isolation Forest v0.2.0):
+
+| measurement | idle | under load |
+|---|---|---|
+| packets seen by `pirewall-core` | 1 (in 31 min) | 602,502 |
+| `pirewall-core` CPU (of one core) | mean 0.30 %, max 1.40 % | mean 15.56 %, p95 99.60 %, max 111.40 % |
+| `pirewall-core` RSS | 147.80–147.83 MB (flat) | 147.83 → 168.78 MB |
+| kernel packet drops | 0 | 5,050 (0.84 % overall, concentrated in two 15 s ticks) |
+| flows completed / flow table peak | 0 / 0 | 4,662 / 4,500 open flows |
+| detection queue peak | 0 | 3,084 flows |
+
+Per-stage latency, uncontended mean (ms/operation): packet parse 0.067,
+flow aggregation 0.060, feature extraction 0.092, **LightGBM 1.693**,
+**Isolation Forest 30.695**, behavior analysis 0.732, threat assessment 0.184,
+decision 0.055, candidate generation 0.004, **end-to-end packet→decision
+33.454**. Under concurrent load the end-to-end mean is 60.9 ms (p95 130.4).
+
+**Isolation Forest is 92 % of end-to-end cost**, capping the flow path at
+**≈30 decisions/s**. Confirmed independently: the daemon drained a 3,084-flow
+backlog at 28.8 flows/s.
+
+**The predicted bottleneck is now observed, not predicted.** Once flows
+completed faster than Isolation Forest could score them, `pirewall-core`
+saturated a core and the kernel dropped **38.5 % of packets in one 15 s
+window**. The packet path itself is fine: 697 packets/s cost 8.7 % of a core
+with zero drops.
+
+**Dev-machine vs Pi gap, apples to apples** (`performance_smoke.py` re-run
+unmodified on the Pi, same Fake backends and placeholder models): the Pi 4 is a
+consistent **2.3–3.8× slower** across every stage — capture+parse 2.8×, flow
+aggregation 3.2×, feature extraction 2.6×, LightGBM 3.8×, Isolation Forest
+2.7×, threat assessment 2.3×, rule deployment 3.7×. Nothing fell off a cliff.
+
+This settles the long-standing open question: the earlier estimate of
+"10–20 flows/s on a Pi 4" for Isolation Forest was **pessimistic by ~1.6×** —
+the real figure is **30.3 flows/s** (placeholder) / **32.6 flows/s** (real
+model) — but the conclusion it drove (batch inference, or accept the ceiling
+in SHADOW/ASSISTED) stands, and is now backed by measured numbers. Swapping the
+placeholder model for the real one barely moved Isolation Forest (33.0 → 30.7
+ms), confirming the cost is scikit-learn's fixed per-call overhead rather than
+tree traversal.
+
+**Two observability defects found (reported, not fixed — this run was
+observation-only). Both are spec §41 items:**
+
+1. **`CaptureStatistics.packets_dropped` is not cumulative but is used as
+   one.** `AFPacketCapture._read_kernel_drops()` reads
+   `getsockopt(SOL_PACKET, PACKET_STATISTICS)`, and the kernel **zeroes
+   `tp_drops` on every read**. Each 15 s tick reports only drops since the
+   previous tick, and the value can decrease. `NetdataMetricsSnapshot.packet_drops`
+   therefore exports a per-interval delta under a name that reads as a lifetime
+   total; anything differencing it as a counter yields negative rates.
+   Fix: accumulate a running total in `AFPacketCapture`.
+2. **Live flow-table size is not observable.** `StatusResult.tracked_flow_count`
+   is `len(CoreStateStore.flows)` — the bounded *completed-flow* ring buffer
+   (capped at `api.history_size`), not the aggregator's table. During the run it
+   saturated at 500 while the real table held 4,500 flows. The live figure is
+   computed in `CoreDaemon._tick()` but only reaches the Netdata snapshot, which
+   on this deployment cannot be delivered. Fix: route it into `CoreStateStore`
+   so `get_status` can report it, and rename the field whose current meaning
+   contradicts its name.
+
+**Still Environment-dependent after this run:**
+
+- **Behaviour under genuine multi-host LAN traffic.** `wlan0` had **no
+  associated stations** — `iw dev wlan0 station dump` empty, 12 s of `tcpdump`
+  captured zero packets, and the daemon saw one packet in 31 minutes. Load had
+  to be generated from the Pi itself as broadcast UDP on `wlan0` (real frames
+  through the real capture path, but not multi-host traffic). iperf3 between two
+  LAN devices was impossible: there is no second device.
+- **Throughput as bits/second.** 802.11 broadcast caps at ~0.8 Mbit/s
+  (~700 packets/s) regardless of sender count. This run bounds per-packet and
+  per-flow CPU cost, not bandwidth.
+- **Real end-to-end nftables rule-deployment latency** — requires mutating the
+  live ruleset. Decomposed instead: validation chain + Fake deploy **0.220 ms**
+  (Mocked), real read-only `nft` round-trips **7.4–10 ms** (Tested). Deployment
+  is dominated by forking `nft`, not by validation.
+- **Detection accuracy** — unchanged by this run. Every flow was benign
+  broadcast (all 4,662 scored LOW → ALLOW → no candidate rule). The spec §34
+  attack lab is still outstanding.
+- **A headless baseline.** The Pi was running a desktop session and the CLI that
+  drove the benchmark, so *host-level* CPU/memory are not a clean pirewall
+  baseline; the per-process figures are.
+- **O(n) rule-deployment growth with `active_rules()`** — not re-measured;
+  reaching a large active-rule count through the real A3 rate cap takes longer
+  than one session.
+
+`ruff check .` clean and `pyright` (strict, per `pyproject.toml`) clean with the
+benchmark tooling added; `benchmarks/` is outside pyright's `include`.
+matplotlib was installed into a **separate throwaway virtualenv**, not
+pirewall's dependency set (`CLAUDE.md`).
+
 ### Wireless-deployment documentation session
 
 The operator's deployment target was confirmed as **all-wireless**: the
@@ -951,8 +1056,11 @@ reported under "Open questions for the human" instead of being improvised.
    (regression-guarded at a smaller scale by
    `tests/system/test_performance_smoke.py`, which asserts every stage
    still runs and reports positive throughput, not specific numbers).
-   **Environment-dependent** for real Pi 4 numbers — re-run this same
-   script on the target hardware.
+   ~~**Environment-dependent** for real Pi 4 numbers~~ — **done
+   2026-08-30**: this same script was re-run unmodified on the target Pi 4.
+   The Pi is 2.3–3.8× slower across every stage; Isolation Forest measured
+   33.0 ms/call (30.3 flows/s). See the "Real-hardware performance benchmark
+   session" above and `benchmarks/2026-08-30/`.
 4. **Documentation**: `docs/FEATURE_SCHEMA.md`, `docs/ML_PIPELINE.md`,
    `docs/FIREWALL.md`, `docs/API.md`, `docs/TESTING.md`,
    `docs/DEVELOPMENT_WORKFLOW.md` all new this phase; `docs/ARCHITECTURE.md`
@@ -1407,10 +1515,23 @@ dataset file locations, Admin PC IP, actual WAN/LAN interface names).
      behind delays observation but enforces nothing, and revisit before
      enabling ACTIVE.
   Whichever you choose, `pirewall.inference_latency_ms` is already
-  exported to Netdata (spec §33), so the real figure is observable on the
-  Pi rather than needing to be guessed. **A human must** re-run
-  `scripts/diagnostics/performance_smoke.py` on the actual Pi before
-  enabling enforcement — every number above is x86.
+  exported to Netdata (spec §33) — though note that on a deployment where
+  Netdata is unreachable, as it was during the benchmark, nothing observable
+  carries it.
+
+  **UPDATE 2026-08-30 — measured on the real Pi 4**, so the estimates above
+  are superseded (`benchmarks/2026-08-30/REPORT.md`): single-flow Isolation
+  Forest is **30.7 ms** with the real v0.2.0 artifact and **33.0 ms** with a
+  placeholder, i.e. **~30 flows/s**, not the 10–20 estimated here. Option 1
+  (fewer trees) is less attractive than it looked: swapping models barely
+  moved the number, confirming the cost is scikit-learn's per-call overhead,
+  not tree traversal. Option 2 (batching) is the only change that moves the
+  ceiling. The consequence of *not* choosing is now measured rather than
+  hypothetical: when flows completed faster than ~30/s, the detection queue
+  reached 3,084 flows, `pirewall-core` saturated a core, and the kernel
+  **dropped 38.5 % of packets in a 15 s window**. Option 3 (accept it in
+  SHADOW/ASSISTED) remains viable — falling behind delays observation and
+  loses packets, but enforces nothing incorrectly.
 
 - **Phase 9 — real-hardware verification still required (ADDENDUM.md A1,
   A4, A6), explicitly listed per this phase's own instructions:**

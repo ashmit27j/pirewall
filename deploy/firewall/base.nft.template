@@ -60,7 +60,8 @@ table inet pirewall_base {
 		# panel/API must not be reachable from the WAN or from other
 		# LAN clients, only from admin.admin_pc_ip).
 		ip saddr ${ADMIN_PC_IP} tcp dport { 22, ${API_PORT} } accept
-
+		ip saddr ${PROTECTED_NETWORK} udp dport { 53, 67 } accept
+		ip saddr ${PROTECTED_NETWORK} tcp dport 53 accept
 		# Diagnostic ICMP to the Pi itself.
 		ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } accept
 	}

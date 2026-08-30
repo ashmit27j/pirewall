@@ -1,0 +1,34 @@
+# --- 1. Confirm interfaces ---
+nmcli device status
+ip a
+# Confirm: wlan1 has upstream address, wlan0 shows 192.168.100.1, eth0 shows 192.168.101.1
+
+# --- 2. Confirm ML artifacts present + owned correctly ---
+ls -la /opt/pirewall/pirewall/ml/artifacts/
+sudo chown pirewall-core:pirewall-ipc /opt/pirewall/pirewall/ml/artifacts/*
+
+# --- 3. Confirm log directory exists + correctly owned ---
+sudo mkdir -p /var/log/pirewall
+sudo chown pirewall-core:pirewall-ipc /var/log/pirewall
+sudo chmod 2770 /var/log/pirewall
+
+# --- 4. Load firewall ruleset cleanly (never additive) ---
+cd /opt/pirewall
+sudo nft delete table inet pirewall_base 2>/dev/null
+sudo nft -c -f deploy/rendered/base.nft
+sudo nft -f deploy/rendered/base.nft
+sudo nft -f deploy/rendered/nat-masquerade.nft
+sudo nft list table inet pirewall_base | grep -c 8443   # must say 1
+
+# --- 5. Start core, confirm healthy before continuing ---
+sudo systemctl restart pirewall-core.service
+sudo systemctl status pirewall-core.service --no-pager
+sudo ls -la /run/pirewall/     # core.sock must exist, owned pirewall-core:pirewall-ipc
+
+# --- 6. Start api, confirm healthy ---
+sudo systemctl restart pirewall-api.service
+sudo systemctl status pirewall-api.service --no-pager
+sudo -u pirewall-api ls -la /run/pirewall/
+
+# --- 7. Verify reachability from Admin PC ---
+nc -zvn -w 5 192.168.101.1 8443

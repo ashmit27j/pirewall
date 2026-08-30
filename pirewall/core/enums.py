@@ -123,6 +123,11 @@ class BehaviorPatternType(StrEnum):
     REPEATED_FAILURES = "repeated_failures"
     TEMPORAL_PATTERN = "temporal_pattern"
     SCANNING = "scanning"
+    # ADDENDUM_2.md B2 — many concurrent long-lived, low-throughput
+    # connections from one source to one destination (slowloris-class). A
+    # source-level aggregate pattern, same category as SCANNING/BURST, not
+    # a per-flow classification of any single ambiguous connection.
+    SLOW_RATE_DOS = "slow_rate_dos"
 
 
 class ModelType(StrEnum):

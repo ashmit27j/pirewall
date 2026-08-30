@@ -60,6 +60,7 @@ class SourceBehaviorState:
         "last_seen",
         "ports",
         "recent_connection_times",
+        "slow_connection_counts",
     )
 
     def __init__(self, first_seen: datetime, max_destinations: int, max_ports: int, max_recent: int) -> None:
@@ -71,6 +72,10 @@ class SourceBehaviorState:
         self.connections_per_destination: dict[tuple[IPv4Address, int | None], int] = {}
         self.failure_count = 0
         self.recent_connection_times: deque[datetime] = deque(maxlen=max_recent)
+        # ADDENDUM_2.md B2 — most recent concurrent-slow-connection count
+        # per destination, a live snapshot (see `note_slow_connections`),
+        # capped the same way `connections_per_destination` is.
+        self.slow_connection_counts: dict[IPv4Address, int] = {}
         self._max_destinations = max_destinations
         self._max_ports = max_ports
 
@@ -118,9 +123,28 @@ class SourceBehaviorState:
         self.observe_new_connection(flow.destination_ip, flow.destination_port, flow.first_seen)
         self.observe_completion(flow)
 
+    def note_slow_connections(self, destination_ip: IPv4Address, count: int, timestamp: datetime) -> None:
+        """Record the current concurrent-slow-connection count to `destination_ip` (ADDENDUM_2.md B2).
+
+        Overwrites rather than accumulates: `count` is already a live
+        snapshot of how many qualifying connections are open *right now*
+        (from `pirewall.flow.aggregator.FlowAggregator.
+        snapshot_slow_connection_clusters`), not an event to fold in
+        incrementally the way a new connection is.
+        """
+        if timestamp > self.last_seen:
+            self.last_seen = timestamp
+        already_tracked = destination_ip in self.slow_connection_counts
+        if already_tracked or len(self.slow_connection_counts) < self._max_destinations:
+            self.slow_connection_counts[destination_ip] = count
+
     @property
     def max_connections_to_single_destination(self) -> int:
         return max(self.connections_per_destination.values(), default=0)
+
+    @property
+    def max_concurrent_slow_connections(self) -> int:
+        return max(self.slow_connection_counts.values(), default=0)
 
 
 class BehaviorAnalyzer:
@@ -147,6 +171,24 @@ class BehaviorAnalyzer:
         """
         state = self._get_or_create(source_ip, timestamp)
         state.observe_new_connection(destination_ip, destination_port, timestamp)
+
+    def note_slow_connections(
+        self,
+        source_ip: IPv4Address,
+        destination_ip: IPv4Address,
+        count: int,
+        timestamp: datetime,
+    ) -> None:
+        """Record a live concurrent-slow-connection count for one (source, destination) pair.
+
+        Fed periodically from `pirewall.runtime.core.CoreDaemon`'s sweep
+        loop, via `pirewall.flow.aggregator.FlowAggregator.
+        snapshot_slow_connection_clusters` (ADDENDUM_2.md B2) — never called
+        from the detection thread's per-flow path, since this is
+        source-level aggregate evidence, not a per-flow observation.
+        """
+        state = self._get_or_create(source_ip, timestamp)
+        state.note_slow_connections(destination_ip, count, timestamp)
 
     def observe_completion(self, flow: Flow) -> None:
         """Fold a completed flow's completion-only signal into its source's state.
@@ -254,6 +296,12 @@ def _assess_state(
     if state.failure_count >= config.repeated_failures_threshold:
         patterns.append(BehaviorPatternType.REPEATED_FAILURES)
         reasons.append(f"{state.failure_count} unanswered connection attempts")
+
+    if state.max_concurrent_slow_connections >= config.concurrent_slow_connections_threshold:
+        patterns.append(BehaviorPatternType.SLOW_RATE_DOS)
+        reasons.append(
+            f"{state.max_concurrent_slow_connections} concurrent slow connections to one destination"
+        )
 
     intervals = _inter_arrival_seconds(state.recent_connection_times)
     if len(intervals) >= 3:

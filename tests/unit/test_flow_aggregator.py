@@ -167,6 +167,109 @@ def test_on_new_flow_fires_again_for_a_genuinely_new_flow_from_the_same_ports() 
     assert len(signals) == 2
 
 
+def test_snapshot_slow_connection_clusters_finds_a_qualifying_cluster_without_closing_flows() -> None:
+    """ADDENDUM_2.md B2: read-only — the connections stay open, nothing is popped from the table."""
+    aggregator = _aggregator(active_timeout_seconds=3600, inactive_timeout_seconds=3600)
+    for source_port in range(40000, 40008):
+        aggregator.process_packet(
+            make_packet(
+                source_ip="203.0.113.80",
+                destination_ip="10.0.0.60",
+                source_port=source_port,
+                destination_port=80,
+                timestamp=T0,
+                total_length=10,
+            )
+        )
+    assert len(aggregator) == 8
+
+    clusters = aggregator.snapshot_slow_connection_clusters(
+        now=T0 + timedelta(seconds=20),
+        min_duration_seconds=15.0,
+        max_bytes_per_second=5.0,
+        concurrent_threshold=8,
+    )
+
+    assert len(clusters) == 1
+    cluster = clusters[0]
+    assert str(cluster.source_ip) == "203.0.113.80"
+    assert str(cluster.destination_ip) == "10.0.0.60"
+    assert cluster.concurrent_count == 8
+    # Nothing was closed — every flow is still open in the table.
+    assert len(aggregator) == 8
+
+
+def test_snapshot_slow_connection_clusters_ignores_a_single_slow_connection() -> None:
+    aggregator = _aggregator(active_timeout_seconds=3600, inactive_timeout_seconds=3600)
+    aggregator.process_packet(
+        make_packet(
+            source_ip="203.0.113.81",
+            destination_ip="10.0.0.61",
+            destination_port=80,
+            timestamp=T0,
+            total_length=10,
+        )
+    )
+
+    clusters = aggregator.snapshot_slow_connection_clusters(
+        now=T0 + timedelta(seconds=20),
+        min_duration_seconds=15.0,
+        max_bytes_per_second=5.0,
+        concurrent_threshold=8,
+    )
+
+    assert clusters == []
+
+
+def test_snapshot_slow_connection_clusters_ignores_flows_below_the_duration_floor() -> None:
+    aggregator = _aggregator(active_timeout_seconds=3600, inactive_timeout_seconds=3600)
+    for source_port in range(40000, 40008):
+        aggregator.process_packet(
+            make_packet(
+                source_ip="203.0.113.82",
+                destination_ip="10.0.0.62",
+                source_port=source_port,
+                destination_port=80,
+                timestamp=T0,
+                total_length=10,
+            )
+        )
+
+    clusters = aggregator.snapshot_slow_connection_clusters(
+        now=T0 + timedelta(seconds=5),  # below min_duration_seconds
+        min_duration_seconds=15.0,
+        max_bytes_per_second=5.0,
+        concurrent_threshold=8,
+    )
+
+    assert clusters == []
+
+
+def test_snapshot_slow_connection_clusters_ignores_flows_above_the_rate_ceiling() -> None:
+    """A fast, ordinary connection held open a while must not be mistaken for a slow one."""
+    aggregator = _aggregator(active_timeout_seconds=3600, inactive_timeout_seconds=3600)
+    for source_port in range(40000, 40008):
+        aggregator.process_packet(
+            make_packet(
+                source_ip="203.0.113.83",
+                destination_ip="10.0.0.63",
+                source_port=source_port,
+                destination_port=80,
+                timestamp=T0,
+                total_length=10_000,  # far above the rate ceiling once divided by duration
+            )
+        )
+
+    clusters = aggregator.snapshot_slow_connection_clusters(
+        now=T0 + timedelta(seconds=20),
+        min_duration_seconds=15.0,
+        max_bytes_per_second=5.0,
+        concurrent_threshold=8,
+    )
+
+    assert clusters == []
+
+
 def test_udp_flow_produces_expected_protocol_on_finalization() -> None:
     aggregator = _aggregator(active_timeout_seconds=3600, inactive_timeout_seconds=10)
     aggregator.process_packet(make_packet(protocol=Protocol.UDP, tcp_flags=None, timestamp=T0))

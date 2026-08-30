@@ -177,6 +177,53 @@ def test_observe_completion_does_not_double_count_a_connection_already_observed(
     assert BehaviorPatternType.REPEATED_CONNECTIONS not in assessment.detected_patterns
 
 
+def test_slow_rate_dos_detected_from_concurrent_slow_connection_count() -> None:
+    """ADDENDUM_2.md B2: many concurrent slow connections to one destination fires the pattern."""
+    config = _config(concurrent_slow_connections_threshold=8)
+    analyzer = BehaviorAnalyzer(config)
+
+    analyzer.note_slow_connections(
+        IPv4Address("203.0.113.70"), IPv4Address("10.0.0.50"), 8, T0
+    )
+
+    assessment = analyzer.assess(IPv4Address("203.0.113.70"))
+    assert assessment is not None
+    assert BehaviorPatternType.SLOW_RATE_DOS in assessment.detected_patterns
+
+
+def test_single_slow_connection_does_not_trigger_slow_rate_dos() -> None:
+    """Regression for the DHCP/Slowhttptest false positive (ADDENDUM_2.md, top of file):
+
+    one ordinary slow connection (one IoT-device-style flow) must never be
+    mistaken for a slow-rate DoS pattern on its own.
+    """
+    config = _config(concurrent_slow_connections_threshold=8)
+    analyzer = BehaviorAnalyzer(config)
+
+    analyzer.note_slow_connections(
+        IPv4Address("203.0.113.71"), IPv4Address("10.0.0.51"), 1, T0
+    )
+
+    assessment = analyzer.assess(IPv4Address("203.0.113.71"))
+    assert assessment is not None
+    assert BehaviorPatternType.SLOW_RATE_DOS not in assessment.detected_patterns
+
+
+def test_slow_connection_count_is_a_live_snapshot_not_an_accumulator() -> None:
+    """A later, lower count must be able to clear the pattern — it isn't a monotonic counter."""
+    config = _config(concurrent_slow_connections_threshold=8)
+    analyzer = BehaviorAnalyzer(config)
+
+    analyzer.note_slow_connections(IPv4Address("203.0.113.72"), IPv4Address("10.0.0.52"), 10, T0)
+    analyzer.note_slow_connections(
+        IPv4Address("203.0.113.72"), IPv4Address("10.0.0.52"), 2, T0 + timedelta(seconds=30)
+    )
+
+    assessment = analyzer.assess(IPv4Address("203.0.113.72"))
+    assert assessment is not None
+    assert BehaviorPatternType.SLOW_RATE_DOS not in assessment.detected_patterns
+
+
 def test_assess_unknown_source_returns_none() -> None:
     analyzer = BehaviorAnalyzer(_config())
     assert analyzer.assess(IPv4Address("192.0.2.1")) is None

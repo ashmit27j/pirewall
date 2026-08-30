@@ -68,7 +68,7 @@ from pirewall.detection.coordinator import DetectionCoordinator, load_models
 from pirewall.firewall.backend.nftables import NftablesBackend
 from pirewall.firewall.interface import FirewallBackend
 from pirewall.firewall.manager import FirewallManager
-from pirewall.flow.aggregator import FlowAggregator, NewFlowSignal
+from pirewall.flow.aggregator import FlowAggregator, NewFlowSignal, SlowConnectionCluster
 from pirewall.integration.netdata import NetdataExporter, StatsdNetdataTransport
 from pirewall.integration.wazuh import SyslogWazuhTransport, WazuhForwarder
 from pirewall.ipc.dispatcher import CoreRpcDispatcher
@@ -94,6 +94,11 @@ _FLOW_QUEUE_MAX = 10_000
 # flows per second than complete in the same window, so this is sized well
 # above `_FLOW_QUEUE_MAX`.
 _NEW_FLOW_QUEUE_MAX = 50_000
+# Slow-connection clusters awaiting the detection thread (ADDENDUM_2.md B2).
+# One entry per distinct (source, destination) pair currently exceeding the
+# concurrent-slow-connection threshold, produced at most once per sweep
+# interval — orders of magnitude fewer than either flow queue.
+_SLOW_CLUSTER_QUEUE_MAX = 1_000
 # How long the queue drain waits before re-checking the stop flag.
 _QUEUE_POLL_SECONDS = 0.5
 # Threads get this long to finish after `stop()` before the process gives up
@@ -192,6 +197,13 @@ class CoreDaemon:
         # `_drain_new_flow_signals`.
         self._new_flow_queue: queue.Queue[NewFlowSignal] = queue.Queue(maxsize=_NEW_FLOW_QUEUE_MAX)
         self._new_flow_signals_dropped = 0
+        # ADDENDUM_2.md B2 — same reasoning: populated by the sweep thread,
+        # drained by the detection thread, so BehaviorAnalyzer stays
+        # mutated from exactly one thread.
+        self._slow_cluster_queue: queue.Queue[SlowConnectionCluster] = queue.Queue(
+            maxsize=_SLOW_CLUSTER_QUEUE_MAX
+        )
+        self._slow_clusters_dropped = 0
         self._aggregator = FlowAggregator(config.flow, on_new_flow=self._handle_new_flow)
 
         models = load_models(config.ml)
@@ -502,6 +514,33 @@ class CoreDaemon:
                 signal.source_ip, signal.destination_ip, signal.destination_port, signal.timestamp
             )
 
+    def _drain_slow_clusters(self) -> None:
+        """Fold every pending slow-connection cluster into `BehaviorAnalyzer` and the normal pipeline.
+
+        ADDENDUM_2.md B2. Detection thread only, same reasoning as
+        `_drain_new_flow_signals`. Recording the cluster's count *before*
+        enqueueing its representative flow is what makes the SLOW_RATE_DOS
+        pattern visible on that same flow's own `ThreatAssessment`, exactly
+        like every other behavioral pattern.
+        """
+        while True:
+            try:
+                cluster = self._slow_cluster_queue.get_nowait()
+            except queue.Empty:
+                return
+            now = datetime.now(UTC)
+            self._coordinator.behavior_analyzer.note_slow_connections(
+                cluster.source_ip, cluster.destination_ip, cluster.concurrent_count, now
+            )
+            # Not `_enqueue`: that increments `flows_completed`, and this
+            # flow did not complete — it's a still-open connection's
+            # point-in-time snapshot (see `SlowConnectionCluster`'s
+            # docstring). Metrics must not conflate the two.
+            try:
+                self._flow_queue.put_nowait(cluster.representative_flow)
+            except queue.Full:
+                self._note_backpressure_drop(cluster.representative_flow)
+
     def _note_backpressure_drop(self, flow: Flow) -> None:
         self._backpressure_drops += 1
         count = self._backpressure_drops
@@ -536,6 +575,7 @@ class CoreDaemon:
         """
         while not self._stop.is_set():
             self._drain_new_flow_signals()
+            self._drain_slow_clusters()
             try:
                 flow = self._flow_queue.get(timeout=_QUEUE_POLL_SECONDS)
             except queue.Empty:
@@ -545,23 +585,53 @@ class CoreDaemon:
             finally:
                 self._flow_queue.task_done()
         self._drain_new_flow_signals()
+        self._drain_slow_clusters()
         _logger.info("detection loop exited")
 
     def _sweep_loop(self) -> None:
-        """Expire timed-out flows and TTL-elapsed rules on `flow.cleanup_interval_seconds`."""
+        """Expire timed-out flows and TTL-elapsed rules on `flow.cleanup_interval_seconds`.
+
+        Also snapshots slow-connection clusters (ADDENDUM_2.md B2) on the
+        same cadence — cheap (a duration/byte-count check per open flow, no
+        feature extraction or ML), so it costs nothing extra to piggyback on
+        this loop rather than run its own.
+        """
         interval = float(self._config.flow.cleanup_interval_seconds)
+        detection = self._config.detection
         while not self._stop.wait(interval):
             now = datetime.now(UTC)
             try:
                 with self._flow_lock:
                     completed = self._aggregator.sweep_timeouts(now)
+                    clusters = self._aggregator.snapshot_slow_connection_clusters(
+                        now,
+                        detection.slow_connection_min_duration_seconds,
+                        detection.slow_connection_max_bytes_per_second,
+                        detection.concurrent_slow_connections_threshold,
+                    )
                 self._counters.add(flows_expired=len(completed))
                 self._enqueue(completed)
+                self._enqueue_slow_clusters(clusters)
                 self._expire_rules(now)
             except PirewallError as exc:
                 _logger.warning("sweep pass failed: %s", exc)
             except Exception:
                 _logger.exception("sweep pass crashed")
+
+    def _enqueue_slow_clusters(self, clusters: list[SlowConnectionCluster]) -> None:
+        """Hand slow-connection clusters to the detection thread, dropping rather than blocking."""
+        for cluster in clusters:
+            try:
+                self._slow_cluster_queue.put_nowait(cluster)
+            except queue.Full:
+                self._slow_clusters_dropped += 1
+                if self._slow_clusters_dropped == 1 or (
+                    self._slow_clusters_dropped % _BACKPRESSURE_REPORT_INTERVAL == 0
+                ):
+                    _logger.warning(
+                        "slow-connection cluster queue full, dropped %d so far",
+                        self._slow_clusters_dropped,
+                    )
         _logger.info("sweep loop exited")
 
     def _expire_rules(self, now: datetime) -> None:

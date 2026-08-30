@@ -171,7 +171,105 @@ to `_assess_state` are collected, not the detection logic itself.
 
 ## B2. New slow-rate aggregate detection signal
 
-*(filled in when B2 is implemented — see the B2 commit)*
+**What:** a new `BehaviorPatternType.SLOW_RATE_DOS` pattern, structurally
+the same category of evidence as `SCANNING`/`BURST` — a source-level
+aggregate observation, not a per-flow classification of any single
+ambiguous connection. Fires when `concurrent_slow_connections_threshold`
+(default 8) or more currently-open flows from one source to one destination
+have each been open at least `slow_connection_min_duration_seconds`
+(default 15.0) while averaging at most `slow_connection_max_bytes_per_second`
+(default 5.0) — new fields under `[detection]`.
+
+**Implementation:**
+
+* `pirewall.flow.aggregator.FlowAggregator.snapshot_slow_connection_clusters`
+  (new) — iterates the *currently open* flow table (never pops, closes, or
+  otherwise mutates a flow; the connections keep running exactly as they
+  were), groups qualifying flows by (source, destination), and returns one
+  `SlowConnectionCluster` per pair that meets the concurrency threshold.
+  `SlowConnectionCluster.representative_flow` is a point-in-time snapshot
+  of one qualifying flow's accumulated stats so far (`FlowState.to_flow`,
+  the exact same conversion flow *completion* uses — just called without
+  removing the flow from the table).
+* `pirewall.detection.behavior.SourceBehaviorState`/`BehaviorAnalyzer`
+  gained `note_slow_connections` — records a *live snapshot* count per
+  destination (overwrites, doesn't accumulate: this is "how many qualify
+  right now", not an event). `_assess_state` adds `SLOW_RATE_DOS` when
+  `max_concurrent_slow_connections >= concurrent_slow_connections_threshold`.
+* **Wiring, reusing the existing pipeline rather than building a parallel
+  one:** `pirewall.runtime.core.CoreDaemon`'s sweep loop (already runs on
+  `flow.cleanup_interval_seconds`, already iterates the flow table for
+  `sweep_timeouts`) now also calls `snapshot_slow_connection_clusters` on
+  the same pass — cheap (a duration/byte-count comparison per open flow, no
+  feature extraction, no ML) so piggybacking costs nothing extra. Each
+  cluster is handed to the detection thread through a new bounded
+  `_slow_cluster_queue` (same reasoning as B1's `_new_flow_queue`:
+  `BehaviorAnalyzer` must stay mutated from exactly one thread). The
+  detection thread's `_drain_slow_clusters` records the cluster's count via
+  `note_slow_connections` and then pushes `representative_flow` onto the
+  *same* flow queue every genuinely completed flow uses — from there it
+  goes through the completely unmodified
+  `FlowPipeline` -> `DetectionCoordinator` -> `assess_threat` -> `decide` ->
+  `generate_candidate_rule` -> `FirewallManager.submit_candidate` chain,
+  producing a real (or SHADOW-logged) `RATE_LIMIT`/`BLOCK` decision the same
+  way any other detection does. **Not** counted in the `flows_completed`
+  metric (`RuntimeCounters`) — that would misrepresent a still-open
+  connection as a completed one; it's pushed directly onto the flow queue
+  instead of through `_enqueue`.
+
+**Why this avoids the DHCP-style false positive** (the incident this whole
+pass's intro describes): a single ordinary slow connection — one IoT device
+polling slowly, one legitimate long download, one DHCP-adjacent
+long-lived flow — produces a concurrent count of 1 at its destination,
+which never approaches `concurrent_slow_connections_threshold` (8). Only a
+genuine many-connections-at-once pattern to the *same* destination does.
+This is the same "aggregate, multi-observation signal by construction"
+argument B1 makes for `SCANNING`/`BURST`, applied to a new pattern —
+`test_single_slow_connection_does_not_trigger_slow_rate_dos` is the direct
+regression test.
+
+**A known, disclosed side effect of reusing the pipeline rather than
+building a parallel one**: while a qualifying slow-connection cluster
+persists, its representative flow is re-snapshotted and re-pushed through
+the pipeline on every sweep interval. This is safe from a rule-management
+standpoint — a repeat candidate targeting an already-`ACTIVE` rule's exact
+target is rejected at the validator's `duplicate` stage, before it can
+consume any of A3's rate-cap budget — but in `SHADOW` mode (the default),
+where nothing ever becomes `ACTIVE`, this does mean a new `ThreatAssessment`
+and `SHADOWED` event get logged every sweep interval for as long as the
+pattern persists, rather than exactly once. Documented rather than
+suppressed: a human watching the shadow log during the recommended
+SHADOW-mode observation period would see this as "still ongoing", not as
+independent repeat detections, and A3's window rate-cap still bounds any
+*enforced* consequence of it in ACTIVE/ASSISTED mode.
+
+**Tested:**
+`tests/unit/test_behavior.py` (`test_slow_rate_dos_detected_from_concurrent_slow_connection_count`,
+`test_single_slow_connection_does_not_trigger_slow_rate_dos`,
+`test_slow_connection_count_is_a_live_snapshot_not_an_accumulator`);
+`tests/unit/test_flow_aggregator.py`
+(`test_snapshot_slow_connection_clusters_finds_a_qualifying_cluster_without_closing_flows`,
+`test_snapshot_slow_connection_clusters_ignores_a_single_slow_connection`,
+`test_snapshot_slow_connection_clusters_ignores_flows_below_the_duration_floor`,
+`test_snapshot_slow_connection_clusters_ignores_flows_above_the_rate_ceiling`).
+Adding `SLOW_RATE_DOS` changed `BehaviorPatternType`'s member count from 8
+to 9, which shifted the behavior-confidence/scoring-contribution fraction
+(`len(detected_patterns) / len(BehaviorPatternType)`) — three pre-existing
+tests hardcoding the old total (`test_behavior_pattern_type_values`,
+`test_behavior_contribution_scales_with_pattern_count`,
+`test_multiple_corroborating_evidence_types_sum`) were updated to the new
+denominator; no production code has a hardcoded total (both use
+`len(BehaviorPatternType)`). `ruff check .` and `pyright --strict` clean
+across the whole repo; full suite 566 passed, 22 skipped, the same 1
+pre-existing unrelated failure as B1 (see B1's section).
+
+**Written, not executed this session** (same `AF_UNIX`-on-Windows
+constraint as B1's end-to-end test):
+`tests/integration/test_core_daemon.py::test_slow_rate_dos_detected_without_waiting_for_connections_to_close_or_time_out`
+— 6 bare, never-FIN'd, never-timed-out SYN connections from one source to
+one destination, asserting a `ThreatAssessment` carries `SLOW_RATE_DOS`
+purely from the sweep loop's periodic snapshot. Run this on the next
+macOS/Linux session.
 
 ## B3. Explicit maturity/evidence-based action-capping invariant
 

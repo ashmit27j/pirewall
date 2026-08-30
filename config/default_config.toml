@@ -60,6 +60,15 @@ scanning_port_threshold = 10
 repeated_failures_threshold = 10
 temporal_pattern_cv_threshold = 0.15
 
+# ADDENDUM_2.md B2 — slow-rate (slowloris-class) aggregate signal. A flow
+# only becomes a "slow connection" candidate once open this many seconds
+# while transferring at most this many bytes/second; only when
+# concurrent_slow_connections_threshold many such candidates target the
+# *same destination* from one source does the pattern fire.
+slow_connection_min_duration_seconds = 15.0
+slow_connection_max_bytes_per_second = 5.0
+concurrent_slow_connections_threshold = 8
+
 [ml]
 lightgbm_model_path = "pirewall/ml/artifacts/lightgbm_model.txt"
 isolation_forest_model_path = "pirewall/ml/artifacts/isolation_forest_model.joblib"

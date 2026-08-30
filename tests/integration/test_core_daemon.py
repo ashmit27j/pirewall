@@ -287,6 +287,51 @@ def test_scanning_visible_through_a_completing_flow_while_scan_flows_stay_open(
         daemon.stop()
 
 
+def test_slow_rate_dos_detected_without_waiting_for_connections_to_close_or_time_out(
+    socket_path: str,
+) -> None:
+    """ADDENDUM_2.md B2, end to end: many concurrent slow connections, none of which ever close.
+
+    Every one of the "slow" connections here is a bare, never-acknowledged
+    SYN — no FIN, no timeout reached during the test (timeouts are left at
+    generous defaults). The only way `SLOW_RATE_DOS` can show up in a
+    `ThreatAssessment` here is via the sweep loop's periodic snapshot of
+    still-open flows, not via any flow actually completing.
+    """
+    src, dst = "203.0.113.90", "192.168.1.20"
+    packets = [_tcp_packet(45000 + port, 80, _SYN, src, dst) for port in range(6)]
+
+    config = make_config(
+        api={"rpc_socket_path": socket_path, "history_size": 50},
+        detection={
+            "concurrent_slow_connections_threshold": 5,
+            "slow_connection_min_duration_seconds": 0.2,
+            "slow_connection_max_bytes_per_second": 10_000.0,
+        },
+        flow={"cleanup_interval_seconds": 1},
+    )
+    daemon = CoreDaemon(
+        config,
+        capture=FakePacketCapture("test0", packets),
+        backend=FakeFirewallBackend(),
+        notifier=SystemdNotifier(notify_socket=None),
+    )
+    daemon.start()
+    try:
+        client = UnixSocketRpcClient(socket_path)
+        _wait_for(
+            lambda: any(
+                assessment.behavior_assessment is not None
+                and "slow_rate_dos"
+                in [p.value for p in assessment.behavior_assessment.detected_patterns]
+                for assessment in client.list_threats()
+            ),
+            "a SLOW_RATE_DOS threat assessment from still-open connections",
+        )
+    finally:
+        daemon.stop()
+
+
 def _deploy_one_rule(daemon: CoreDaemon) -> str:
     """Push a rule to ACTIVE through the manager's normal, fully validated path.
 

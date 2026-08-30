@@ -33,6 +33,27 @@ from pirewall.flow.timeout import check_closure
 
 
 @dataclass(frozen=True, slots=True)
+class SlowConnectionCluster:
+    """A (source, destination) pair currently running many concurrent slow connections.
+
+    Produced by `FlowAggregator.snapshot_slow_connection_clusters`
+    (ADDENDUM_2.md B2) — a source-level aggregate observation, not a
+    per-flow one. `representative_flow` is a point-in-time snapshot of one
+    qualifying *still-open* flow's accumulated stats so far (the
+    connection itself is left running, untouched, in the table) — it
+    exists only to carry (source, destination, port, protocol) identity
+    through the normal detection/decision/enforcement pipeline the same
+    way a genuinely completed flow does, reusing that machinery rather than
+    building a parallel one.
+    """
+
+    source_ip: IPv4Address
+    destination_ip: IPv4Address
+    concurrent_count: int
+    representative_flow: Flow
+
+
+@dataclass(frozen=True, slots=True)
 class NewFlowSignal:
     """Everything knowable about a flow the instant its first packet arrives.
 
@@ -136,6 +157,55 @@ class FlowAggregator:
                 self._table.pop(key)
                 emitted.append(self._finalize(state))
         return emitted
+
+    def snapshot_slow_connection_clusters(
+        self,
+        now: datetime,
+        min_duration_seconds: float,
+        max_bytes_per_second: float,
+        concurrent_threshold: int,
+    ) -> list[SlowConnectionCluster]:
+        """Group currently-open flows by (source, destination) and report any qualifying cluster.
+
+        A flow qualifies as a "slow connection" candidate once it has been
+        open at least `min_duration_seconds` while averaging at most
+        `max_bytes_per_second`. A (source, destination) pair is only
+        reported once at least `concurrent_threshold` of its currently-open
+        flows qualify simultaneously — a single slow connection never
+        qualifies on its own, by construction (ADDENDUM_2.md B2).
+
+        Read-only: this never closes, pops, or otherwise mutates a flow —
+        every connection keeps running exactly as it was. Meant to be
+        called periodically, alongside `sweep_timeouts`, by whatever owns
+        the wall clock (`pirewall.runtime.core.CoreDaemon`'s sweep loop).
+        """
+        by_pair: dict[tuple[IPv4Address, IPv4Address], list[FlowState]] = {}
+        for state in self._table.values():
+            duration = (now - state.first_seen).total_seconds()
+            if duration < min_duration_seconds:
+                continue
+            rate = state.byte_count / duration
+            if rate > max_bytes_per_second:
+                continue
+            key = (state.forward_source_ip, state.forward_destination_ip)
+            by_pair.setdefault(key, []).append(state)
+
+        clusters: list[SlowConnectionCluster] = []
+        for (source_ip, destination_ip), states in by_pair.items():
+            if len(states) < concurrent_threshold:
+                continue
+            # Deterministic, arbitrary-but-stable choice of which single
+            # connection carries the evidence forward: the longest-held one.
+            representative = min(states, key=lambda candidate: candidate.first_seen)
+            clusters.append(
+                SlowConnectionCluster(
+                    source_ip=source_ip,
+                    destination_ip=destination_ip,
+                    concurrent_count=len(states),
+                    representative_flow=representative.to_flow(flow_id=str(uuid4())),
+                )
+            )
+        return clusters
 
     def flush(self) -> list[Flow]:
         """Finalize every remaining open flow, regardless of timeout status.

@@ -125,7 +125,7 @@ def test_behavior_contribution_scales_with_pattern_count() -> None:
     breakdown = score_evidence(
         CONFIG, None, None, _behavior((BehaviorPatternType.SCANNING,))
     )
-    expected = 25.0 * (1 / 8)
+    expected = 25.0 * (1 / 9)
     assert round(breakdown.behavior_contribution, 6) == round(expected, 6)
 
 
@@ -136,7 +136,7 @@ def test_multiple_corroborating_evidence_types_sum() -> None:
         _anomaly(is_anomaly=True),
         _behavior((BehaviorPatternType.SCANNING, BehaviorPatternType.HIGH_FREQUENCY)),
     )
-    expected = 50.0 + 25.0 + 25.0 * (2 / 8)
+    expected = 50.0 + 25.0 + 25.0 * (2 / 9)
     assert round(breakdown.total, 6) == round(expected, 6)
 
 

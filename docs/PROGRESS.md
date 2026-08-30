@@ -1867,7 +1867,7 @@ for what's actually built so far if this table looks incomplete.
 | Item | Status | Label |
 |------|--------|-------|
 | B1 Creation-time behavior counters | Complete | Tested — see below |
-| B2 Slow-rate aggregate signal | Not started | — |
+| B2 Slow-rate aggregate signal | Complete | Tested — see below |
 | B3 Evidence-maturity gate | Not started | — |
 | B4 Heartbleed detector | Not started | — |
 | B5 JA3 fingerprinting | Not started | — |
@@ -1910,3 +1910,28 @@ accept rule is scoped to `${PROTECTED_NETWORK}`, not `${ADMIN_PC_IP}`,
 which the test expects for every `tcp dport` accept line including DNS.
 Out of scope for this pass; flagging so it isn't mistakenly attributed to
 B1-B6.
+
+### B2 — Tested
+
+New `BehaviorPatternType.SLOW_RATE_DOS` signal:
+`FlowAggregator.snapshot_slow_connection_clusters` (read-only scan of
+still-open flows, grouped by source/destination) feeds
+`BehaviorAnalyzer.note_slow_connections` via a new sweep-thread-to-
+detection-thread queue, and its representative flow snapshot goes through
+the completely unmodified detection/decision/enforcement pipeline. Full
+design, the reused-pipeline side effect in SHADOW mode, and the
+DHCP-false-positive-avoidance argument are in `docs/ADDENDUM_2.md` B2.
+
+**Tested**: 3 new tests in `tests/unit/test_behavior.py`, 4 new tests in
+`tests/unit/test_flow_aggregator.py`. Adding the 9th `BehaviorPatternType`
+member required updating 3 pre-existing tests that hardcoded the old
+total-of-8 denominator (`test_behavior_pattern_type_values`,
+`test_behavior_contribution_scales_with_pattern_count`,
+`test_multiple_corroborating_evidence_types_sum`) — no production code had
+a hardcoded total. `ruff check .` and `pyright --strict` clean across the
+whole repo. Full suite: 566 passed, 22 skipped, the same 1 pre-existing
+unrelated failure noted under B1.
+
+**Written, not executed this session** (same `AF_UNIX`-on-Windows gap as
+B1): `tests/integration/test_core_daemon.py::test_slow_rate_dos_detected_without_waiting_for_connections_to_close_or_time_out`.
+Run on the next macOS/Linux session, alongside B1's equivalent test.

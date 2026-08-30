@@ -89,6 +89,18 @@ class DetectionConfig(PirewallModel):
     repeated_failures_threshold: int = Field(default=10, gt=0)
     temporal_pattern_cv_threshold: float = Field(default=0.15, gt=0.0)
 
+    # ADDENDUM_2.md B2 — slow-rate (slowloris-class) aggregate signal. A
+    # flow only counts as a "slow connection" candidate once it has been
+    # open at least this long while transferring at most this many
+    # bytes/second; `concurrent_slow_connections_threshold` many such
+    # candidates to the *same destination* from one source is what
+    # actually fires the pattern — a single slow connection never does,
+    # by construction (see `pirewall.detection.behavior`'s module
+    # docstring for the false-positive reasoning this guards against).
+    slow_connection_min_duration_seconds: float = Field(default=15.0, gt=0.0)
+    slow_connection_max_bytes_per_second: float = Field(default=5.0, gt=0.0)
+    concurrent_slow_connections_threshold: int = Field(default=8, gt=0)
+
 
 class MLConfig(PirewallModel):
     """Model artifact locations and expected feature schema (spec §15)."""

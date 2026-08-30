@@ -234,6 +234,59 @@ def test_backpressure_drops_flows_rather_than_blocking_capture(socket_path: str)
         daemon.stop()
 
 
+def test_scanning_visible_through_a_completing_flow_while_scan_flows_stay_open(
+    socket_path: str,
+) -> None:
+    """ADDENDUM_2.md B1, end to end: scanning is counted at creation, not completion.
+
+    Drives 6 single-SYN "scan" flows (never FIN'd, so under the old
+    architecture they would sit uncounted until an inactivity timeout) plus
+    one ordinary 4-packet completing flow, all from the same source. The
+    only flow that ever completes is the ordinary one — but because the
+    scan flows already updated the source's behavioral state the instant
+    each one *opened*, the completing flow's own threat assessment already
+    carries the SCANNING pattern, well before any scan flow times out.
+    """
+    src, dst = "203.0.113.60", "192.168.1.10"
+    packets: list[bytes] = [_tcp_packet(51000 + port, port, _SYN, src, dst) for port in range(6000, 6006)]
+    packets.extend(_one_completed_session(src=src, dst=dst))
+
+    config_overrides: dict[str, dict[str, object]] = {
+        "detection": {"scanning_port_threshold": 5},
+        # Long enough that none of the never-FIN'd scan flows could complete
+        # via timeout within this test's deadline — if scanning shows up
+        # anyway, it did so without them completing.
+        "flow": {"active_timeout_seconds": 3600, "inactive_timeout_seconds": 3600},
+    }
+    config = make_config(
+        api={"rpc_socket_path": socket_path, "history_size": 50}, **config_overrides
+    )
+    daemon = CoreDaemon(
+        config,
+        capture=FakePacketCapture("test0", packets),
+        backend=FakeFirewallBackend(),
+        notifier=SystemdNotifier(notify_socket=None),
+    )
+    daemon.start()
+    try:
+        client = UnixSocketRpcClient(socket_path)
+        _wait_for(lambda: len(client.list_threats()) >= 1, "a threat assessment")
+
+        # Exactly one flow (the completing 4-packet session) ever finished —
+        # the six scan flows are still open, proving they were never
+        # completed, only counted at creation.
+        assert len(client.list_flows()) == 1
+
+        assessments = client.list_threats()
+        assert any(
+            assessment.behavior_assessment is not None
+            and "scanning" in [p.value for p in assessment.behavior_assessment.detected_patterns]
+            for assessment in assessments
+        ), [a.behavior_assessment for a in assessments]
+    finally:
+        daemon.stop()
+
+
 def _deploy_one_rule(daemon: CoreDaemon) -> str:
     """Push a rule to ACTIVE through the manager's normal, fully validated path.
 

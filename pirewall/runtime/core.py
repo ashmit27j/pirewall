@@ -68,7 +68,7 @@ from pirewall.detection.coordinator import DetectionCoordinator, load_models
 from pirewall.firewall.backend.nftables import NftablesBackend
 from pirewall.firewall.interface import FirewallBackend
 from pirewall.firewall.manager import FirewallManager
-from pirewall.flow.aggregator import FlowAggregator
+from pirewall.flow.aggregator import FlowAggregator, NewFlowSignal
 from pirewall.integration.netdata import NetdataExporter, StatsdNetdataTransport
 from pirewall.integration.wazuh import SyslogWazuhTransport, WazuhForwarder
 from pirewall.ipc.dispatcher import CoreRpcDispatcher
@@ -87,6 +87,13 @@ _SUBSYSTEM = "runtime.core"
 # bounded memory on a `MemoryMax=768M` Pi rather than growing until the OOM
 # killer intervenes. At ~1 KiB per `Flow` this is a few MiB.
 _FLOW_QUEUE_MAX = 10_000
+# New-flow-opened signals awaiting the detection thread (ADDENDUM_2.md B1).
+# Far smaller and cheaper per-item than a `Flow` (five plain fields, no
+# accumulated stats), and a burst of new connections — the exact case this
+# queue exists to make visible quickly — can legitimately open far more
+# flows per second than complete in the same window, so this is sized well
+# above `_FLOW_QUEUE_MAX`.
+_NEW_FLOW_QUEUE_MAX = 50_000
 # How long the queue drain waits before re-checking the stop flag.
 _QUEUE_POLL_SECONDS = 0.5
 # Threads get this long to finish after `stop()` before the process gives up
@@ -179,7 +186,13 @@ class CoreDaemon:
         self._manager = FirewallManager(config, firewall_backend)
         self._counters = RuntimeCounters()
         self._forwarder = EventForwarder(self._state, self._build_wazuh(), self._lock)
-        self._aggregator = FlowAggregator(config.flow)
+        # ADDENDUM_2.md B1: fed from the capture thread the instant a flow
+        # opens, drained by the detection thread (the sole owner of
+        # `BehaviorAnalyzer`'s mutable state) — see `_handle_new_flow` and
+        # `_drain_new_flow_signals`.
+        self._new_flow_queue: queue.Queue[NewFlowSignal] = queue.Queue(maxsize=_NEW_FLOW_QUEUE_MAX)
+        self._new_flow_signals_dropped = 0
+        self._aggregator = FlowAggregator(config.flow, on_new_flow=self._handle_new_flow)
 
         models = load_models(config.ml)
         self._model_load_errors = models.load_errors
@@ -455,6 +468,40 @@ class CoreDaemon:
             except queue.Full:
                 self._note_backpressure_drop(flow)
 
+    def _handle_new_flow(self, signal: NewFlowSignal) -> None:
+        """`FlowAggregator`'s creation-time callback (ADDENDUM_2.md B1). Runs on the capture thread.
+
+        Only enqueues — `BehaviorAnalyzer` is mutated exclusively from the
+        detection thread (`_drain_new_flow_signals`), so this needs no lock
+        of its own, same reasoning as `_enqueue` for completed flows.
+        Dropping under backpressure only costs *how fast* a pattern becomes
+        visible, never correctness: a dropped signal is one fewer connection
+        counted at creation time, but that same flow still updates its
+        source's state at completion via `observe_completion` regardless.
+        """
+        try:
+            self._new_flow_queue.put_nowait(signal)
+        except queue.Full:
+            self._new_flow_signals_dropped += 1
+            if self._new_flow_signals_dropped == 1 or (
+                self._new_flow_signals_dropped % _BACKPRESSURE_REPORT_INTERVAL == 0
+            ):
+                _logger.warning(
+                    "new-flow signal queue full, dropped %d so far",
+                    self._new_flow_signals_dropped,
+                )
+
+    def _drain_new_flow_signals(self) -> None:
+        """Fold every pending creation-time signal into `BehaviorAnalyzer`. Detection thread only."""
+        while True:
+            try:
+                signal = self._new_flow_queue.get_nowait()
+            except queue.Empty:
+                return
+            self._coordinator.behavior_analyzer.observe_new_connection(
+                signal.source_ip, signal.destination_ip, signal.destination_port, signal.timestamp
+            )
+
     def _note_backpressure_drop(self, flow: Flow) -> None:
         self._backpressure_drops += 1
         count = self._backpressure_drops
@@ -479,8 +526,16 @@ class CoreDaemon:
         )
 
     def _detection_loop(self) -> None:
-        """Drain the flow queue through `FlowPipeline`, one flow at a time."""
+        """Drain the flow queue through `FlowPipeline`, one flow at a time.
+
+        Also drains the new-flow-signal queue (ADDENDUM_2.md B1) at least
+        once per `_QUEUE_POLL_SECONDS`, whether or not a completed flow
+        arrived in that window — this is what bounds volumetric-pattern
+        detection latency to roughly that interval instead of however long
+        the constituent flows take to complete.
+        """
         while not self._stop.is_set():
+            self._drain_new_flow_signals()
             try:
                 flow = self._flow_queue.get(timeout=_QUEUE_POLL_SECONDS)
             except queue.Empty:
@@ -489,6 +544,7 @@ class CoreDaemon:
                 self._pipeline.process(flow, datetime.now(UTC))
             finally:
                 self._flow_queue.task_done()
+        self._drain_new_flow_signals()
         _logger.info("detection loop exited")
 
     def _sweep_loop(self) -> None:

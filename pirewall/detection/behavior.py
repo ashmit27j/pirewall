@@ -6,6 +6,29 @@ every level (`BehaviorAnalyzer` evicts the least-recently-active source
 once `max_tracked_sources` is reached; each source's own destination/port/
 recent-connection tracking is separately capped) so this can never be used
 to exhaust memory (spec §17 "behavior state must be bounded").
+
+**Two update points, not one (ADDENDUM_2.md B1).** The volumetric signals
+(scanning/burst/repeated-connection/destination-diversity) are derived from
+data that's fully known the instant a flow *opens* — source, destination,
+port, protocol, timestamp. Waiting for the flow to *complete* before folding
+that in is what made a scan detectable only as fast as its slowest
+constituent flow timed out, not as fast as the pattern was actually visible.
+So:
+
+* `observe_new_connection` folds in everything knowable at flow creation —
+  called once per new flow, from `pirewall.flow.aggregator.FlowAggregator`'s
+  creation path (via a callback, not an import — the flow layer must not
+  depend on detection, per `CLAUDE.md`'s dependency-direction rule).
+* `observe_completion` folds in the one signal that genuinely cannot be
+  known until a flow ends: whether it ever got a response
+  (`failure_count`, from `backward_packet_count == 0`).
+* `observe_flow` is both of the above against one already-completed `Flow`,
+  kept as the single-call convenience it always was — useful for tests and
+  for any caller that only ever sees flows post-completion. Production code
+  (`pirewall.detection.coordinator.DetectionCoordinator`) calls
+  `observe_new_connection` at creation and `observe_completion` at
+  completion *separately*, never `observe_flow`, precisely so a real flow's
+  connection is counted once, not twice.
 """
 
 import statistics
@@ -51,28 +74,49 @@ class SourceBehaviorState:
         self._max_destinations = max_destinations
         self._max_ports = max_ports
 
-    def observe(self, flow: Flow) -> None:
-        """Fold one more completed flow from this source into the tracked state."""
-        if flow.last_seen > self.last_seen:
-            self.last_seen = flow.last_seen
+    def observe_new_connection(
+        self, destination_ip: IPv4Address, destination_port: int | None, timestamp: datetime
+    ) -> None:
+        """Fold in one newly-opened flow (ADDENDUM_2.md B1) — everything knowable at creation."""
+        if timestamp > self.last_seen:
+            self.last_seen = timestamp
         self.connection_count += 1
 
         if len(self.destinations) < self._max_destinations:
-            self.destinations.add(flow.destination_ip)
-        if flow.destination_port is not None and len(self.ports) < self._max_ports:
-            self.ports.add(flow.destination_port)
+            self.destinations.add(destination_ip)
+        if destination_port is not None and len(self.ports) < self._max_ports:
+            self.ports.add(destination_port)
 
-        destination_key = (flow.destination_ip, flow.destination_port)
+        destination_key = (destination_ip, destination_port)
         already_tracked = destination_key in self.connections_per_destination
         if already_tracked or len(self.connections_per_destination) < self._max_destinations:
             self.connections_per_destination[destination_key] = (
                 self.connections_per_destination.get(destination_key, 0) + 1
             )
 
+        self.recent_connection_times.append(timestamp)
+
+    def observe_completion(self, flow: Flow) -> None:
+        """Fold in the one signal only knowable once a flow ends: did it ever get a response?
+
+        Must be called at most once per flow, and only ever *after* that same
+        flow's `observe_new_connection` — never on its own, or `failure_count`
+        would be counted for a connection this state never opened.
+        """
+        if flow.last_seen > self.last_seen:
+            self.last_seen = flow.last_seen
         if flow.backward_packet_count == 0:
             self.failure_count += 1
 
-        self.recent_connection_times.append(flow.last_seen)
+    def observe(self, flow: Flow) -> None:
+        """Fold one already-completed flow into the tracked state in one call.
+
+        Equivalent to `observe_new_connection` (keyed off `flow.first_seen`)
+        followed by `observe_completion` — see the module docstring for why
+        production code calls those two separately instead of this.
+        """
+        self.observe_new_connection(flow.destination_ip, flow.destination_port, flow.first_seen)
+        self.observe_completion(flow)
 
     @property
     def max_connections_to_single_destination(self) -> int:
@@ -89,22 +133,73 @@ class BehaviorAnalyzer:
     def __len__(self) -> int:
         return len(self._sources)
 
-    def observe_flow(self, flow: Flow) -> None:
-        """Route one completed flow into its source IP's bounded behavior state."""
+    def observe_new_connection(
+        self,
+        source_ip: IPv4Address,
+        destination_ip: IPv4Address,
+        destination_port: int | None,
+        timestamp: datetime,
+    ) -> None:
+        """Route one newly-opened flow into its source IP's bounded state (ADDENDUM_2.md B1).
+
+        Called once per flow, at creation — see the module docstring for why
+        this is the call that actually shortens scan/flood detection latency.
+        """
+        state = self._get_or_create(source_ip, timestamp)
+        state.observe_new_connection(destination_ip, destination_port, timestamp)
+
+    def observe_completion(self, flow: Flow) -> None:
+        """Fold a completed flow's completion-only signal into its source's state.
+
+        The ordinary case: this source's state already exists (created by
+        `observe_new_connection` when this flow opened, or by an earlier
+        flow from the same source), so this only adds the completion-only
+        signal (`failure_count`) to it.
+
+        Fallback case: no state exists for this source at all — this flow's
+        creation-time signal was dropped under backpressure, its source was
+        LRU-evicted before completion, or the caller never sent a
+        creation-time signal in the first place (e.g. calling `analyze`
+        directly without going through `pirewall.runtime.core.CoreDaemon`'s
+        queue, as tests do). Rather than silently losing this flow's
+        evidence, this falls back to a full `observe()` — equivalent to
+        treating flow completion as this source's first-known signal, which
+        is the best information available in that case.
+        """
         state = self._sources.get(flow.source_ip)
+        if state is None:
+            state = self._get_or_create(flow.source_ip, flow.first_seen)
+            state.observe(flow)
+            return
+        self._sources.move_to_end(flow.source_ip)
+        state.observe_completion(flow)
+
+    def observe_flow(self, flow: Flow) -> None:
+        """Route one already-completed flow into its source IP's bounded behavior state.
+
+        Convenience for callers (tests, or anything that only ever sees
+        post-completion flows) that never got a creation-time signal for this
+        flow — see the module docstring. Production's own detection path
+        calls `observe_new_connection`/`observe_completion` separately.
+        """
+        state = self._get_or_create(source_ip=flow.source_ip, first_seen=flow.first_seen)
+        state.observe(flow)
+
+    def _get_or_create(self, source_ip: IPv4Address, first_seen: datetime) -> SourceBehaviorState:
+        state = self._sources.get(source_ip)
         if state is None:
             if len(self._sources) >= self._config.max_tracked_sources:
                 self._sources.popitem(last=False)
             state = SourceBehaviorState(
-                first_seen=flow.first_seen,
+                first_seen=first_seen,
                 max_destinations=self._config.max_tracked_destinations_per_source,
                 max_ports=self._config.max_tracked_ports_per_source,
                 max_recent=self._config.recent_connections_window,
             )
-            self._sources[flow.source_ip] = state
+            self._sources[source_ip] = state
         else:
-            self._sources.move_to_end(flow.source_ip)
-        state.observe(flow)
+            self._sources.move_to_end(source_ip)
+        return state
 
     def assess(self, source_ip: IPv4Address) -> BehaviorAssessment | None:
         """Assess `source_ip`'s currently tracked state, or `None` if nothing is tracked for it."""

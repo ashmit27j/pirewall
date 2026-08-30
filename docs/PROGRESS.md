@@ -1854,3 +1854,59 @@ length). `grep` for `lambda|gradient|hessian|boost|leaf` in
 `contamination`, chosen by a 5-candidate validation sweep — coarse tuning,
 not a divergence failure mode. Original explanation: commit `3ea9f87` and
 `docs/ML_DATA_AUDIT.md` §F.
+
+## ADDENDUM_2 pass — B1-B6 detection-timing redesign (2026-08-31 -)
+
+A second wave of deliberate architecture additions on top of
+`docs/ADDENDUM.md`'s A1-A8, recorded in `docs/ADDENDUM_2.md`. Full
+reasoning, implementation detail, and per-item test lists live there; this
+section tracks status/honesty labels only, updated per B-item as each is
+completed. This pass may span multiple sessions — see `docs/ADDENDUM_2.md`
+for what's actually built so far if this table looks incomplete.
+
+| Item | Status | Label |
+|------|--------|-------|
+| B1 Creation-time behavior counters | Complete | Tested — see below |
+| B2 Slow-rate aggregate signal | Not started | — |
+| B3 Evidence-maturity gate | Not started | — |
+| B4 Heartbleed detector | Not started | — |
+| B5 JA3 fingerprinting | Not started | — |
+| B6 Empirical sqlmap-pattern test | Not started | — |
+| §7 WAFFY scope boundary (docs only) | Not started | — |
+
+### B1 — Tested
+
+`pirewall.detection.behavior.SourceBehaviorState`/`BehaviorAnalyzer` split
+into `observe_new_connection` (creation-time) and `observe_completion`
+(completion-time only: `failure_count`), wired via a new
+`FlowAggregator(on_new_flow=...)` callback and a second bounded queue in
+`CoreDaemon` drained by the detection thread. Full design rationale, the
+no-double-counting argument, and the eviction/backpressure fallback are in
+`docs/ADDENDUM_2.md` B1 — not duplicated here.
+
+**Tested**: 4 new + 6 pre-existing (unmodified) tests in
+`tests/unit/test_behavior.py`; 2 new + 9 pre-existing (unmodified) tests in
+`tests/unit/test_flow_aggregator.py`. `ruff check .` and `pyright --strict`
+clean across the whole repo (not just touched files). Full suite: 559
+passed, 21 skipped, 1 pre-existing unrelated failure (see below) — same
+counts before and after this section's changes aside from the new tests.
+
+**Written, not executed this session**:
+`tests/integration/test_core_daemon.py::test_scanning_visible_through_a_completing_flow_while_scan_flows_stay_open`
+— a real-`CoreDaemon` end-to-end test proving 6 never-completed scan flows
+plus 1 completing flow produce a `ThreatAssessment` already carrying
+`SCANNING`. Lint/type-clean, but `tests/integration/test_core_daemon.py` is
+entirely gated on `hasattr(socket, "AF_UNIX")`, which this Windows dev
+session lacks — same pre-existing constraint as all 8 other tests already
+in that file. **Run this on the next macOS/Linux session** before treating
+it as verified; the unit-level tests above already exercise the same
+mechanism in isolation and did run.
+
+**Pre-existing, unrelated failure noted in passing, not fixed here**:
+`tests/security/test_firewall_base_template.py::test_management_access_restricted_to_admin_pc_placeholder`
+fails identically on a clean checkout before any of this pass's changes
+(confirmed via `git stash`) — the base nftables template's DNS (port 53)
+accept rule is scoped to `${PROTECTED_NETWORK}`, not `${ADMIN_PC_IP}`,
+which the test expects for every `tcp dport` accept line including DNS.
+Out of scope for this pass; flagging so it isn't mistakenly attributed to
+B1-B6.

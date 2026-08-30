@@ -73,7 +73,101 @@ through one per-flow-completion pipeline:
 
 ## B1. Decouple fast/volumetric behavioral detection from flow completion
 
-*(filled in when B1 is implemented — see the B1 commit)*
+**What:** `pirewall.detection.behavior`'s per-source rolling state
+(`SourceBehaviorState`) now updates in two places instead of one:
+
+* `observe_new_connection` (new) — folds in everything knowable the instant
+  a flow *opens*: destination, destination port, timestamp. This drives
+  `connection_count`, `destinations`, `ports`, `connections_per_destination`,
+  and `recent_connection_times` — every input the SCANNING, DESTINATION_
+  DIVERSITY, REPEATED_CONNECTIONS, HIGH_FREQUENCY, BURST, PERSISTENCE, and
+  TEMPORAL_PATTERN checks in `_assess_state` read.
+* `observe_completion` (new) — folds in the one signal that genuinely
+  cannot be known until a flow ends: `failure_count`, from
+  `backward_packet_count == 0`.
+* `observe_flow` (existing name, kept) — both of the above against one
+  already-completed `Flow` in a single call. Every pre-existing test in
+  `tests/unit/test_behavior.py` calls this and needed **zero changes** —
+  it reproduces the old behavior exactly. It's also the fallback
+  `observe_completion` uses when no creation-time state exists yet (see
+  "no double-counting" below).
+
+**Wiring:** `pirewall.flow.aggregator.FlowAggregator` gained an
+`on_new_flow: Callable[[NewFlowSignal], None] | None` constructor
+parameter, invoked exactly once per flow — right when a genuinely new
+`FlowKey` is inserted into the table, never on a later packet of the same
+flow, never on eviction or completion. `NewFlowSignal` is a plain frozen
+dataclass (source/destination/port/protocol/timestamp), not a Pydantic
+model — same category as `pirewall.capture.interfaces.CapturedPacket`:
+internal plumbing between layers, not a domain object crossing an API
+boundary (spec §9).
+
+This is a `Callable`, not an import, on purpose: `pirewall.flow` must not
+depend on `pirewall.detection` (`CLAUDE.md`'s "dependencies flow one
+direction" — capture -> flow/features -> detection -> engine -> firewall).
+`pirewall.runtime.core.CoreDaemon` (top of that chain, allowed to know
+about everything) is what actually connects the two: it enqueues each
+`NewFlowSignal` onto a new bounded `_new_flow_queue` from the **capture**
+thread, and a new `_drain_new_flow_signals` step in the **detection**
+thread's loop drains it into `DetectionCoordinator.behavior_analyzer.
+observe_new_connection` at least once per `_QUEUE_POLL_SECONDS` (0.5s).
+Routing through this second queue — rather than calling
+`BehaviorAnalyzer` directly from the capture thread — keeps `BehaviorAnalyzer`
+mutated from exactly one thread, same as before this change, with no new
+locking. `DetectionCoordinator.analyze` (still detection-thread-only, at
+flow completion) now calls `observe_completion`, never `observe_flow`.
+
+**Why the volumetric signals are safe to act on quickly, explicitly stated
+per the phase prompt's request:** every one of them is already an
+*aggregate, multi-observation* signal by construction, not a single-packet
+trigger — `scanning_port_threshold` (default 10 distinct ports),
+`repeated_connections_threshold` (20), `destination_diversity_threshold`
+(15), and `burst_count_threshold` (10) all require that many *distinct*
+qualifying observations from the same source before firing, regardless of
+whether those observations happen to be recorded at flow creation or flow
+completion. Moving *when* they update doesn't change *how much* evidence
+they require to fire — B3 below makes this an explicit, checked invariant
+rather than leaving it as something only true by inspection of today's
+threshold values.
+
+**No double-counting:** a real production flow gets exactly one
+`observe_new_connection` call (at creation, via the queue) and exactly one
+`observe_completion` call (at completion, via `DetectionCoordinator.analyze`)
+— `observe_completion` never re-adds to `destinations`/`ports`/
+`connection_count`, only `failure_count`. The one deliberate exception:
+if a flow's creation-time signal never arrived (dropped under new-flow-queue
+backpressure, or its source was LRU-evicted from `BehaviorAnalyzer` between
+creation and completion), `observe_completion` falls back to a full
+`observe()` rather than silently losing that flow's evidence — this is a
+*single* state, recreated fresh in the eviction case, so it cannot double
+anything that came before it.
+
+**Tested:**
+`tests/unit/test_behavior.py` (`test_scanning_detected_from_new_connections_before_any_completion`,
+`test_single_new_connection_triggers_nothing`,
+`test_observe_completion_before_any_new_connection_falls_back_to_full_observe`,
+`test_observe_completion_does_not_double_count_a_connection_already_observed`,
+plus all 6 pre-existing tests passing unmodified);
+`tests/unit/test_flow_aggregator.py` (`test_on_new_flow_fires_once_per_new_flow_not_per_packet`,
+`test_on_new_flow_fires_again_for_a_genuinely_new_flow_from_the_same_ports`,
+plus all 9 pre-existing tests passing unmodified);
+`tests/integration/test_core_daemon.py::test_scanning_visible_through_a_completing_flow_while_scan_flows_stay_open`
+— written against the real `CoreDaemon` (real capture thread, real detection
+thread, real queues, `FakePacketCapture`/`FakeFirewallBackend`), asserting
+that 6 never-completed scan flows plus 1 completing flow from the same
+source produce a `ThreatAssessment` (for the one flow that did complete)
+already carrying `SCANNING`, while `list_flows()` shows only that one flow
+ever completed — the literal claim of this section, exercised end to end.
+**This last test is written and lint/type-clean but not executed in this
+session**: `tests/integration/test_core_daemon.py` is entirely
+`skipif(not hasattr(socket, "AF_UNIX"))`-gated (pre-existing, all 8 other
+tests in that file are in the same state here) and this session ran on a
+Windows dev machine, which lacks `AF_UNIX`. It should be run on the next
+macOS/Linux session before relying on it.
+
+**Not changed:** the actual pattern thresholds/config fields, `_assess_state`
+itself, and `ThreatAssessment`/scoring — B1 only changes *when* the inputs
+to `_assess_state` are collected, not the detection logic itself.
 
 ## B2. New slow-rate aggregate detection signal
 

@@ -179,8 +179,15 @@ class DetectionCoordinator:
         `MODEL_ERROR` event) rather than losing the flow entirely. Behavior
         analysis is deterministic and has no external dependency, so it
         always contributes.
+
+        Only folds in this flow's *completion* signal (ADDENDUM_2.md B1) —
+        the *creation*-time volumetric signals were already folded in when
+        this flow was opened, via `pirewall.runtime.core.CoreDaemon` calling
+        `behavior_analyzer.observe_new_connection` directly from the capture
+        path. Calling `observe_flow` here instead would double-count every
+        real flow's connection.
         """
-        self._behavior.observe_flow(flow)
+        self._behavior.observe_completion(flow)
         known = self._classify_known(features, now)
         anomaly = self._detect_anomaly(features, now)
         record = DetectionRecord(

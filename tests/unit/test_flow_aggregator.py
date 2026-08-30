@@ -6,13 +6,13 @@ from pirewall.config.models import FlowConfig
 from pirewall.core.enums import AddressFamily, Protocol
 from pirewall.core.models.common import TcpFlags
 from pirewall.core.models.flow import Flow
-from pirewall.flow.aggregator import FlowAggregator
+from pirewall.flow.aggregator import FlowAggregator, NewFlowSignal, NewFlowSink
 from tests.helpers.flows import make_packet
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
 
-def _aggregator(**overrides: object) -> FlowAggregator:
+def _aggregator(on_new_flow: NewFlowSink | None = None, **overrides: object) -> FlowAggregator:
     defaults: dict[str, object] = {
         "active_timeout_seconds": 1800,
         "inactive_timeout_seconds": 60,
@@ -20,7 +20,7 @@ def _aggregator(**overrides: object) -> FlowAggregator:
         "cleanup_interval_seconds": 30,
     }
     defaults.update(overrides)
-    return FlowAggregator(FlowConfig.model_validate(defaults))
+    return FlowAggregator(FlowConfig.model_validate(defaults), on_new_flow=on_new_flow)
 
 
 def test_syn_then_ack_stays_open_until_completion() -> None:
@@ -120,6 +120,51 @@ def test_eviction_under_flood_emits_evicted_flow_and_stays_bounded() -> None:
 
     assert len(aggregator) == 10
     assert len(all_emitted) == 990  # every flow beyond the first 10 caused one eviction
+
+
+def test_on_new_flow_fires_once_per_new_flow_not_per_packet() -> None:
+    """ADDENDUM_2.md B1: the creation-time hook must fire exactly once per flow."""
+    signals: list[NewFlowSignal] = []
+    aggregator = _aggregator(on_new_flow=signals.append)
+
+    aggregator.process_packet(make_packet(timestamp=T0, tcp_flags=TcpFlags(syn=True)))
+    aggregator.process_packet(
+        make_packet(
+            source_ip="10.0.0.10",
+            destination_ip="10.0.0.5",
+            source_port=443,
+            destination_port=51234,
+            timestamp=T0 + timedelta(milliseconds=1),
+            tcp_flags=TcpFlags(syn=True, ack=True),
+        )
+    )
+    aggregator.process_packet(
+        make_packet(timestamp=T0 + timedelta(seconds=1), tcp_flags=TcpFlags(ack=True))
+    )
+
+    assert len(signals) == 1
+    signal = signals[0]
+    assert str(signal.source_ip) == "10.0.0.5"
+    assert str(signal.destination_ip) == "10.0.0.10"
+    assert signal.destination_port == 443
+    assert signal.protocol is Protocol.TCP
+    assert signal.timestamp == T0
+
+
+def test_on_new_flow_fires_again_for_a_genuinely_new_flow_from_the_same_ports() -> None:
+    signals: list[NewFlowSignal] = []
+    aggregator = _aggregator(on_new_flow=signals.append)
+
+    aggregator.process_packet(make_packet(source_port=51234, destination_port=443, timestamp=T0))
+    aggregator.process_packet(
+        make_packet(
+            source_port=51235,
+            destination_port=443,
+            timestamp=T0 + timedelta(milliseconds=1),
+        )
+    )
+
+    assert len(signals) == 2
 
 
 def test_udp_flow_produces_expected_protocol_on_finalization() -> None:

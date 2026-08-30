@@ -113,6 +113,70 @@ def test_repeated_ssh_connections_flags_repeated_connections_and_failures() -> N
     assert BehaviorPatternType.REPEATED_FAILURES in assessment.detected_patterns
 
 
+def test_scanning_detected_from_new_connections_before_any_completion() -> None:
+    """ADDENDUM_2.md B1: the volumetric signal must not need a single completed flow."""
+    config = _config(scanning_port_threshold=5, destination_diversity_threshold=100)
+    analyzer = BehaviorAnalyzer(config)
+
+    for port in range(1000, 1010):
+        analyzer.observe_new_connection(
+            IPv4Address("203.0.113.5"), IPv4Address("10.0.0.20"), port, T0
+        )
+
+    assessment = analyzer.assess(IPv4Address("203.0.113.5"))
+
+    assert assessment is not None
+    assert BehaviorPatternType.SCANNING in assessment.detected_patterns
+
+
+def test_single_new_connection_triggers_nothing() -> None:
+    """The pattern threshold, not a single observation, is what may act (ADDENDUM_2.md B1/B3)."""
+    config = _config(scanning_port_threshold=5)
+    analyzer = BehaviorAnalyzer(config)
+
+    analyzer.observe_new_connection(IPv4Address("203.0.113.6"), IPv4Address("10.0.0.21"), 22, T0)
+
+    assessment = analyzer.assess(IPv4Address("203.0.113.6"))
+
+    assert assessment is not None
+    assert assessment.detected_patterns == ()
+
+
+def test_observe_completion_before_any_new_connection_falls_back_to_full_observe() -> None:
+    """A flow whose creation-time signal never arrived (dropped/evicted) must not lose its evidence."""
+    analyzer = BehaviorAnalyzer(_config())
+    assert len(analyzer) == 0
+
+    analyzer.observe_completion(make_flow(source_ip="203.0.113.8", first_seen=T0))
+
+    assert len(analyzer) == 1
+    assessment = analyzer.assess(IPv4Address("203.0.113.8"))
+    assert assessment is not None
+
+
+def test_observe_completion_does_not_double_count_a_connection_already_observed() -> None:
+    """The same flow's creation and completion signals must count as exactly one connection."""
+    config = _config(repeated_connections_threshold=2)
+    analyzer = BehaviorAnalyzer(config)
+
+    analyzer.observe_new_connection(
+        IPv4Address("203.0.113.9"), IPv4Address("10.0.0.22"), 443, T0
+    )
+    analyzer.observe_completion(
+        make_flow(
+            source_ip="203.0.113.9",
+            destination_ip="10.0.0.22",
+            destination_port=443,
+            first_seen=T0,
+            backward_packet_count=4,
+        )
+    )
+
+    assessment = analyzer.assess(IPv4Address("203.0.113.9"))
+    assert assessment is not None
+    assert BehaviorPatternType.REPEATED_CONNECTIONS not in assessment.detected_patterns
+
+
 def test_assess_unknown_source_returns_none() -> None:
     analyzer = BehaviorAnalyzer(_config())
     assert analyzer.assess(IPv4Address("192.0.2.1")) is None

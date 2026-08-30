@@ -6,13 +6,25 @@ at all, so IPv6 traffic never reaches feature extraction or ML. It can
 still be counted upstream in capture statistics (Phase 2); this module just
 never emits an IPv6 `Flow` because `pirewall.core.models.Flow` structurally
 cannot represent one.
+
+**`on_new_flow` (ADDENDUM_2.md B1).** Fires once per flow, at creation —
+the only point volumetric behavioral signals (scanning, destination
+diversity, burst rate) actually need, since they're derived from connection
+metadata that's fully known from the first packet. This is a plain
+`Callable`, not an import of anything from `pirewall.detection`: the flow
+layer must not depend on the detection layer (`CLAUDE.md`'s "dependencies
+flow one direction"). Whatever wires the two together at runtime
+(`pirewall.runtime.core.CoreDaemon`) supplies the callback.
 """
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from ipaddress import IPv4Address
 from uuid import uuid4
 
 from pirewall.config.models import FlowConfig
+from pirewall.core.enums import Protocol
 from pirewall.core.models.flow import Flow
 from pirewall.core.models.packet import PacketMetadata
 from pirewall.flow.key import compute_flow_key
@@ -20,13 +32,38 @@ from pirewall.flow.state import FlowState, FlowTable
 from pirewall.flow.timeout import check_closure
 
 
+@dataclass(frozen=True, slots=True)
+class NewFlowSignal:
+    """Everything knowable about a flow the instant its first packet arrives.
+
+    Deliberately not a Pydantic domain model (spec §9 lists `Flow`/
+    `PacketMetadata` as the domain objects that cross a subsystem boundary;
+    this is internal plumbing between the flow and detection layers, same
+    category as `pirewall.capture.interfaces.CapturedPacket`).
+    """
+
+    source_ip: IPv4Address
+    destination_ip: IPv4Address
+    destination_port: int | None
+    protocol: Protocol
+    timestamp: datetime
+
+
+type NewFlowSink = Callable[[NewFlowSignal], None]
+
+
 class FlowAggregator:
     """Routes packets into a bounded flow table and emits completed/expired flows."""
 
-    def __init__(self, config: FlowConfig) -> None:
+    def __init__(
+        self,
+        config: FlowConfig,
+        on_new_flow: NewFlowSink | None = None,
+    ) -> None:
         self._table = FlowTable(max_flows=config.max_flows)
         self._active_timeout_seconds = float(config.active_timeout_seconds)
         self._inactive_timeout_seconds = float(config.inactive_timeout_seconds)
+        self._on_new_flow = on_new_flow
 
     def __len__(self) -> int:
         """Number of flows currently open in the table."""
@@ -58,6 +95,16 @@ class FlowAggregator:
         state = self._table.get(key)
         if state is None:
             state = FlowState.opening(key, packet)
+            if self._on_new_flow is not None:
+                self._on_new_flow(
+                    NewFlowSignal(
+                        source_ip=packet.source_ip,
+                        destination_ip=packet.destination_ip,
+                        destination_port=packet.destination_port,
+                        protocol=packet.protocol,
+                        timestamp=packet.timestamp,
+                    )
+                )
             evicted = self._table.insert(key, state)
             if evicted is not None:
                 emitted.append(self._finalize(evicted))

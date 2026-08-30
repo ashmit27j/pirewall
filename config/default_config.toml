@@ -97,6 +97,14 @@ known_attack_weight = 60.0
 anomaly_weight = 15.0
 behavior_weight = 25.0
 
+# ADDENDUM_2.md B3 — evidence-maturity gate. A source whose evidence never
+# qualifies on its own (no completed-flow classification, no
+# multi-observation behavioral pattern) can still reach BLOCK/RATE_LIMIT if
+# the same elevated reading recurs for this many consecutive assessment
+# windows.
+evidence_maturity_consistency_windows = 3
+max_tracked_maturity_sources = 10000
+
 [firewall]
 # See docs/ADDENDUM.md for the letter references below.
 enforcement_mode = "shadow"              # A1 — SHADOW is the required default for a first deployment.

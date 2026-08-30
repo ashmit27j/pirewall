@@ -143,6 +143,16 @@ class ThreatConfig(PirewallModel):
     anomaly_weight: float = Field(default=15.0, ge=0.0, le=100.0)
     behavior_weight: float = Field(default=25.0, ge=0.0, le=100.0)
 
+    # ADDENDUM_2.md B3 — the evidence-maturity gate. A source whose evidence
+    # never qualifies on its own (no completed-flow classification, no
+    # multi-observation behavioral pattern — e.g. anomaly evidence alone)
+    # can still reach BLOCK/RATE_LIMIT if the same elevated reading recurs
+    # for this many *consecutive* independent assessment windows.
+    # `max_tracked_maturity_sources` bounds that tracker's memory the same
+    # way `pirewall.detection.behavior`'s state is bounded.
+    evidence_maturity_consistency_windows: int = Field(default=3, gt=0)
+    max_tracked_maturity_sources: int = Field(default=10_000, gt=0)
+
     @model_validator(mode="after")
     def _check_ascending(self) -> "ThreatConfig":
         thresholds = (

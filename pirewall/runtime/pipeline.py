@@ -44,7 +44,7 @@ from pirewall.core.exceptions import FeatureExtractionError, PirewallError
 from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.flow import Flow
 from pirewall.detection.coordinator import DetectionCoordinator
-from pirewall.engine.decision import decide
+from pirewall.engine.decision import EvidenceMaturityTracker, decide
 from pirewall.engine.threat import assess_threat
 from pirewall.features.extractor import extract_features
 from pirewall.firewall.generator import generate_candidate_rule
@@ -81,6 +81,9 @@ class FlowPipeline:
         self._state = state
         self._forwarder = forwarder
         self._counters = counters
+        # ADDENDUM_2.md B3 — detection-thread-only, same as everything else
+        # this class owns; no locking needed.
+        self._maturity_tracker = EvidenceMaturityTracker.from_config(config.threat)
         # The same lock `CoreDaemon` gives the RPC dispatcher: this thread
         # mutates `CoreStateStore` and `FirewallManager` while the RPC
         # thread reads both to answer `/status`, `/rules`, `/threats`.
@@ -122,7 +125,7 @@ class FlowPipeline:
             behavior_assessment=outcome.behavior,
             assessed_at=now,
         )
-        decision = decide(assessment, now)
+        decision = decide(assessment, now, self._maturity_tracker)
 
         with self._lock:
             self._state.record_detection(outcome.record)

@@ -1868,7 +1868,7 @@ for what's actually built so far if this table looks incomplete.
 |------|--------|-------|
 | B1 Creation-time behavior counters | Complete | Tested — see below |
 | B2 Slow-rate aggregate signal | Complete | Tested — see below |
-| B3 Evidence-maturity gate | Not started | — |
+| B3 Evidence-maturity gate | Complete | Tested — see below |
 | B4 Heartbleed detector | Not started | — |
 | B5 JA3 fingerprinting | Not started | — |
 | B6 Empirical sqlmap-pattern test | Not started | — |
@@ -1935,3 +1935,27 @@ unrelated failure noted under B1.
 **Written, not executed this session** (same `AF_UNIX`-on-Windows gap as
 B1): `tests/integration/test_core_daemon.py::test_slow_rate_dos_detected_without_waiting_for_connections_to_close_or_time_out`.
 Run on the next macOS/Linux session, alongside B1's equivalent test.
+
+### B3 — Tested
+
+New `EvidenceMaturityTracker` + gate in `pirewall.engine.decision.decide`:
+`BLOCK`/`RATE_LIMIT` now require "mature" evidence (a completed-flow
+classification, a multi-observation behavioral pattern, or a consistent
+multi-window reading from the same source), else the decision downgrades
+to `MONITOR`. Full rationale, why it lives in `decision.py` rather than
+`validator.py`, and the arithmetic proof that this doesn't regress any
+scenario already reachable under today's scoring weights are in
+`docs/ADDENDUM_2.md` B3.
+
+**Tested**: `tests/unit/test_decision.py` rewritten — the pre-existing
+`test_high_maps_to_rate_limit`/`test_critical_maps_to_block` were renamed
+and given realistic (evidence-carrying) assessments, matching what real
+detection actually produces, since a bare threat_level with no evidence
+was never a real scenario the old tests represented accurately; 6 new
+tests cover the downgrade-to-MONITOR case, path (b) alone, and the
+consistency tracker (including per-source isolation). `ruff check .` and
+`pyright --strict` clean across the whole repo. Full suite: 571 passed, 22
+skipped, the same 1 pre-existing unrelated failure noted under B1 — no
+other test in the repo needed a change, confirming the invariant's blast
+radius is exactly what B3's own arithmetic predicted (nothing that already
+carries real evidence is affected).

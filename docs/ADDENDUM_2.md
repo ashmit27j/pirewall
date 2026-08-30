@@ -273,7 +273,69 @@ macOS/Linux session.
 
 ## B3. Explicit maturity/evidence-based action-capping invariant
 
-*(filled in when B3 is implemented — see the B3 commit)*
+**What:** a real, named, testable invariant in `pirewall.engine.decision`:
+no `ThreatAssessment` may produce a `BLOCK` or `RATE_LIMIT`
+`FirewallDecision` unless it carries "mature" evidence, defined as exactly
+one of:
+
+* **(a)** a completed flow's known-attack classification
+  (`known_evidence is not None`) — conclusive by what it *is*;
+* **(b)** a behavioral pattern that already requires multiple independent
+  observations by construction (`behavior_assessment.detected_patterns`
+  non-empty) — every current `BehaviorPatternType` qualifies, including B2's
+  new `SLOW_RATE_DOS`;
+* **(c)** the same weak-but-elevated reading from the same source, recurring
+  across `ThreatConfig.evidence_maturity_consistency_windows` (default 3)
+  consecutive independent assessment windows that failed (a)/(b) —
+  `EvidenceMaturityTracker`, a new bounded (LRU, same shape as
+  `BehaviorAnalyzer`) per-source counter.
+
+Anything reaching `BLOCK`/`RATE_LIMIT` without meeting one of these is
+downgraded to `MONITOR` — never silently dropped, never re-scored, just
+capped to the next mildest action, same ladder the rest of the module
+already uses.
+
+**Where it lives, and why:** `pirewall.engine.decision`, not
+`pirewall.firewall.validator`. By the time a candidate rule reaches the
+validator, its `action` (BLOCK/RATE_LIMIT/etc.) is already baked in from
+the `FirewallDecision` that generated it (`pirewall.firewall.generator`
+just copies `decision.action`) — downgrading at the validator stage would
+mean either rejecting an otherwise-valid candidate outright (losing the
+MONITOR-level visibility entirely) or regenerating a different candidate
+from a different action mid-validation, which the validator's chain isn't
+shaped for. Capping the action *before* a candidate rule is ever generated
+means nothing downstream — generator, validator, manager, backend — ever
+sees an immature BLOCK/RATE_LIMIT at all.
+
+**Confirming this doesn't weaken anything already trusted** (the phase
+prompt's explicit ask): under the current scoring weights
+(`known_attack_weight=60`, `anomaly_weight=15`, `behavior_weight=25`,
+`docs/ML_PIPELINE.md`), the maximum score reachable with *neither* (a) nor
+(b) is `known_attack_weight + anomaly_weight = 75` — exactly
+`high_threshold`, never `critical_threshold` (90) — and `known_evidence`
+being present at all already satisfies (a). So today, path (c) is the
+*only* way anything reaches `CRITICAL`/`BLOCK` without already qualifying
+under (a) or (b); every completed-flow classification and every
+volumetric-pattern scenario from earlier phases' tests is unaffected,
+confirmed by `tests/unit/test_decision.py::test_high_maps_to_rate_limit_with_mature_evidence`
+/ `test_critical_maps_to_block_with_mature_evidence` (realistic,
+evidence-carrying HIGH/CRITICAL scenarios — the same shape real detection
+actually produces) and `test_behavior_pattern_alone_is_sufficient_for_block`
+still producing `RATE_LIMIT`/`BLOCK` as before. This is a safety net for a
+future retrain or threshold change, not a new bottleneck on today's
+detection.
+
+**Tested:** `tests/unit/test_decision.py` — `test_high_without_mature_evidence_downgrades_to_monitor`
+/ `test_critical_without_mature_evidence_downgrades_to_monitor` (the
+literal "genuinely insufficient evidence, regardless of raw score" case
+the phase prompt asked for), `test_consistency_tracker_grants_maturity_after_enough_windows`
+(the 3rd of 3 consecutive weak windows from the same source flips
+MONITOR->MONITOR->BLOCK), `test_consistency_tracker_is_per_source` (a
+second source's first observation doesn't inherit another source's
+streak), plus the "still produces BLOCK/RATE_LIMIT correctly" tests above.
+`ruff check .` and `pyright --strict` clean across the whole repo; full
+suite 571 passed, 22 skipped, the same 1 pre-existing unrelated failure
+noted under B1.
 
 ## B4. Heartbleed detector — TLS record-layer length check
 

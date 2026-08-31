@@ -141,6 +141,94 @@ imports `engine`, because that would invert `detection -> engine ->
 firewall`. The pipeline is what carries evidence across each boundary, and
 it holds no detection, scoring, or rule logic of its own.
 
+## Batched anomaly scoring (ADDENDUM_2 follow-up pass, section 3)
+
+`benchmarks/2026-08-30/REPORT.md` §3-4 measured single-flow Isolation
+Forest scoring at **30.7 ms/call on a real Pi 4 — 92% of total
+packet-to-decision cost** — and traced that cost to scikit-learn's own
+fixed per-call overhead, not tree traversal: a follow-up quick benchmark
+(`benchmarks/2026-08-31-anomaly-batching/quick_benchmark.py`, run on this
+session's dev/CI hardware, *not* a Pi — no real Pi 4 was reachable this
+session) found `decision_function`'s call cost is ~3.2-3.4 ms regardless of
+batch size 1 through 100, so scoring 100 flows in one call costs about the
+same wall time as scoring 1. Batching amortizes that fixed cost across
+every flow in the batch instead of paying it once per flow.
+
+**Where this lives, and why it's a fourth thread, not a fourth
+responsibility bolted onto the detection thread:** the same reasoning
+`CoreDaemon`'s own module docstring already gives for splitting capture
+from detection — two stages that run at wildly different speeds must not
+share a thread, or the slow one stalls the fast one — applies again between
+detection and anomaly scoring. `pirewall.runtime.pipeline.FlowPipeline`
+gained a `process`/`finish` split: `process` (called from the detection
+thread, as before) now runs known-attack classification and behavior
+analysis inline, then — only when an Isolation Forest model is loaded —
+hands the flow off to an injected `anomaly_scorer` callback instead of
+scoring inline, and returns immediately; `finish` (a new, separately
+error-handled entry point) does the rest — `assess_threat` through
+`FirewallManager.submit_candidate` — once that flow's anomaly evidence is
+ready. `pirewall.detection.coordinator.DetectionCoordinator` gained the
+matching split: `analyze_except_anomaly` (known + behavior only) and a
+module-level `with_anomaly_evidence` combinator that folds a separately
+obtained `AnomalyEvidence | None` back into the outcome `analyze_except_anomaly`
+produced. `analyze` itself is now defined as exactly that composition, so
+the non-batched path (no Isolation Forest loaded, or any direct caller —
+`tests/unit/test_detection_coordinator.py`'s tests all still call `analyze`
+unchanged) is provably identical to before this section existed.
+
+`pirewall.runtime.core.CoreDaemon` owns the actual batching machinery, same
+place B1/B2's `_new_flow_queue`/`_slow_cluster_queue` live, for the same
+reason (`pirewall.flow`/`pirewall.detection` must not depend on
+`threading`; `runtime` is the one package allowed to know about all of
+capture/flow/detection/engine/firewall *and* how they're scheduled onto
+threads):
+
+* A new bounded `_anomaly_queue`, written by the detection thread
+  (`_enqueue_anomaly_scoring`, called from `FlowPipeline.process` via the
+  injected callback) and drained by a new dedicated
+  `pirewall-anomaly-inference` thread — only spawned when
+  `DetectionCoordinator.models.isolation_forest is not None` (`start()`);
+  when no model is loaded, `anomaly_scorer` is never injected in the first
+  place and `FlowPipeline.process` behaves exactly as it always did,
+  single-flow, synchronous, no queue involved at all.
+* `_collect_anomaly_batch` flushes on **size or timeout, whichever comes
+  first**: it collects up to `detection.anomaly_batch_size` (default 50)
+  flows, but never waits past `detection.anomaly_batch_max_wait_seconds`
+  (default 0.2 s) from when the first flow of that batch arrived. This is
+  what bounds worst-case *added* per-flow latency under low load to a few
+  hundred milliseconds rather than however long it takes a batch to fill —
+  the same requirement the phase prompt for this section stated explicitly.
+* `_score_and_finish_batch` calls the new
+  `pirewall.detection.anomaly.detect_batch` /
+  `pirewall.ml.inference.isolation_forest_predictor.anomaly_score_batch`
+  once per batch (one `decision_function` call, N feature rows stacked),
+  then calls `FlowPipeline.finish` once per flow in the batch — every flow
+  still gets its own `ThreatAssessment`/`FirewallDecision`/candidate-rule
+  cycle, exactly as before; only *when* the anomaly half of its evidence
+  was computed changed.
+* **Same bounded-drop discipline as every other cross-thread queue here,
+  but a different, milder failure mode.** `_enqueue_anomaly_scoring` drops
+  on `queue.Full` exactly like `_enqueue`/`_handle_new_flow` do for their
+  own queues — but because known-attack and behavioral evidence were
+  already computed inline before the handoff, a drop here does not lose
+  the flow: it finishes immediately via `FlowPipeline.finish` with
+  `anomaly_evidence` left `None`, so the flow still reaches a real
+  `ThreatAssessment`, just without an Isolation Forest score. Tracked by
+  its own `RuntimeCounters.anomaly_scores_dropped_for_backpressure` field
+  and its own rate-limited `SecurityEvent`, deliberately distinct from
+  `flows_dropped_for_backpressure` (a flow never assessed at all) and from
+  the packet-level `packets_dropped` counter (section 2 of this same
+  follow-up pass) — three genuinely different failure modes, three
+  separate signals, not one drop counter standing in for all of them.
+
+**The module-boundary diagram above is unchanged, deliberately, not by
+oversight.** The new thread is entirely internal to `runtime` — it calls
+`pirewall.detection.anomaly`/`pirewall.ml.inference`, both of which
+`runtime` already depended on before this section, and it introduces no new
+cross-package edge. What changed is *scheduling* (a fourth `pirewall-core`
+thread) and a `runtime.pipeline` API split (`process`/`finish`), not the
+dependency graph.
+
 This file exists per `CLAUDE.md`'s dependency policy: "Anything else [beyond
 the allowed dependency list] — ask first, and say why here." It records
 places where a phase needed something beyond the base list, and why the
@@ -314,3 +402,11 @@ implemented in this repository, and nothing here depends on it existing.
 The two are meant to compose: pirewall covers the network perimeter and
 the traffic patterns visible there, WAFFY covers per-host application
 content the same traffic carries.
+
+**Update (Pi deployment readiness pass):** WAFFY has since become a real,
+deployment-ready sibling system (per the human operator) rather than a
+referenced-but-unbuilt one — this does not change the scope-boundary
+argument above, which remains the deliberate architecture decision; see
+`docs/DEPLOYMENT.md` §10 for the operational coexistence notes this
+prompted (where each one runs, and the open question on WAFFY's own
+firewall/port footprint that only WAFFY's own docs can answer).

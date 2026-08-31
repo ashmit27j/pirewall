@@ -1446,8 +1446,14 @@ dataset file locations, Admin PC IP, actual WAN/LAN interface names).
   `docs/DEPLOYMENT_COMPLETE.md`.
 
 
-- **Phase 9 — Control Panel gap: "network statistics" — plumbing now
-  done, rendering still open.** The entry-point session added the whole
+- ~~**Phase 9 — Control Panel gap: "network statistics" — plumbing now
+  done, rendering still open.**~~ — **RESOLVED by the Pi deployment
+  readiness pass, section 1.** `_render_network_section` and the extra
+  `rpc_client.get_capture_stats()` call now exist exactly as this note's
+  own recommended follow-up described. See that section for the tests.
+  Original note follows, kept for history.
+
+  The entry-point session added the whole
   data path this note asked for: `CoreStateStore.capture_stats` +
   `record_capture_stats()`, a `GET_CAPTURE_STATS` RPC operation, a typed
   `BaseRpcClient.get_capture_stats()`, and `GET /api/v1/capture-stats` —
@@ -1479,7 +1485,13 @@ dataset file locations, Admin PC IP, actual WAN/LAN interface names).
   copy the pattern directly once `pirewall/main.py` exists to call
   `record_capture_stats()` periodically.
 
-- **Phase 9 — Control Panel gap: "detections" section not rendered.**
+- ~~**Phase 9 — Control Panel gap: "detections" section not rendered.**~~
+  — **RESOLVED by the Pi deployment readiness pass, section 1.**
+  `_render_detections_section` and the extra `rpc_client.list_detections()`
+  call now exist exactly as this note's own recommended follow-up
+  described. See that section for the tests. Original note follows, kept
+  for history.
+
   `GET /api/v1/detections` exists and is Tested, but
   `pirewall.web.routes.dashboard` never calls `rpc_client.list_detections()`
   and `render_dashboard` has no detections parameter/section — the raw
@@ -1492,7 +1504,18 @@ dataset file locations, Admin PC IP, actual WAN/LAN interface names).
   structure, and one extra `rpc_client.list_detections()` call in
   `pirewall.web.routes.dashboard`.
 
-- **Pi 4 anomaly-scoring throughput — needs a design decision.** Anomaly
+- ~~**Pi 4 anomaly-scoring throughput — needs a design decision.**~~ —
+  **RESOLVED (implementation) by the Pi deployment readiness pass, section
+  3; real-Pi verification still needed — see that section's go/no-go
+  checklist.** Batched scoring (option 2 below, chosen exactly as
+  recommended) is implemented, tested, and wired into the real running
+  daemon via a new dedicated `pirewall-anomaly-inference` thread; the
+  benchmark backing the batch-size/flush-timeout defaults was re-run this
+  session but only on dev/CI hardware, not the real Pi 4 the "UPDATE
+  2026-08-30" entry below measured. Original note follows, kept for
+  history.
+
+  Anomaly
   detection scores **one flow per `IsolationForest.decision_function`
   call**. Measured on the dev machine, that is ~15.6 ms/call at
   `n_estimators=100`, versus ~0.088 ms/flow when the same forest scores a
@@ -2223,3 +2246,368 @@ ran here and both its tests (the fixed original, plus the new one) pass.
 `tests/integration/test_core_daemon.py` specifically** to confirm the
 queue-drain fix also closes the originally-reported failure there, not
 just its Windows-runnable proxy.
+
+## Pi deployment readiness pass (sections 1-5, post ADDENDUM_2 B1-B6)
+
+Closes the specific, real gaps between the B1-B6 pass above and an honest
+"ready to deploy on the Pi" — five independently scoped pieces of work
+bundled into one session because they were individually too small to
+justify their own sessions. Each is reported separately below per the
+session prompt's own scope boundaries.
+
+**This is also the first session in this repository's history to run on a
+real POSIX machine from the start**, closing the exact gap the "Post-pass
+audit session" above warns about (a Windows session silently skipping
+`tests/integration/test_core_daemon.py` via the `AF_UNIX` gate). The dev
+machine itself is still Windows, but this session set up and used a
+working Ubuntu WSL2 distro for every verification command — see section 0.
+
+### 0. Re-verification — real POSIX, real numbers, not trusted from the prompt
+
+Per this project's own honesty discipline, no pass/fail claim from the
+session prompt or `docs/PROGRESS.md` was trusted before independently
+re-confirming it:
+
+- `python3 -c "import socket; print(hasattr(socket, 'AF_UNIX'))"` on this
+  Windows machine's native Python prints `False` — this machine fails the
+  session's own POSIX gate exactly as flagged. Rather than stopping the
+  session there, an Ubuntu WSL2 distro was installed and made to work (an
+  initial `wsl -d Ubuntu` call failed with `WSL_E_UNEXPECTED` — fixed by
+  `wsl --update`, which jumped the platform from 2.3.26 to 2.7.12; then
+  `lightgbm` failed to import with `OSError: libgomp.so.1: cannot open
+  shared object file` — fixed by `apt-get install libgomp1`, absent from a
+  stock Ubuntu WSL image). Confirmed `AF_UNIX` is `True` inside that
+  distro before running anything else.
+- Fresh `uv sync`, `uv run ruff check .`, `uv run pyright`, and
+  `uv run pytest -q`, run for real inside that distro, before any of this
+  session's own changes: **`ruff` clean, `pyright` 0 errors, `pytest`
+  644 passed, 0 skipped, 0 failed** — matching the prior session's own
+  claimed count exactly, and for the first time genuinely including
+  `tests/integration/test_core_daemon.py` and every other `AF_UNIX`-gated
+  test actually executing rather than being silently skipped.
+
+### 1. Control Panel rendering gaps — Tested
+
+Both Phase 9 "Open questions for the human" gaps closed. Both were
+rendering-only, per the session prompt's own framing — the RPC/API data
+path (`GET /api/v1/capture-stats`, `GET /api/v1/detections`) already
+existed and was already Tested.
+
+- `pirewall.web.render._render_network_section` (new) and
+  `_render_detections_section`/`_detection_evidence_summary` (new), mirroring
+  `_render_threats_section`'s structure and this module's documented
+  per-context escaping rules exactly — no new `data-` attribute wiring was
+  needed, since neither section has any interactive action buttons.
+- `render_dashboard` gained `capture_stats: CaptureStatistics | None` and
+  `detections: list[DetectionRecord]` parameters (appended at the end of
+  the existing parameter list, to minimize churn to already-passing
+  callers); `pirewall.web.routes.dashboard` gained the two extra RPC calls
+  (`rpc_client.get_capture_stats()`, `rpc_client.list_detections()`).
+
+**Tested**: 8 new tests in `tests/unit/test_web_render.py` (every existing
+`render_dashboard` call site updated for the two new parameters, plus new
+cases for populated/empty network stats and populated/empty detections);
+1 new integration-style test in `tests/unit/test_api_routes.py`
+(`test_dashboard_renders_network_statistics_and_detections`) that
+populates `CoreStateStore` directly and asserts the real HTML response
+from a full `TestHarness` contains both sections' data — not just that the
+render function alone works. `docs/PROGRESS.md`'s Phase 9 "Open questions
+for the human" entries for both gaps are now resolved by this section (not
+separately struck through below, to avoid duplicating the same fix in two
+places — see this section instead).
+
+### 2. `CaptureStatistics.packets_dropped` cumulative-counter bug — Tested
+
+Confirmed, real bug from `benchmarks/2026-08-30/REPORT.md` §4: the kernel
+zeroes `PACKET_STATISTICS`' `tp_drops` on every `getsockopt` read, so
+`AFPacketCapture._read_kernel_drops` was re-exporting a per-read delta as
+if it were a lifetime total — a dashboard differencing consecutive
+readings as a counter would see it go up and down and compute a negative
+rate. Fixed by accumulating each read's delta into a new
+`self._packets_dropped_cumulative` running counter and returning that,
+never resetting it (including on a transient `getsockopt` failure or
+before the socket is open, both of which now return the last known
+cumulative total rather than `0`, so a temporary read failure can't make
+the exported figure go backwards either). The underlying `getsockopt` call
+itself is unchanged, per the session prompt's own instruction — the
+reset-on-read kernel behavior is real and can't be avoided, only accounted
+for correctly.
+
+**Tested**: `tests/unit/test_af_packet_capture.py` (new, 3 tests) —
+simulates the kernel's reset-on-read behavior via a fake stats socket
+standing in for `capture._socket`, asserting two consecutive reads
+reporting 5 then 3 total 8 (not 3), a longer four-read sequence never
+decreases, and the figure is `0` before any socket is open. `AFPacketCapture`
+itself (the real `AF_PACKET` socket, `start()`/`bind()`) remains
+Environment-dependent as before — only `_read_kernel_drops`'s accumulation
+logic is exercised here, via a fake socket object, not a real interface.
+
+### 3. Anomaly-scoring batching — Tested, dev-hardware benchmark only
+
+**3a. Quick benchmark, dev/CI hardware, explicitly not a Pi.** No real Pi 4
+was reachable this session. `benchmarks/2026-08-31-anomaly-batching/quick_benchmark.py`
+measured `IsolationForest.decision_function` against the real, shipped
+v0.2.0 artifact at batch sizes 1/10/25/50/100, on this session's WSL2
+Ubuntu environment (a Linux VM on the Windows dev machine, x86_64 — **not**
+ARM, **not** a Pi, and a different machine again from the "dev machine"
+`docs/PROGRESS.md`'s earlier ~15.6 ms/call figure came from):
+
+  | batch_size | ms/call | ms/flow | flows/sec |
+  |---|---|---|---|
+  | 1 | 3.2734 | 3.2734 | 305.5 |
+  | 10 | 3.1843 | 0.3184 | 3140.4 |
+  | 25 | 3.2345 | 0.1294 | 7729.3 |
+  | 50 | 3.3083 | 0.0662 | 15113.5 |
+  | 100 | 3.4161 | 0.0342 | 29273.0 |
+
+  Confirms the earlier finding's shape exactly: call cost is ~3.2-3.4 ms
+  regardless of batch size in this range — fixed per-call overhead, not
+  tree traversal — so batching is the correct fix, not fewer trees (already
+  ruled out on the real Pi in the prior benchmark). Chosen from these
+  numbers: `detection.anomaly_batch_size = 50` (diminishing returns past
+  this point — 50→100 only gains ~1.9x while 1→50 gains ~49x — and 50 keeps
+  worst-case batch-fill memory/latency modest) and
+  `detection.anomaly_batch_max_wait_seconds = 0.2` (a few hundred
+  milliseconds, per the session prompt's own bound, chosen independently of
+  the batch-size number since the flush timer is what actually bounds
+  worst-case added latency under low load, not the batch size).
+
+**3b. Design.** New dedicated `pirewall-anomaly-inference` thread in
+  `CoreDaemon`, only spawned when an Isolation Forest model is loaded; fed
+  by a new bounded `_anomaly_queue`; `pirewall.runtime.pipeline.FlowPipeline`
+  split into `process`/`finish` (`process` runs known-attack + behavior
+  inline and hands off to `finish` either synchronously, when no batching
+  is configured, or later, from the inference thread, once a batch is
+  scored); `pirewall.detection.coordinator.DetectionCoordinator` gained the
+  matching `analyze_except_anomaly`/`with_anomaly_evidence` split, with
+  `analyze` now defined as exactly that composition (behavior-preserving by
+  construction, confirmed by a dedicated test — see 3d). Full design
+  writeup, including exactly how this interacts with `CoreDaemon`'s
+  existing B1/B2 queues and why the module-boundary diagram is unchanged,
+  is in `docs/ARCHITECTURE.md`'s new "Batched anomaly scoring" section —
+  not duplicated here.
+
+**3c. Backpressure.** A full `_anomaly_queue` degrades gracefully rather
+  than losing the flow: `_enqueue_anomaly_scoring` drops the *anomaly*
+  request on `queue.Full` and finishes the flow immediately with
+  `anomaly_evidence` left `None` — known-attack and behavioral evidence
+  were already computed inline before the handoff, so the flow still gets
+  a real `ThreatAssessment`. Tracked by a new, separate
+  `RuntimeCounters.anomaly_scores_dropped_for_backpressure` counter and its
+  own rate-limited `SecurityEvent` (`"anomaly-scoring queue full; N
+  flow(s) finished without an anomaly score"`), deliberately distinct from
+  `flows_dropped_for_backpressure` (a flow never assessed at all) and from
+  section 2's packet-level `packets_dropped` — three different failure
+  modes, three separate signals.
+
+**3d. Implementation.** New pure batched-scoring functions reusing 100% of
+  the existing single-flow evidence-building logic:
+  `pirewall.ml.inference.isolation_forest_predictor.anomaly_score_batch`
+  and `pirewall.detection.anomaly.detect_batch`. New config fields
+  `detection.anomaly_batch_size`/`anomaly_batch_max_wait_seconds` (defaults
+  from 3a). No new dependency — batching a scikit-learn call needed none.
+
+  **Tested**: 4 new tests in `tests/ml/test_inference.py` — batch scoring
+  matches individual scoring exactly (order preserved), empty input,
+  **N single-flow calls collapse to exactly 1 batched call** (a real call-
+  count assertion, not inferred), and a deterministic wall-clock timing
+  test with an injected fixed per-call overhead (avoids depending on how
+  fast the real model happens to be on whatever machine runs the suite)
+  confirming batching amortizes it the way the benchmark predicted (>5x
+  faster for 20 flows). 3 new tests in `tests/ml/test_anomaly_detection.py`
+  — `detect_batch` matches `detect` exactly for the same flows, handles
+  empty input, and agrees with individual `detect` on a known outlier's
+  `is_anomaly` verdict when scored as part of a mixed batch. 3 new tests in
+  `tests/unit/test_detection_coordinator.py` — `analyze_except_anomaly`
+  never touches the anomaly detector (proven via a monkeypatched detector
+  that raises if called at all, not just by inspection), `with_anomaly_evidence`
+  attaches evidence without disturbing anything else, and — the strongest
+  of the three — `analyze()` against a real trained model produces a
+  byte-identical `DetectionOutcome` to `analyze_except_anomaly` +
+  `with_anomaly_evidence` composed manually through a second coordinator
+  instance. 2 new **real, executed, end-to-end** integration tests in
+  `tests/integration/test_core_daemon.py`, against the real running
+  `CoreDaemon` with the real shipped v0.2.0 model loaded (not a fake, not
+  mocked — `make_config()`'s default `ml` paths): 20 flows completing
+  close together cost **far fewer than 20** Isolation Forest calls (asserted
+  `< 20` and `<= 5`, verified stable across repeated runs, not a one-off);
+  a forced-full anomaly queue (via the new `anomaly_queue_max` constructor
+  override, `detection.anomaly_batch_size=1`, and a deterministic
+  artificial per-call delay so the race is guaranteed rather than merely
+  likely) still produces a real `ThreatAssessment` for every flow, with the
+  drop visible via both the new `SecurityEvent` and the new counter.
+
+  **Incidental fix, found while reading this exact code, not otherwise in
+  scope**: `CoreDaemon._sweep_loop` never logged "sweep loop exited" on
+  shutdown — a stray `_logger.info("sweep loop exited")` statement had been
+  misplaced one method down, inside `_enqueue_slow_clusters` (introduced
+  during the B2 pass), so it fired on *every sweep interval* instead of
+  once at actual thread exit. Moved to the correct place, at the end of
+  `_sweep_loop`'s `while` loop, matching the pattern `_capture_loop`/
+  `_detection_loop`/`_anomaly_inference_loop` all already use. No test
+  previously asserted this log line's placement or timing (log content
+  isn't part of any RPC-visible state), so there is no regression test for
+  this specific fix beyond the existing shutdown tests continuing to pass.
+
+  `ruff check .` and `pyright --strict` clean across the whole repo. Full
+  suite after this section: **664 passed, 0 skipped, 0 failed** (+20 tests
+  from the 644 baseline in section 0 — 8 section-1, 3 section-2, 9 unit +
+  2 integration for section 3).
+
+**3e. Honest before/after — dev hardware only, real-Pi verification still
+  outstanding.** This session's own numbers (3a) are the only ones
+  gathered here; the real hardware improvement is **not measured this
+  session** and must not be claimed as such. What *is* verified: the
+  mechanism works correctly end to end on a real running daemon (3d's
+  integration tests) and the amortization the benchmark predicts is real,
+  not just a call-count reduction on paper (3d's timing test, with an
+  injected deterministic overhead standing in for whatever the real
+  per-call cost turns out to be on whichever machine runs it). **A human
+  must** re-run `benchmarks/2026-08-30/REPORT.md`'s original benchmark
+  methodology (or a similarly-shaped one) against this batching change on
+  a real Pi 4 to confirm it actually resolves the measured 38.5% packet-
+  drop-rate/queue-backlog finding in the field — see the go/no-go checklist
+  in section 5 below.
+
+**Not changed**: `enforcement_mode`'s default, or any other safety-relevant
+default or runtime behavior, anywhere in this section — per the session
+prompt's explicit instruction.
+
+### 4. WAFFY coexistence — Implemented (documentation only)
+
+`docs/DEPLOYMENT.md` gained a new §10 "WAFFY coexistence" (existing §10
+renumbered to §11), and `docs/ARCHITECTURE.md`'s "Known limitations"
+section gained one sentence noting WAFFY has moved from a
+referenced-but-unbuilt sibling to a deployable one, without changing the
+scope-boundary argument's substance — exactly the two changes the session
+prompt asked for, no more. **No code changed**: no WAFFY import, no config
+field expecting a WAFFY endpoint, no runtime coupling — that boundary was
+deliberate before this session and remains correct.
+
+**Confirmed from this repository's own docs**: pirewall's firewall
+footprint (`deploy/firewall/base.nft.template` + the adaptive `inet
+pirewall` table, Pi gateway only, via `nft -j -f -`), its only local IPC
+surface (`/run/pirewall/core.sock`, ADDENDUM.md A4), its API port (`:8443`
+TLS), and its event/metric export destinations (TCP syslog to Wazuh, UDP
+StatsD to Netdata, both external collector addresses).
+
+**Open question for the human, not guessed**: whether WAFFY manages any
+host-level firewall rules of its own on the hosts it runs on, and whether
+it binds any port/socket path that could collide with the above, could not
+be confirmed this session — WAFFY's own repository/deployment docs were
+not reachable from here (no URL was available, and this project's own
+rules against guessing/generating URLs apply). `docs/DEPLOYMENT.md` §10
+states this open question explicitly rather than assuming compatibility;
+a human should confirm it against WAFFY's actual docs before relying on
+both running together in `ACTIVE` mode on the same host.
+
+### 5. Final Pi deployment readiness audit
+
+**`docs/DEPLOYMENT.md` walked end to end against the current code state**
+after sections 1-4: systemd unit `ExecStart`/`WorkingDirectory` paths
+(`/opt/pirewall/.venv/bin/python -m pirewall.main` /
+`-m pirewall.api`, `WorkingDirectory=/opt/pirewall`), the RPC socket path
+(`/run/pirewall/core.sock`), certificate config field names
+(`api.tls_cert_path`/`tls_key_path`), the `make_certs.sh` script referenced
+in §6 (confirmed present at `scripts/deployment/make_certs.sh`), and
+service user/group names (`pirewall-core`, `pirewall-api`, `pirewall-ipc`)
+all still match the repository. **Config field names specifically**: not
+just eyeballed — `tests/unit/test_config_loader.py` loads and validates
+the real, shipped `config/default_config.toml` (including this session's
+two new `[detection]` fields) against the live `PirewallConfig` Pydantic
+model as part of the passing suite, which is stronger evidence of
+zero field-name drift than a manual diff would be. No drift found requiring
+a fix.
+
+**One soft, not-clearly-drift finding, reported rather than silently fixed
+or silently ignored**: `docs/DEPLOYMENT.md` §2 says installing Python via
+`uv python install 3.12` "is the same mechanism used on the development
+machine, so the Pi runs the interpreter version the project is actually
+tested against." Nothing in this repository enforces that in practice —
+there is no `.python-version` file, and `pyproject.toml` only sets a floor
+(`requires-python = ">=3.12"`), no ceiling. This session's own `uv sync`
+(inside the WSL distro set up in section 0) picked up the system's
+Python 3.14.4, not 3.12, since nothing pinned it — meaning this session's
+entire verified test run was against 3.14, genuinely different from
+whatever a Pi following §2 literally would end up running (3.12, via `uv
+python install 3.12`). This isn't necessarily wrong — `pytest`/`ruff`/
+`pyright` all passed clean on 3.14 — but the doc's implicit claim that dev
+and Pi "run the interpreter version the project is actually tested
+against" is only true if a human deliberately runs `uv python install
+3.12` on *both* machines; nothing in the repository guarantees it. Not
+fixed here (adding a `.python-version` pin is an infrastructure decision
+beyond "fix the docs to match the code" — flagged for a human to decide,
+not assumed).
+
+**Pi deployment go/no-go checklist**
+
+*Verified in this repository* (ruff/pyright/pytest-covered, this session
+or earlier ones):
+
+- [x] Sections 1-3's implementation, each with real, passing, executed
+  tests (control panel rendering, cumulative drop counter, batched
+  anomaly-scoring correctness and end-to-end wiring against the real
+  daemon and the real shipped model).
+- [x] A1 SHADOW default, A2 allowlist priority, A3 rate cap, A6 fail-open
+  default, A7 approval queue, A8 kill-switch — all previously Tested,
+  unchanged and re-confirmed passing this session (`enforcement_mode`'s
+  default and every other safety-relevant default untouched, per every
+  section's own explicit scope limit).
+- [x] B1-B6's detection-timing mechanisms and the queue-drain race fix —
+  previously Tested, re-confirmed passing this session, now also verified
+  on a real POSIX run for the first time (section 0) rather than relying
+  on the Windows-runnable proxy test alone.
+- [x] Config field names match the live Pydantic schema exactly (verified
+  by the passing config-loader test, not just inspected).
+- [x] systemd unit paths, cert config field names, and referenced
+  deployment scripts all match the repository's actual paths (section 5
+  audit above).
+- [x] Full suite, fresh, on a real POSIX machine, after every change in
+  this session: **`ruff check .` clean, `pyright --strict` 0 errors, `pytest`
+  664 passed, 0 skipped, 0 failed.**
+
+*Requires the human, on real hardware, and cannot be scripted* (do not mark
+any of these done from this session):
+
+- [ ] **A1's 1-2 week SHADOW-mode observation window** against real
+  household traffic, reviewing the shadow log and `SecurityEvent` stream,
+  before ever moving to `ASSISTED`/`ACTIVE` (ADDENDUM.md A1's own
+  recommended path — unchanged by this session).
+- [ ] **A6's real crash/watchdog test**: install the real `pirewall-core.service`
+  unit, deliberately crash the process (e.g. `kill -SEGV`), confirm systemd
+  restarts it via `Type=notify`/`WatchdogSec=30s`, then repeat past
+  `StartLimitBurst=3` and confirm it lands in `failed` state with
+  `pirewall-api` still reachable and reporting "core is down."
+- [ ] **A4's real socket-ownership check**: after installing both units,
+  `ls -l /run/pirewall/core.sock` must read
+  `srw-rw---- pirewall-core pirewall-ipc`, and a process running as neither
+  `pirewall-core` nor a member of `pirewall-ipc` must get `Permission
+  denied` connecting to it.
+- [ ] **Section 3's real-Pi re-run**: `benchmarks/2026-08-30/REPORT.md`'s
+  benchmark methodology (or similarly shaped), re-run against this
+  session's batching change on a real Pi 4, to confirm it actually resolves
+  the measured 38.5% packet-drop-rate/detection-queue-backlog finding in
+  the field — this session's own numbers (3a/3d) are dev/CI-hardware-only
+  and explicitly do not substitute for this.
+- [ ] **The 3 `test_core_daemon.py` tests already flagged in the B1-B6 pass
+  above** (`test_scanning_visible_through_a_completing_flow_while_scan_flows_stay_open`,
+  the B2 slow-rate-DoS end-to-end test, and now this session's own 2 new
+  batching integration tests) — all now genuinely re-run and passing on
+  this session's WSL2 POSIX environment (section 0's whole point), but
+  WSL2 is still not a real Pi 4/ARM/real-NIC environment; the
+  Environment-dependent items above (real `AF_PACKET`, real `nftables`,
+  real systemd) remain exactly as outstanding as before.
+- [ ] **WAFFY's own firewall/port footprint**, confirmed against WAFFY's
+  actual repository/deployment docs (section 4's open question) — needed
+  before relying on pirewall and WAFFY running together in `ACTIVE` mode on
+  the same host.
+- [ ] **The Python-version pinning gap** (section 5's soft-drift finding)
+  — a human decision on whether to add a `.python-version` file, not a
+  blocking deployment issue but worth resolving before treating "dev and
+  Pi run identical interpreters" as an actual guarantee rather than a
+  manual convention.
+
+**`enforcement_mode`'s shipped default (`"shadow"`) and every other
+safety-relevant default are unchanged by this entire session** — confirmed
+by re-reading `config/default_config.toml`'s `[firewall]`/`[failure]`
+sections after every section's edits, not just by intent.

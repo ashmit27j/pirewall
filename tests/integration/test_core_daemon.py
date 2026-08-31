@@ -234,6 +234,108 @@ def test_backpressure_drops_flows_rather_than_blocking_capture(socket_path: str)
         daemon.stop()
 
 
+def test_batched_anomaly_scoring_uses_far_fewer_inference_calls_than_flows(socket_path: str) -> None:
+    """ADDENDUM_2 follow-up pass, section 3, wired into the real running daemon end to end.
+
+    Many flows completing close together must cost far fewer Isolation
+    Forest calls than flows — not one call per flow, the whole point of
+    this section (`benchmarks/2026-08-30/REPORT.md` §3-4: single-flow
+    scoring was 92% of total packet-to-decision cost on a real Pi 4).
+    `make_config()`'s default `ml.isolation_forest_model_path` points at
+    the real shipped v0.2.0 artifact, so this exercises the real model, the
+    real dedicated anomaly-inference thread, and the real bounded queue
+    between it and the detection thread — not a fake or a mock of any of
+    pirewall's own code.
+    """
+    n_flows = 20
+    packets: list[bytes] = []
+    for index in range(n_flows):
+        packets.extend(_one_completed_session(src=f"203.0.113.{30 + index}"))
+
+    daemon, _, _ = _daemon(socket_path, packets)
+    isolation_forest = daemon._coordinator.models.isolation_forest  # pyright: ignore[reportPrivateUsage]
+    assert isolation_forest is not None, "make_config()'s default ml paths must load a real model"
+    real_decision_function = isolation_forest.model.decision_function  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+    call_count = 0
+
+    def _counting_decision_function(*args: object, **kwargs: object) -> object:
+        nonlocal call_count
+        call_count += 1
+        return real_decision_function(*args, **kwargs)  # pyright: ignore[reportUnknownVariableType]
+
+    isolation_forest.model.decision_function = _counting_decision_function  # pyright: ignore[reportAttributeAccessIssue]
+
+    daemon.start()
+    try:
+        client = UnixSocketRpcClient(socket_path)
+        _wait_for(
+            lambda: len(client.list_threats()) >= n_flows, f"{n_flows} threat assessments"
+        )
+    finally:
+        daemon.stop()
+
+    assert call_count < n_flows  # real batching happened, not one call per flow
+    assert call_count <= 5  # far fewer, not just "occasionally one fewer"
+
+
+def test_anomaly_scoring_backpressure_still_finishes_every_flow(socket_path: str) -> None:
+    """A full anomaly-scoring queue must degrade gracefully (ADDENDUM_2 follow-up pass, section 3c).
+
+    Every flow still reaches a real `ThreatAssessment` — known-attack and
+    behavioral evidence are unaffected — just without an Isolation Forest
+    score for whichever flow got dropped. The drop itself is separately
+    observable: its own `SecurityEvent` and its own `RuntimeCounters`
+    field, distinct from `_note_backpressure_drop`'s "never assessed at
+    all" failure mode.
+    """
+    n_flows = 5
+    packets: list[bytes] = []
+    for index in range(n_flows):
+        packets.extend(_one_completed_session(src=f"203.0.113.{40 + index}"))
+
+    config = make_config(
+        api={"rpc_socket_path": socket_path, "history_size": 50},
+        # batch_size=1 so the inference thread scores (and blocks on) one
+        # flow at a time instead of draining the whole burst into one batch
+        # before the slow model call ever runs — otherwise the artificial
+        # per-call delay below never gets a chance to create backpressure.
+        detection={"anomaly_batch_size": 1},
+    )
+    daemon = CoreDaemon(
+        config,
+        capture=FakePacketCapture("test0", packets),
+        backend=FakeFirewallBackend(),
+        notifier=SystemdNotifier(notify_socket=None),
+        anomaly_queue_max=1,
+    )
+    isolation_forest = daemon._coordinator.models.isolation_forest  # pyright: ignore[reportPrivateUsage]
+    assert isolation_forest is not None
+    real_decision_function = isolation_forest.model.decision_function  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+
+    def _slow_decision_function(*args: object, **kwargs: object) -> object:
+        # Deliberately lags the inference thread behind the fast in-memory
+        # capture/detection threads, so the tiny queue is guaranteed to
+        # fill rather than merely likely to — a real race, made
+        # deterministic rather than left flaky.
+        time.sleep(0.05)
+        return real_decision_function(*args, **kwargs)  # pyright: ignore[reportUnknownVariableType]
+
+    isolation_forest.model.decision_function = _slow_decision_function  # pyright: ignore[reportAttributeAccessIssue]
+
+    daemon.start()
+    try:
+        client = UnixSocketRpcClient(socket_path)
+        _wait_for(
+            lambda: len(client.list_threats()) >= n_flows, f"{n_flows} threat assessments"
+        )
+        reasons = [event.reason or "" for event in client.list_events()]
+        assert any("anomaly-scoring queue full" in reason for reason in reasons)
+    finally:
+        daemon.stop()
+
+    assert daemon._counters.anomaly_scores_dropped_for_backpressure >= 1  # pyright: ignore[reportPrivateUsage]
+
+
 def test_scanning_visible_through_a_completing_flow_while_scan_flows_stay_open(
     socket_path: str,
 ) -> None:

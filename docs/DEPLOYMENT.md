@@ -688,7 +688,59 @@ straight to restarting services with unreviewed changes:
    5, tested) — a bad artifact fails loudly at restart, not silently at
    inference time.
 
-## 10. What's still Environment-dependent after all of the above
+## 10. WAFFY coexistence
+
+WAFFY is a separate, sibling project — a per-host web application firewall —
+now deployment-ready in its own right (per the human operator). It is
+referenced here only as a sibling; **there is no code dependency in either
+direction**, and this section stays documentation-only, per
+`docs/ARCHITECTURE.md`'s "Known limitations" section, which this does not
+change the substance of. See that section for the full architectural
+argument; this section is the operational half — how the two coexist on
+the same network once both are actually running.
+
+**Where each one runs.** pirewall runs once, on the Pi acting as the
+network gateway (§4 above) — it sees every packet crossing the LAN/WAN
+boundary and reasons about flow-level/behavioral/volumetric patterns.
+WAFFY, per its own project description, runs per protected host, at the
+application layer — it sees HTTP/application content on that one host,
+which pirewall deliberately never inspects (spec §7; see B6's empirical
+finding in `docs/ADDENDUM_2.md` for exactly where that gap is real and
+measured, not theoretical). They compose by being deployed side by side,
+each covering the layer the other cannot see — not by talking to each
+other in-process or over a network protocol.
+
+**Firewall/ruleset footprint — confirmed for pirewall, open for WAFFY.**
+pirewall's own footprint is fully documented and unambiguous: `deploy/firewall/base.nft.template`
+plus the adaptive `inet pirewall` table, both installed on the Pi gateway
+only, via `nft -j -f -` (`docs/FIREWALL.md` "Backends", "Base ruleset vs.
+adaptive rules"). Whether WAFFY manages any host-level firewall rules of
+its own (iptables, nftables, or otherwise) on the hosts *it* runs on could
+not be confirmed this session — WAFFY's own repository/deployment docs
+were not reachable from here. **This is an open question for the human
+operator, not assumed compatible**: if WAFFY runs on a host that also has
+its own local firewall pirewall's adaptive rules might interact with (for
+example, a host under active adaptive `RATE_LIMIT`/`BLOCK` from pirewall
+that also has WAFFY-managed local rules), confirm there's no ordering
+conflict before relying on both together in `ACTIVE` mode. In practice this
+risk is low if WAFFY runs purely as an application-layer reverse
+proxy/module with no host firewall footprint of its own — but that has to
+be confirmed against WAFFY's actual deployment docs, not guessed here.
+
+**No port, socket, or log-destination collision, as far as pirewall's own
+footprint is concerned.** pirewall-api listens on `:8443` (TLS, §6 above);
+`pirewall-core`'s only local IPC surface is the Unix domain socket at
+`/run/pirewall/core.sock` (ADDENDUM.md A4, filesystem-permissioned to the
+`pirewall-core`/`pirewall-ipc` users — §5, §7 above); event/metric export
+uses TCP syslog to Wazuh and UDP StatsD to Netdata (§8 above), both to
+*external* collector addresses, not a local port WAFFY could contend for.
+None of these are well-known ports a generic web application or reverse
+proxy would typically also claim, but — same caveat as the firewall
+footprint above — confirm against WAFFY's own listened ports/socket paths
+once its deployment docs are available; this repository has no visibility
+into what WAFFY itself binds.
+
+## 11. What's still Environment-dependent after all of the above
 
 See `docs/SECURITY.md` §3 and `docs/PROGRESS.md` Phase 8 for the complete,
 itemized list. In short: every step in this document that involves a real

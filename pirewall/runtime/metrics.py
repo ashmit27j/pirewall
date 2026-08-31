@@ -58,6 +58,13 @@ class RuntimeCounters:
     blocks: int = 0
     rules_rejected: int = 0
     flows_dropped_for_backpressure: int = 0
+    # ADDENDUM_2 follow-up pass, section 3c — a flow whose anomaly scoring
+    # was dropped because the batching queue was full. Deliberately a
+    # separate counter from `flows_dropped_for_backpressure`: that one
+    # means a flow never got assessed at all; this one means a flow *did*
+    # get a real `ThreatAssessment`, just without an Isolation Forest
+    # score. Two different, separately observable failure modes, not one.
+    anomaly_scores_dropped_for_backpressure: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def add(self, **deltas: float) -> None:
@@ -79,6 +86,7 @@ class RuntimeCounters:
                 blocks=self.blocks,
                 rules_rejected=self.rules_rejected,
                 flows_dropped_for_backpressure=self.flows_dropped_for_backpressure,
+                anomaly_scores_dropped_for_backpressure=self.anomaly_scores_dropped_for_backpressure,
             )
 
 

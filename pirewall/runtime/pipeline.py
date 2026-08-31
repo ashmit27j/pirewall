@@ -35,7 +35,9 @@ A6 fail-open).
 
 import logging
 import time
+from collections.abc import Callable
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from datetime import datetime
 
 from pirewall.config.models import PirewallConfig
@@ -43,8 +45,9 @@ from pirewall.core.enums import EventSeverity, FirewallAction, SecurityEventType
 from pirewall.core.exceptions import FeatureExtractionError, PirewallError
 from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.evidence import ProtocolSignatureEvidence
+from pirewall.core.models.feature_vector import FeatureVector
 from pirewall.core.models.flow import Flow
-from pirewall.detection.coordinator import DetectionCoordinator
+from pirewall.detection.coordinator import DetectionCoordinator, DetectionOutcome
 from pirewall.engine.decision import EvidenceMaturityTracker, decide
 from pirewall.engine.threat import assess_threat
 from pirewall.features.extractor import extract_features
@@ -63,6 +66,29 @@ _SUBSYSTEM = "runtime.pipeline"
 _REPORTABLE_LEVELS = frozenset({ThreatLevel.MEDIUM, ThreatLevel.HIGH, ThreatLevel.CRITICAL})
 
 
+@dataclass(frozen=True, slots=True)
+class PendingAnomalyScoring:
+    """A flow whose known-attack + behavior evidence is ready; anomaly scoring is still pending.
+
+    Produced by `FlowPipeline.process` when a batching `anomaly_scorer`
+    callback is configured and an Isolation Forest model is loaded
+    (ADDENDUM_2 follow-up pass, section 3) — handed to that callback
+    instead of being scored inline, so many flows' Isolation Forest calls
+    can be coalesced into one `decision_function` call.
+    `pirewall.runtime.core.CoreDaemon` owns the actual batching queue and
+    dedicated inference thread; this module only defines the handoff shape
+    and what happens on either side of it (`process`/`finish`).
+    """
+
+    flow: Flow
+    now: datetime
+    features: FeatureVector
+    outcome: DetectionOutcome  # anomaly_evidence is always None here
+
+
+AnomalyScorer = Callable[[PendingAnomalyScoring], None]
+
+
 class FlowPipeline:
     """Runs one completed `Flow` through detection, decision, and enforcement."""
 
@@ -75,6 +101,7 @@ class FlowPipeline:
         forwarder: EventForwarder,
         counters: RuntimeCounters,
         lock: AbstractContextManager[bool],
+        anomaly_scorer: AnomalyScorer | None = None,
     ) -> None:
         self._config = config
         self._coordinator = coordinator
@@ -89,6 +116,14 @@ class FlowPipeline:
         # mutates `CoreStateStore` and `FirewallManager` while the RPC
         # thread reads both to answer `/status`, `/rules`, `/threats`.
         self._lock = lock
+        # ADDENDUM_2 follow-up pass, section 3 — `None` (the default) means
+        # anomaly evidence is scored inline, synchronously, exactly as
+        # before this section existed. When `CoreDaemon` injects a real
+        # callback (only once an Isolation Forest model is actually
+        # loaded), `process` hands the flow off to it instead of scoring
+        # inline, and the flow's pipeline processing is completed later by
+        # a `finish()` call once that flow's batch has been scored.
+        self._anomaly_scorer = anomaly_scorer
 
     def process(
         self,
@@ -102,6 +137,13 @@ class FlowPipeline:
         `pirewall.runtime.core.CoreDaemon`, looked up by this flow's key
         from raw-payload inspection performed while the connection was
         still open — this class has no capture-layer access of its own.
+
+        When batched anomaly scoring is configured (`anomaly_scorer` is not
+        `None`) and an Isolation Forest model is loaded, this method
+        returns *before* the flow reaches a `ThreatAssessment` — it hands
+        the flow off for batched scoring and the rest of processing resumes
+        later, from `finish()`. Otherwise this behaves exactly as it always
+        has: one flow, fully processed, before this call returns.
         """
         try:
             self._process(flow, now, protocol_signature)
@@ -109,6 +151,26 @@ class FlowPipeline:
             self._report_failure(flow, now, exc)
         except Exception as exc:  # a bug here must not take capture down with it
             _logger.exception("unexpected error processing flow %s", flow.flow_id)
+            self._report_failure(flow, now, exc)
+
+    def finish(self, flow: Flow, now: datetime, outcome: DetectionOutcome) -> None:
+        """Complete a flow's pipeline processing once its anomaly evidence is ready.
+
+        The other half of the split `process` performs when batched
+        anomaly scoring is configured (ADDENDUM_2 follow-up pass, section
+        3): called by `CoreDaemon`'s dedicated anomaly-inference thread
+        once a batch containing this flow has been scored — or immediately,
+        with `outcome.record.anomaly_evidence` left `None`, if that queue
+        was full (see `CoreDaemon._enqueue_anomaly_scoring`). Never raises,
+        same discipline as `process`, since there is no longer a `process`
+        call on the stack above this one to catch it.
+        """
+        try:
+            self._finish(flow, now, outcome)
+        except PirewallError as exc:
+            self._report_failure(flow, now, exc)
+        except Exception as exc:  # a bug here must not take the inference thread down with it
+            _logger.exception("unexpected error finishing flow %s", flow.flow_id)
             self._report_failure(flow, now, exc)
 
     def _process(
@@ -123,12 +185,31 @@ class FlowPipeline:
             self._report_failure(flow, now, exc)
             return
 
+        if self._anomaly_scorer is not None and self._coordinator.models.isolation_forest is not None:
+            started = time.perf_counter()
+            outcome = self._coordinator.analyze_except_anomaly(flow, features, now, protocol_signature)
+            elapsed_seconds = time.perf_counter() - started
+            # Only LightGBM (if loaded) ran inline here — Isolation Forest
+            # scoring is what got deferred to the batch. Attributing this
+            # timing to "inferences" only when LightGBM actually ran keeps
+            # the exported `inference_latency_ms` honest; the batch's own
+            # contribution is added separately, once per batch, by whatever
+            # scores it (`CoreDaemon._score_and_finish_batch`).
+            if self._coordinator.models.lightgbm is not None:
+                self._counters.add(inferences=1, inference_seconds_total=elapsed_seconds)
+            self._anomaly_scorer(
+                PendingAnomalyScoring(flow=flow, now=now, features=features, outcome=outcome)
+            )
+            return
+
         started = time.perf_counter()
         outcome = self._coordinator.analyze(flow, features, now, protocol_signature)
         elapsed_seconds = time.perf_counter() - started
         if self._coordinator.models.any_loaded:
             self._counters.add(inferences=1, inference_seconds_total=elapsed_seconds)
+        self._finish(flow, now, outcome)
 
+    def _finish(self, flow: Flow, now: datetime, outcome: DetectionOutcome) -> None:
         assessment = assess_threat(
             self._config.threat,
             flow_id=flow.flow_id,

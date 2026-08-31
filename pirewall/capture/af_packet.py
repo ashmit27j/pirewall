@@ -49,6 +49,7 @@ class AFPacketCapture:
         self._running = False
         self._packets_seen = 0
         self._packets_malformed = 0
+        self._packets_dropped_cumulative = 0
 
     def start(self) -> None:
         """Bind an AF_PACKET socket to `interface`. Raises `CaptureError` on failure.
@@ -133,17 +134,29 @@ class AFPacketCapture:
     def _read_kernel_drops(self) -> int:
         """Best-effort: kernel-reported drops via `PACKET_STATISTICS` (spec §6).
 
-        Returns 0 if the socket isn't open or the kernel doesn't support
-        this getsockopt — this is "detect drops where possible", not a hard
-        requirement.
+        The kernel zeroes `tp_drops` every time it's read via this
+        `getsockopt` — so the raw value from one call is only the count
+        *since the previous read*, not a lifetime total. `statistics()`
+        exports `packets_dropped` as a cumulative counter (matching
+        `packets_seen`/`packets_malformed`), so this accumulates each read's
+        delta into `self._packets_dropped_cumulative` and returns the
+        running sum rather than the raw per-read value — otherwise a
+        dashboard differencing consecutive readings as a counter would see
+        it drop and compute a negative rate (`benchmarks/2026-08-30/REPORT.md`
+        §4). Returns the last known cumulative total if the socket isn't
+        open or the kernel doesn't support this getsockopt, never resetting
+        it — this is "detect drops where possible", not a hard requirement,
+        and a transient read failure must not make the exported total go
+        backwards either.
         """
         if self._socket is None:
-            return 0
+            return self._packets_dropped_cumulative
         try:
             raw = self._socket.getsockopt(
                 _SOL_PACKET, _PACKET_STATISTICS, struct.calcsize(_PACKET_STATS_FORMAT)
             )
         except OSError:
-            return 0
-        _received, dropped = struct.unpack(_PACKET_STATS_FORMAT, raw)
-        return dropped
+            return self._packets_dropped_cumulative
+        _received, dropped_since_last_read = struct.unpack(_PACKET_STATS_FORMAT, raw)
+        self._packets_dropped_cumulative += dropped_since_last_read
+        return self._packets_dropped_cumulative

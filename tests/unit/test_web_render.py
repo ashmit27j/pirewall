@@ -13,7 +13,10 @@ from pirewall.core.enums import (
     ThreatLevel,
 )
 from pirewall.core.models.allowlist import AllowlistEntry
+from pirewall.core.models.capture_stats import CaptureStatistics
+from pirewall.core.models.detection_record import DetectionRecord
 from pirewall.core.models.event import SecurityEvent
+from pirewall.core.models.evidence import AnomalyEvidence
 from pirewall.core.models.model_metadata import ModelMetadata
 from pirewall.core.models.status import StatusResult
 from pirewall.web.render import render_dashboard, render_login_page
@@ -83,6 +86,26 @@ def _allowlist_entry() -> AllowlistEntry:
     )
 
 
+def _capture_stats() -> CaptureStatistics:
+    return CaptureStatistics(interface="eth0", packets_seen=1000, packets_dropped=5, packets_malformed=1)
+
+
+def _detection_record() -> DetectionRecord:
+    return DetectionRecord(
+        flow_id="f1",
+        anomaly_evidence=AnomalyEvidence(
+            flow_id="f1",
+            anomaly_score=0.8,
+            threshold=0.5,
+            is_anomaly=True,
+            model_version="1.0.0",
+            feature_schema_version="1.0.0",
+            generated_at=NOW,
+        ),
+        recorded_at=NOW,
+    )
+
+
 def test_dashboard_renders_every_spec_section() -> None:
     html = render_dashboard(
         status=_status(),
@@ -91,14 +114,27 @@ def test_dashboard_renders_every_spec_section() -> None:
         threats=[_threat_assessment()],
         models=[_model_metadata()],
         allowlist=[_allowlist_entry()],
+        capture_stats=_capture_stats(),
+        detections=[_detection_record()],
     )
 
-    for heading in ("System", "Threats", "Firewall", "Shadow log", "Allowlist", "Events", "ML"):
+    headings = (
+        "System",
+        "Network",
+        "Detections",
+        "Threats",
+        "Firewall",
+        "Shadow log",
+        "Allowlist",
+        "Events",
+        "ML",
+    )
+    for heading in headings:
         assert heading in html
 
 
 def test_dashboard_includes_addendum_specific_sections() -> None:
-    html = render_dashboard(_status(), [], [], [], [], [])
+    html = render_dashboard(_status(), [], [], [], [], [], None, [])
     assert "Shadow log" in html
     assert "kill-switch" in html.lower()
     assert "Allowlist" in html
@@ -113,9 +149,30 @@ def test_dashboard_escapes_untrusted_content() -> None:
         subsystem="test",
         reason="<script>alert('xss')</script>",
     )
-    html = render_dashboard(_status(), [], [malicious_event], [], [], [])
+    html = render_dashboard(_status(), [], [malicious_event], [], [], [], None, [])
     assert "<script>alert" not in html
     assert "&lt;script&gt;" in html
+
+
+def test_dashboard_renders_network_section_with_capture_stats() -> None:
+    html = render_dashboard(_status(), [], [], [], [], [], _capture_stats(), [])
+    assert "eth0" in html
+    assert "1000" in html
+
+
+def test_dashboard_network_section_handles_no_capture_stats_yet() -> None:
+    html = render_dashboard(_status(), [], [], [], [], [], None, [])
+    assert "No capture statistics reported yet" in html
+
+
+def test_dashboard_renders_detections_section() -> None:
+    html = render_dashboard(_status(), [], [], [], [], [], None, [_detection_record()])
+    assert "anomaly: 0.80" in html
+
+
+def test_dashboard_detections_section_handles_empty_state() -> None:
+    html = render_dashboard(_status(), [], [], [], [], [], None, [])
+    assert "No detections recorded yet" in html
 
 
 def test_ids_never_reach_an_inline_js_handler() -> None:
@@ -147,7 +204,7 @@ def test_ids_never_reach_an_inline_js_handler() -> None:
         )
     ]
 
-    html = render_dashboard(_status(), rules, [], [], [], allowlist)
+    html = render_dashboard(_status(), rules, [], [], [], allowlist, None, [])
 
     assert "alert(1)" not in html
     # The decoded form is what the JS engine would have seen.
@@ -158,7 +215,7 @@ def test_ids_never_reach_an_inline_js_handler() -> None:
 def test_action_buttons_still_carry_their_target_url() -> None:
     """The escaping fix must not have silently broken the buttons it protects."""
     html = render_dashboard(
-        _status(), [make_firewall_rule(id="abc123", status=RuleStatus.ACTIVE)], [], [], [], []
+        _status(), [make_firewall_rule(id="abc123", status=RuleStatus.ACTIVE)], [], [], [], [], None, []
     )
 
     assert 'data-action="/api/v1/rules/abc123/disable"' in html
@@ -167,7 +224,7 @@ def test_action_buttons_still_carry_their_target_url() -> None:
 
 
 def test_dashboard_handles_empty_state_gracefully() -> None:
-    html = render_dashboard(_status(), [], [], [], [], [])
+    html = render_dashboard(_status(), [], [], [], [], [], None, [])
     assert "No rules yet" in html
     assert "No events recorded yet" in html
 

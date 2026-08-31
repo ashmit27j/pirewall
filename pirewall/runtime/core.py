@@ -11,7 +11,16 @@ Threads, and why there is more than one
 `capture`            Blocks in `recv()` on the `AF_PACKET` socket, parses each
                      packet, feeds `FlowAggregator`, and hands completed flows
                      to the detection thread through a bounded queue.
-`detection`          Drains that queue and runs `FlowPipeline` per flow.
+`detection`          Drains that queue and runs `FlowPipeline` per flow. Runs
+                     known-attack (LightGBM) and behavior analysis inline;
+                     hands anomaly scoring off to the `anomaly-inference`
+                     thread instead of calling Isolation Forest itself (see
+                     below).
+`anomaly-inference`  Only spawned when an Isolation Forest model is loaded.
+                     Batch-scores flows handed off by the detection thread —
+                     one `decision_function` call per batch instead of one
+                     per flow (ADDENDUM_2 follow-up pass, section 3) — then
+                     finishes each flow's pipeline processing itself.
 `sweep`              Flow active/inactive timeouts and adaptive-rule TTL
                      expiry, on `flow.cleanup_interval_seconds`.
 `rpc`                `UnixSocketRpcServer.serve_until_stopped` — pirewall-api's
@@ -21,14 +30,17 @@ main thread          `sd_notify` watchdog heartbeats, capture-statistics
 ===================  =========================================================
 
 Capture and detection are separated because they run at wildly different
-speeds. Isolation Forest scoring was measured at ~15.6 ms per flow on the
-development machine and is expected to be slower on a Pi 4
-(`docs/PROGRESS.md`); doing that work inline in the capture thread would
-stall `recv()` and drop packets in the kernel. The queue between them is
-**bounded** and drops on overflow rather than blocking, because blocking the
-capture thread is precisely the failure this split exists to avoid — a
-detection backlog must cost detection coverage, never packet capture. Drops
-are counted and reported, never silent.
+speeds. Single-flow Isolation Forest scoring was measured at ~30.7 ms/call on
+a real Pi 4 — 92% of total packet-to-decision cost, and the dominant cause of
+a 38.5% packet-drop rate under sustained load
+(`benchmarks/2026-08-30/REPORT.md` §3-4). Detection and anomaly-inference are
+separated from each other for the same reason capture and detection are: so
+one slow stage cannot stall a faster one. Every cross-thread queue in this
+class (`_flow_queue`, `_new_flow_queue`, `_slow_cluster_queue`,
+`_anomaly_queue`) is **bounded** and drops on overflow rather than blocking
+its producer — a backlog in one stage must cost that stage's own coverage,
+never a faster stage's throughput. Drops are always counted and reported,
+never silent.
 
 Shutdown
 --------
@@ -51,6 +63,7 @@ import logging
 import queue
 import signal
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
@@ -66,12 +79,13 @@ from pirewall.capture.parser import extract_tcp_payload
 from pirewall.capture.pipeline import capture_packets
 from pirewall.config.models import PirewallConfig
 from pirewall.core.enums import EventSeverity, FailureMode, SecurityEventType
-from pirewall.core.exceptions import CaptureError, PirewallError
+from pirewall.core.exceptions import CaptureError, ModelInferenceError, PirewallError
 from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.evidence import ProtocolSignatureEvidence
 from pirewall.core.models.flow import Flow
 from pirewall.core.models.packet import PacketMetadata
-from pirewall.detection.coordinator import DetectionCoordinator, load_models
+from pirewall.detection.anomaly import detect_batch as detect_anomaly_batch
+from pirewall.detection.coordinator import DetectionCoordinator, load_models, with_anomaly_evidence
 from pirewall.detection.tls_fingerprint import (
     compute_ja3,
     load_known_tool_fingerprints,
@@ -91,7 +105,7 @@ from pirewall.ipc.server import UnixSocketRpcServer
 from pirewall.ipc.state import CoreStateStore
 from pirewall.runtime.forwarder import EventForwarder
 from pirewall.runtime.metrics import MetricsCollector, RuntimeCounters
-from pirewall.runtime.pipeline import FlowPipeline
+from pirewall.runtime.pipeline import FlowPipeline, PendingAnomalyScoring
 from pirewall.runtime.watchdog import SystemdNotifier
 
 _logger = logging.getLogger(__name__)
@@ -118,6 +132,14 @@ _SLOW_CLUSTER_QUEUE_MAX = 1_000
 # table itself uses. Written by the capture thread, read/popped by the
 # detection thread — see `_handle_tcp_payload`/`_pop_tls_evidence`.
 _TLS_EVIDENCE_CACHE_MAX = 10_000
+# Flows awaiting batched anomaly scoring (ADDENDUM_2 follow-up pass, section
+# 3), written by the detection thread and drained by the dedicated
+# anomaly-inference thread. Sized well above the default
+# `detection.anomaly_batch_size` (50) so a burst can queue up several
+# batches' worth of flows before backpressure kicks in, but still bounded —
+# an unbounded queue here would just move the OOM risk `_FLOW_QUEUE_MAX`
+# already exists to avoid one stage later.
+_ANOMALY_QUEUE_MAX = 5_000
 # How long the queue drain waits before re-checking the stop flag.
 _QUEUE_POLL_SECONDS = 0.5
 # Threads get this long to finish after `stop()` before the process gives up
@@ -185,6 +207,7 @@ class CoreDaemon:
         backend: FirewallBackend | None = None,
         notifier: SystemdNotifier | None = None,
         flow_queue_max: int = _FLOW_QUEUE_MAX,
+        anomaly_queue_max: int = _ANOMALY_QUEUE_MAX,
     ) -> None:
         """Build every subsystem. `capture`/`backend`/`notifier` are injectable for testing.
 
@@ -269,6 +292,15 @@ class CoreDaemon:
             config.detection, models, on_event=self._forwarder
         )
 
+        # ADDENDUM_2 follow-up pass, section 3 — populated by the detection
+        # thread (`_enqueue_anomaly_scoring`), drained by the dedicated
+        # anomaly-inference thread (`_anomaly_inference_loop`), only when an
+        # Isolation Forest model is actually loaded; otherwise anomaly
+        # scoring stays inline/synchronous and this queue is never touched.
+        self._anomaly_queue: queue.Queue[PendingAnomalyScoring] = queue.Queue(
+            maxsize=anomaly_queue_max
+        )
+        self._anomaly_scores_dropped = 0
         self._pipeline = FlowPipeline(
             config=config,
             coordinator=self._coordinator,
@@ -277,6 +309,9 @@ class CoreDaemon:
             forwarder=self._forwarder,
             counters=self._counters,
             lock=self._lock,
+            anomaly_scorer=(
+                self._enqueue_anomaly_scoring if models.isolation_forest is not None else None
+            ),
         )
         self._flow_queue: queue.Queue[Flow] = queue.Queue(maxsize=flow_queue_max)
         self._rpc_server = UnixSocketRpcServer(
@@ -374,6 +409,8 @@ class CoreDaemon:
         self._spawn("pirewall-rpc", lambda: self._rpc_server.serve_until_stopped(self._stop))
         self._spawn("pirewall-detection", self._detection_loop)
         self._spawn("pirewall-sweep", self._sweep_loop)
+        if self._coordinator.models.isolation_forest is not None:
+            self._spawn("pirewall-anomaly-inference", self._anomaly_inference_loop)
         if self._capture_started:
             self._spawn("pirewall-capture", self._capture_loop)
 
@@ -716,6 +753,135 @@ class CoreDaemon:
             )
         )
 
+    def _enqueue_anomaly_scoring(self, pending: PendingAnomalyScoring) -> None:
+        """`FlowPipeline`'s batching handoff (ADDENDUM_2 follow-up pass, section 3). Detection thread only.
+
+        Drops rather than blocks under backpressure, same discipline as
+        every other cross-thread queue here — but "dropped" here does not
+        mean the flow is lost. `pending.outcome` already carries real
+        known-attack and behavioral evidence; on drop this finishes the
+        flow immediately with `anomaly_evidence` left `None`, so it still
+        reaches a real `ThreatAssessment`, just without an Isolation Forest
+        score. That is a materially different, milder failure than
+        `_note_backpressure_drop`'s "never assessed at all" — tracked by
+        its own counter and event for exactly that reason (section 3c).
+        """
+        try:
+            self._anomaly_queue.put_nowait(pending)
+        except queue.Full:
+            self._note_anomaly_scoring_drop(pending.flow)
+            self._pipeline.finish(pending.flow, pending.now, pending.outcome)
+
+    def _note_anomaly_scoring_drop(self, flow: Flow) -> None:
+        self._anomaly_scores_dropped += 1
+        count = self._anomaly_scores_dropped
+        self._counters.add(anomaly_scores_dropped_for_backpressure=1)
+        if count != 1 and count % _BACKPRESSURE_REPORT_INTERVAL != 0:
+            return
+        _logger.warning(
+            "anomaly-scoring queue full, flow %s finished without an anomaly score "
+            "(%d dropped so far)",
+            flow.flow_id,
+            count,
+        )
+        self._forwarder.emit(
+            SecurityEvent(
+                timestamp=datetime.now(UTC),
+                severity=EventSeverity.WARNING,
+                event_type=SecurityEventType.SYSTEM_WARNING,
+                subsystem=_SUBSYSTEM,
+                flow_id=flow.flow_id,
+                reason=(
+                    f"anomaly-scoring queue full; {count} flow(s) finished without an "
+                    "anomaly score. Batched Isolation Forest inference is falling behind."
+                ),
+            )
+        )
+
+    def _anomaly_inference_loop(self) -> None:
+        """Batch-score queued flows through Isolation Forest (ADDENDUM_2 follow-up pass, section 3).
+
+        Only spawned when a model is actually loaded (see `start()`). One
+        `decision_function` call per batch instead of one per flow —
+        `benchmarks/2026-08-30/REPORT.md` measured single-flow scoring as
+        92% of total packet-to-decision cost on a real Pi 4. Bounds
+        worst-case added latency to `detection.anomaly_batch_max_wait_seconds`
+        via `_collect_anomaly_batch`, the same "flush on size or timeout"
+        shape as any other micro-batcher.
+        """
+        while not self._stop.is_set():
+            batch = self._collect_anomaly_batch()
+            if batch:
+                self._score_and_finish_batch(batch)
+        leftover = self._drain_anomaly_queue_nowait()
+        if leftover:
+            self._score_and_finish_batch(leftover)
+        _logger.info("anomaly inference loop exited")
+
+    def _collect_anomaly_batch(self) -> list[PendingAnomalyScoring]:
+        """Block for one item, then keep collecting up to `anomaly_batch_size` more or until
+        `anomaly_batch_max_wait_seconds` has elapsed since the first item arrived, whichever
+        comes first. This is what bounds worst-case per-flow latency under low load instead of
+        waiting indefinitely for a full batch.
+        """
+        try:
+            first = self._anomaly_queue.get(timeout=_QUEUE_POLL_SECONDS)
+        except queue.Empty:
+            return []
+        batch = [first]
+        batch_size = self._config.detection.anomaly_batch_size
+        deadline = time.monotonic() + self._config.detection.anomaly_batch_max_wait_seconds
+        while len(batch) < batch_size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                batch.append(self._anomaly_queue.get(timeout=remaining))
+            except queue.Empty:
+                break
+        return batch
+
+    def _drain_anomaly_queue_nowait(self) -> list[PendingAnomalyScoring]:
+        items: list[PendingAnomalyScoring] = []
+        while True:
+            try:
+                items.append(self._anomaly_queue.get_nowait())
+            except queue.Empty:
+                return items
+
+    def _score_and_finish_batch(self, batch: list[PendingAnomalyScoring]) -> None:
+        """Score one batch and finish every flow in it. Anomaly-inference thread only.
+
+        A batch-level inference failure (a schema mismatch, or anything
+        else `detect_anomaly_batch` raises) degrades every flow in the
+        batch to no anomaly evidence, exactly like a single-flow inference
+        failure degrades that one flow in the non-batched path
+        (`DetectionCoordinator._detect_anomaly`) — never loses the flow.
+        """
+        model = self._coordinator.models.isolation_forest
+        if model is None:  # pragma: no cover — this thread only runs when a model is loaded
+            for pending in batch:
+                self._pipeline.finish(pending.flow, pending.now, pending.outcome)
+            return
+        now = datetime.now(UTC)
+        started = time.perf_counter()
+        try:
+            evidences = detect_anomaly_batch(
+                model,
+                [pending.features for pending in batch],
+                self._config.detection.anomaly_score_threshold,
+                now,
+            )
+        except (ModelInferenceError, ValueError) as exc:
+            _logger.warning("batched anomaly inference failed for %d flow(s): %s", len(batch), exc)
+            evidences = [None] * len(batch)
+        elapsed_seconds = time.perf_counter() - started
+        self._counters.add(inferences=len(batch), inference_seconds_total=elapsed_seconds)
+        for pending, evidence in zip(batch, evidences, strict=True):
+            self._pipeline.finish(
+                pending.flow, pending.now, with_anomaly_evidence(pending.outcome, evidence)
+            )
+
     def _detection_loop(self) -> None:
         """Drain the flow queue through `FlowPipeline`, one flow at a time.
 
@@ -791,6 +957,7 @@ class CoreDaemon:
                 _logger.warning("sweep pass failed: %s", exc)
             except Exception:
                 _logger.exception("sweep pass crashed")
+        _logger.info("sweep loop exited")
 
     def _enqueue_slow_clusters(self, clusters: list[SlowConnectionCluster]) -> None:
         """Hand slow-connection clusters to the detection thread, dropping rather than blocking."""
@@ -806,7 +973,6 @@ class CoreDaemon:
                         "slow-connection cluster queue full, dropped %d so far",
                         self._slow_clusters_dropped,
                     )
-        _logger.info("sweep loop exited")
 
     def _expire_rules(self, now: datetime) -> None:
         with self._lock:

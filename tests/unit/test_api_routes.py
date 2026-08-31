@@ -7,7 +7,9 @@ from fastapi.routing import APIRoute
 from pirewall.api.app import create_app
 from pirewall.core.enums import FirewallAction, SecurityEventType, ThreatLevel
 from pirewall.core.exceptions import RpcError
+from pirewall.core.models.capture_stats import CaptureStatistics
 from pirewall.core.models.decision import FirewallDecision
+from pirewall.core.models.detection_record import DetectionRecord
 from pirewall.firewall.backend.fake import FakeFirewallBackend
 from pirewall.firewall.manager import FirewallManager
 from pirewall.ipc.dispatcher import CoreRpcDispatcher
@@ -270,3 +272,23 @@ def test_unreachable_core_reports_503_instead_of_crashing() -> None:
     assert "pirewall-core is unreachable" in panel_response.text
     # The operator needs the enforcement consequence, not just the error.
     assert "fail_open" in panel_response.text
+
+
+def test_dashboard_renders_network_statistics_and_detections() -> None:
+    """Phase 9's two rendering gaps (docs/PROGRESS.md "Open questions for the human"):
+    capture stats and detections were reachable over the JSON API but never rendered
+    in the HTML control panel. Confirms the dashboard route now fetches and renders both.
+    """
+    harness = make_harness(NOW)
+    token = login(harness)
+    harness.state.record_capture_stats(
+        CaptureStatistics(interface="eth0", packets_seen=42, packets_dropped=1, packets_malformed=0)
+    )
+    harness.state.record_detection(DetectionRecord(flow_id="flow-1", recorded_at=NOW))
+
+    panel_response = harness.get("/control-panel", headers=auth_headers(token))
+
+    assert panel_response.status_code == 200
+    assert "eth0" in panel_response.text
+    assert "42" in panel_response.text
+    assert "flow-1"[:8] in panel_response.text

@@ -8,6 +8,7 @@ mid-run without losing the flow.
 """
 
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -16,9 +17,21 @@ from pirewall.config.models import MLConfig
 from pirewall.core.enums import ModelType, SecurityEventType
 from pirewall.core.exceptions import ModelInferenceError
 from pirewall.core.models.event import SecurityEvent
+from pirewall.core.models.evidence import AnomalyEvidence
 from pirewall.core.models.feature_vector import FeatureVector
-from pirewall.detection.coordinator import DetectionCoordinator, ModelRegistry, load_models
+from pirewall.detection.coordinator import (
+    DetectionCoordinator,
+    ModelRegistry,
+    load_models,
+    with_anomaly_evidence,
+)
 from pirewall.features.extractor import extract_features
+from pirewall.ml.inference.loader import load_isolation_forest_model
+from pirewall.ml.preprocessing.common import LabeledFlow
+from pirewall.ml.training.isolation_forest_trainer import (
+    save_isolation_forest_artifact,
+    train_isolation_forest,
+)
 from tests.helpers.config import make_config
 from tests.helpers.flows import make_flow
 
@@ -127,3 +140,88 @@ def test_repeated_inference_failures_are_counted_but_not_flooded(
 
     assert coordinator.inference_failures[ModelType.LIGHTGBM] == 20
     assert len(events) == 1  # first failure only, until the 100th
+
+
+def test_analyze_except_anomaly_never_scores_anomaly_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADDENDUM_2 follow-up pass, section 3: this is the entry point batched callers use
+    instead of `analyze` — it must never touch the anomaly detector at all, regardless of
+    whether an Isolation Forest model is loaded, so a caller batching scores elsewhere never
+    pays for (or races) a second, inline score for the same flow.
+    """
+
+    def _must_not_be_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("analyze_except_anomaly must never score anomaly evidence")
+
+    monkeypatch.setattr("pirewall.detection.coordinator.detect_anomaly", _must_not_be_called)
+    config = make_config()
+    coordinator = DetectionCoordinator(
+        config.detection,
+        ModelRegistry(isolation_forest=_ExplodingModel()),  # pyright: ignore[reportArgumentType]
+    )
+    flow = make_flow()
+
+    outcome = coordinator.analyze_except_anomaly(flow, extract_features(flow), NOW)
+
+    assert outcome.record.anomaly_evidence is None
+
+
+def test_with_anomaly_evidence_attaches_evidence_without_changing_anything_else() -> None:
+    config = make_config()
+    coordinator = DetectionCoordinator(config.detection, ModelRegistry())
+    flow = make_flow()
+    outcome = coordinator.analyze_except_anomaly(flow, extract_features(flow), NOW)
+    evidence = AnomalyEvidence(
+        flow_id=flow.flow_id,
+        anomaly_score=-0.5,
+        threshold=0.0,
+        is_anomaly=True,
+        model_version="1.0.0",
+        feature_schema_version="1.0.0",
+        generated_at=NOW,
+    )
+
+    combined = with_anomaly_evidence(outcome, evidence)
+
+    assert combined.record.anomaly_evidence == evidence
+    assert combined.record.known_evidence == outcome.record.known_evidence
+    assert combined.record.flow_id == outcome.record.flow_id
+    assert combined.behavior == outcome.behavior
+
+
+def test_analyze_equals_analyze_except_anomaly_plus_with_anomaly_evidence(tmp_path: Path) -> None:
+    """The split introduced for batched scoring (ADDENDUM_2 follow-up pass, section 3) must be
+    behavior-preserving. `analyze` is defined in terms of these two pieces internally, but this
+    pins the equivalence directly against a real trained model rather than trusting it by
+    inspection.
+    """
+    flows = [LabeledFlow(flow=make_flow(flow_id=f"benign-{i}"), label="BENIGN") for i in range(20)]
+    result = train_isolation_forest(
+        flows,
+        training_dataset_name="synthetic_fixture",
+        model_version="0.0.1-placeholder",
+        is_placeholder=True,
+    )
+    model_path = save_isolation_forest_artifact(result, tmp_path)
+    isolation_forest = load_isolation_forest_model(model_path)
+    config = make_config()
+    flow = make_flow(flow_id="target")
+    features = extract_features(flow)
+
+    combined_coordinator = DetectionCoordinator(
+        config.detection, ModelRegistry(isolation_forest=isolation_forest)
+    )
+    combined_outcome = combined_coordinator.analyze(flow, features, NOW)
+
+    # A fresh coordinator (fresh BehaviorAnalyzer state) so the split path's own
+    # `observe_completion` call doesn't double-count this flow against the combined run above.
+    split_coordinator = DetectionCoordinator(
+        config.detection, ModelRegistry(isolation_forest=isolation_forest)
+    )
+    partial = split_coordinator.analyze_except_anomaly(flow, features, NOW)
+    anomaly = split_coordinator._detect_anomaly(features, NOW)  # pyright: ignore[reportPrivateUsage]
+    split_outcome = with_anomaly_evidence(partial, anomaly)
+
+    assert combined_outcome.record == split_outcome.record
+    assert combined_outcome.behavior == split_outcome.behavior

@@ -23,4 +23,8 @@ def dashboard(rpc_client: RpcClientDep) -> HTMLResponse:
     threats = rpc_client.list_threats()
     models = rpc_client.list_models()
     allowlist = rpc_client.list_allowlist()
-    return HTMLResponse(render_dashboard(status, rules, events, threats, models, allowlist))
+    capture_stats = rpc_client.get_capture_stats()
+    detections = rpc_client.list_detections()
+    return HTMLResponse(
+        render_dashboard(status, rules, events, threats, models, allowlist, capture_stats, detections)
+    )

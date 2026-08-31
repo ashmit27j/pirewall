@@ -109,6 +109,20 @@ class DetectionConfig(PirewallModel):
         default="config/known_tool_fingerprints.toml", min_length=1
     )
 
+    # ADDENDUM_2 follow-up pass, section 3 — batched Isolation Forest
+    # scoring. `IsolationForest.decision_function`'s cost is almost
+    # entirely fixed per-call overhead, not tree traversal (measured at
+    # ~30.7 ms/call on a real Pi 4 regardless of batch size 1 vs. 200:
+    # benchmarks/2026-08-30/REPORT.md §3-4,
+    # benchmarks/2026-08-31-anomaly-batching/quick_benchmark.py), so
+    # scoring `anomaly_batch_size` flows in one call amortizes that
+    # overhead across all of them instead of paying it once per flow.
+    # `anomaly_batch_max_wait_seconds` bounds how long a flow can sit
+    # waiting for a batch to fill under low load — worst-case *added*
+    # detection latency from batching, not a per-flow guarantee.
+    anomaly_batch_size: int = Field(default=50, gt=0)
+    anomaly_batch_max_wait_seconds: float = Field(default=0.2, gt=0.0)
+
 
 class MLConfig(PirewallModel):
     """Model artifact locations and expected feature schema (spec §15)."""

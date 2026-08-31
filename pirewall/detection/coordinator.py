@@ -138,6 +138,22 @@ class DetectionOutcome:
     behavior: BehaviorAssessment | None
 
 
+def with_anomaly_evidence(
+    outcome: DetectionOutcome, anomaly_evidence: AnomalyEvidence | None
+) -> DetectionOutcome:
+    """Attach anomaly evidence to an outcome produced by `DetectionCoordinator.analyze_except_anomaly`.
+
+    Pure data combination, no coordinator state needed — a caller that
+    scored anomaly evidence separately (batched, ADDENDUM_2 follow-up pass
+    section 3) uses this to fold the result back in before the outcome
+    continues through `pirewall.engine.threat.assess_threat`.
+    """
+    return DetectionOutcome(
+        record=outcome.record.model_copy(update={"anomaly_evidence": anomaly_evidence}),
+        behavior=outcome.behavior,
+    )
+
+
 class DetectionCoordinator:
     """Runs every available detector over one flow and pairs up the results."""
 
@@ -201,14 +217,41 @@ class DetectionCoordinator:
         This module's only job for it is to embed it in the combined
         `DetectionRecord`, the same passthrough role it already plays for
         `known`/`anomaly` evidence computed by other modules.
+
+        Scores anomaly evidence inline, synchronously, one flow at a time —
+        use `analyze_except_anomaly` instead when the caller batches
+        Isolation Forest scoring across many flows (ADDENDUM_2 follow-up
+        pass, section 3; `pirewall.runtime.core.CoreDaemon`'s dedicated
+        anomaly-inference thread).
+        """
+        outcome = self.analyze_except_anomaly(flow, features, now, protocol_signature)
+        anomaly = self._detect_anomaly(features, now)
+        return with_anomaly_evidence(outcome, anomaly)
+
+    def analyze_except_anomaly(
+        self,
+        flow: Flow,
+        features: FeatureVector,
+        now: datetime,
+        protocol_signature: ProtocolSignatureEvidence | None = None,
+    ) -> DetectionOutcome:
+        """Everything `analyze` does except Isolation Forest scoring — `anomaly_evidence` is
+        always `None` on the returned outcome's record.
+
+        For callers that batch anomaly scoring across many flows instead of
+        scoring inline per flow (ADDENDUM_2 follow-up pass, section 3):
+        attach the real evidence afterward with `with_anomaly_evidence`.
+        Folds in this flow's completion signal into `BehaviorAnalyzer`
+        exactly once either way — `analyze` calling this and doing nothing
+        else with `BehaviorAnalyzer` is what keeps that guarantee true
+        regardless of which entry point a caller uses.
         """
         self._behavior.observe_completion(flow)
         known = self._classify_known(features, now)
-        anomaly = self._detect_anomaly(features, now)
         record = DetectionRecord(
             flow_id=flow.flow_id,
             known_evidence=known,
-            anomaly_evidence=anomaly,
+            anomaly_evidence=None,
             protocol_signature_evidence=protocol_signature,
             recorded_at=now,
         )

@@ -26,6 +26,8 @@ from urllib.parse import quote
 
 from pirewall.core.enums import RuleStatus
 from pirewall.core.models.allowlist import AllowlistEntry
+from pirewall.core.models.capture_stats import CaptureStatistics
+from pirewall.core.models.detection_record import DetectionRecord
 from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.model_metadata import ModelMetadata
 from pirewall.core.models.rule import FirewallRule
@@ -203,6 +205,48 @@ def _render_threats_section(threats: Iterable[ThreatAssessment]) -> str:
     """
 
 
+def _render_network_section(capture_stats: CaptureStatistics | None) -> str:
+    if capture_stats is None:
+        row = '<tr><td colspan="4">No capture statistics reported yet.</td></tr>'
+    else:
+        row = (
+            f"<tr><td>{_e(capture_stats.interface)}</td><td>{capture_stats.packets_seen}</td>"
+            f"<td>{capture_stats.packets_dropped}</td><td>{capture_stats.packets_malformed}</td></tr>"
+        )
+    return f"""
+    <h2>Network</h2>
+    <table>
+      <tr><th>Interface</th><th>Packets seen</th><th>Packets dropped</th><th>Packets malformed</th></tr>
+      {row}
+    </table>
+    """
+
+
+def _detection_evidence_summary(record: DetectionRecord) -> str:
+    parts: list[str] = []
+    if record.known_evidence is not None:
+        parts.append(f"known: {_e(record.known_evidence.predicted_class)}")
+    if record.anomaly_evidence is not None:
+        parts.append(f"anomaly: {record.anomaly_evidence.anomaly_score:.2f}")
+    if record.protocol_signature_evidence is not None:
+        parts.append(f"protocol: {_e(record.protocol_signature_evidence.signature)}")
+    return ", ".join(parts) or "&mdash;"
+
+
+def _render_detections_section(detections: Iterable[DetectionRecord]) -> str:
+    rows = "".join(
+        f"<tr><td>{_e(d.recorded_at)}</td><td>{_e(d.flow_id[:8])}</td><td>{_detection_evidence_summary(d)}</td></tr>"
+        for d in detections
+    )
+    return f"""
+    <h2>Detections</h2>
+    <table>
+      <tr><th>Time</th><th>Flow</th><th>Evidence</th></tr>
+      {rows or '<tr><td colspan="3">No detections recorded yet.</td></tr>'}
+    </table>
+    """
+
+
 def _render_firewall_section(rules: list[FirewallRule]) -> str:
     rows = "".join(
         f"<tr><td>{_e(rule.id[:8])}</td><td>{_e(rule.action.value)}</td>"
@@ -333,11 +377,15 @@ def render_dashboard(
     threats: list[ThreatAssessment],
     models: list[ModelMetadata],
     allowlist: list[AllowlistEntry],
+    capture_stats: CaptureStatistics | None,
+    detections: list[DetectionRecord],
 ) -> str:
     """Render the full control panel (spec §30's sections, plus the addendum additions)."""
     body = (
         "<h1>pirewall control panel</h1>"
         + _render_system_section(status)
+        + _render_network_section(capture_stats)
+        + _render_detections_section(detections)
         + _render_threats_section(threats)
         + _render_firewall_section(rules)
         + _render_shadow_log_section(rules)

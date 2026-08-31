@@ -73,6 +73,15 @@ concurrent_slow_connections_threshold = 8
 # that file's own header for its source and honest staleness limitation.
 known_tool_fingerprints_path = "config/known_tool_fingerprints.toml"
 
+# ADDENDUM_2 follow-up pass, section 3 — batched Isolation Forest scoring.
+# anomaly_batch_size flows are scored in one decision_function call rather
+# than one call per flow; anomaly_batch_max_wait_seconds bounds how long a
+# flow waits for a batch to fill under low load. See docs/ARCHITECTURE.md
+# and benchmarks/2026-08-31-anomaly-batching/ for the numbers behind these
+# defaults.
+anomaly_batch_size = 50
+anomaly_batch_max_wait_seconds = 0.2
+
 [ml]
 lightgbm_model_path = "pirewall/ml/artifacts/lightgbm_model.txt"
 isolation_forest_model_path = "pirewall/ml/artifacts/isolation_forest_model.joblib"

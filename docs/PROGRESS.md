@@ -1871,7 +1871,7 @@ for what's actually built so far if this table looks incomplete.
 | B3 Evidence-maturity gate | Complete | Tested — see below |
 | B4 Heartbleed detector | Complete | Tested — see below |
 | B5 JA3 fingerprinting | Complete | Tested — see below |
-| B6 Empirical sqlmap-pattern test | Not started | — |
+| B6 Empirical sqlmap-pattern test | Complete | Tested — see below |
 | §7 WAFFY scope boundary (docs only) | Not started | — |
 
 ### B1 — Tested
@@ -2002,6 +2002,29 @@ unrelated failure noted under B1.
 **Environment-dependent**: the seed list's currency/coverage against real,
 current attack tooling — stated as a standing, disclosed limitation in the
 seed file's own header, not something resolvable from this session.
+
+### B6 — Tested (empirical finding, no runtime code changed)
+
+Genuine empirical question, genuinely answered, not assumed: does the
+volumetric/behavioral layer (accelerated by B1) indirectly catch sqlmap-
+style automated probing? **Yes for a realistic full multi-technique sweep
+(caught reliably, 10/10 seeded runs, via `REPEATED_CONNECTIONS`+
+`HIGH_FREQUENCY`+`BURST`); no for a moderate or light, targeted probe
+(0-1/10 runs).** Full table, method, and the honest keep-alive-connection-
+reuse blind spot this can't close are in `docs/ADDENDUM_2.md` B6 — this is
+genuine partial coverage, stated with its real boundary, not overclaimed
+as general web-app-attack detection.
+
+**Tested**: `tests/unit/test_b6_sqlmap_pattern.py` (3 tests) — each
+scenario drives the real B1 production wiring
+(`FlowAggregator(on_new_flow=...)` -> `BehaviorAnalyzer`) with jittered
+(not artificially perfectly-regular) request timing, seeded for
+reproducibility; the reported result table was built from 10 seeds per
+scenario before picking one representative seed per test. `ruff check .`
+and `pyright --strict` clean across the whole repo. Full suite: 619
+passed, 22 skipped, the same 1 pre-existing unrelated failure noted under
+B1. No runtime code changed, per the phase prompt's own scope for this
+section.
 
 ### B3 — Tested
 

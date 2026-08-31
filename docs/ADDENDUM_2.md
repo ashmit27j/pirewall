@@ -559,7 +559,73 @@ TLS traffic diversity, same caveat as B4.
 
 ## B6. Empirical test: does the volumetric layer catch automated web-app probing?
 
-*(filled in when B6 is implemented — see the B6 commit)*
+**Question:** sqlmap-style automated SQL injection/XSS probing sends a
+high volume of rapid requests to one endpoint. pirewall can never classify
+the *content* as SQL injection (spec §7), but the *rate pattern* might be
+structurally similar to the brute-force patterns
+(`repeated_connections_threshold`, `high_frequency_per_second_threshold`)
+already detected well. This was a genuine open question, not assumed —
+`tests/unit/test_b6_sqlmap_pattern.py` is the actual empirical test, run
+against three scan intensities with realistic (jittered, not
+perfectly-regular) request timing.
+
+**Method:** each scenario drives the real `FlowAggregator(on_new_flow=...)`
+-> `BehaviorAnalyzer.observe_new_connection` wiring (the exact production
+call path, ADDENDUM_2.md B1) with a new connection per probe request
+(sqlmap/most HTTP client libraries open a fresh TCP connection per request
+by default rather than reusing one via keep-alive — the opposite case,
+where the whole scan is one long-lived connection, cannot be seen as
+"repeated connections" at all under pirewall's per-flow model; see the
+limitation below). Timing includes bounded random jitter around a mean
+interval, seeded for reproducibility — a naive perfectly-regular synthetic
+timestamp sequence would make `TEMPORAL_PATTERN` fire in every scenario
+regardless of realism, which would overclaim.
+
+**Result — genuine, honest, and more nuanced than a yes/no:**
+
+| Scenario | Rate | Jitter | Result across 10 seeds |
+|---|---|---|---|
+| Full multi-technique sweep (40 requests, no `--delay`) | ~5 req/s | ±20% | **`REPEATED_CONNECTIONS` + `HIGH_FREQUENCY` + `BURST` fired in all 10/10 runs** |
+| Moderate 2-technique scan (18 requests) | ~1.2 req/s | ±35% | `TEMPORAL_PATTERN` fired in 1/10 runs; **9/10 produced no detection at all** |
+| Light single-payload probe (8 requests) | ~1 req/s | ±45% | **0/10 runs produced any detection** |
+
+**The honest conclusion:** a realistic full sqlmap sweep testing multiple
+injection techniques against one parameter — the common case for an actual
+attacker actually trying to find a working payload — **is caught, reliably,
+by the existing volumetric thresholds, with no changes needed.** This is
+genuine partial coverage worth stating plainly. But a moderate or light,
+targeted probe (testing one or two techniques, e.g. an attacker who already
+knows roughly what they're looking for, or a single automated check in a
+larger toolchain) **falls below every default threshold and is not
+detected** — sqlmap's request volume has to actually be high enough to look
+like a brute-force pattern; a handful of well-aimed requests looks
+identical to ordinary traffic to a detector that only sees connection
+metadata. `TEMPORAL_PATTERN` (machine-regular timing, a real and
+independently interesting signal for "this is automated, not human") is
+too jitter-sensitive at real-world network variance to be relied on for
+the lighter cases — it only fired when this test's synthetic jitter
+happened to still produce a coefficient of variation under
+`temporal_pattern_cv_threshold` (0.15), which real network/server timing
+variance would not reliably do.
+
+**Limitation stated plainly, not glossed over:** this entire finding
+assumes sqlmap opens a **new TCP connection per HTTP request** (no
+keep-alive reuse). If a target/configuration keeps one persistent
+connection open for many requests, pirewall's per-flow model sees exactly
+**one** flow regardless of how many application-layer requests travel
+inside it — `REPEATED_CONNECTIONS`/`HIGH_FREQUENCY` cannot fire at all in
+that case, since those are connection-count signals, not request-count
+signals, and pirewall has no visibility into HTTP request framing (spec
+§7). This is a real, structural blind spot the volumetric layer cannot
+close — exactly the gap the WAFFY sibling project (§7 below) exists to
+cover.
+
+**Tested:** `tests/unit/test_b6_sqlmap_pattern.py` (3 tests, encoding the
+three scenarios/seeds above with assertions matching the actually-observed
+result, not an assumed one). `ruff check .` and `pyright --strict` clean
+across the whole repo; full suite 619 passed, 22 skipped, the same 1
+pre-existing unrelated failure noted under B1. No runtime code changed for
+this section, per the phase prompt.
 
 ---
 

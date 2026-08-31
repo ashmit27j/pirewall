@@ -4,11 +4,12 @@ from pirewall.capture.fake import FakePacketCapture
 from pirewall.capture.pipeline import capture_packets
 from pirewall.core.enums import Protocol, SecurityEventType
 from pirewall.core.models.event import SecurityEvent
+from pirewall.core.models.packet import PacketMetadata
 from tests.helpers.packets import eth, ipv4_header, tcp_header, udp_header
 
 
-def _valid_tcp_packet() -> bytes:
-    tcp = tcp_header(51234, 443, flags=0x02)
+def _valid_tcp_packet(destination_port: int = 443) -> bytes:
+    tcp = tcp_header(51234, destination_port, flags=0x02)
     ip = ipv4_header(protocol=6, total_length=20 + len(tcp))
     return eth(0x0800) + ip + tcp
 
@@ -59,3 +60,29 @@ def test_no_events_emitted_when_no_sink_supplied() -> None:
     capture = FakePacketCapture("eth-test", [b"\x00" * 10])
     capture.start()
     list(capture_packets(capture))  # must not raise even without a sink
+
+
+def test_on_tcp_payload_fires_for_port_443_traffic_only() -> None:
+    """ADDENDUM_2.md B4/B5: the callback is invoked for TCP/443, never for other TCP or UDP."""
+    scripted: list[bytes | None] = [
+        _valid_tcp_packet(destination_port=443),
+        _valid_tcp_packet(destination_port=8080),
+        _valid_udp_packet(),
+    ]
+    capture = FakePacketCapture("eth-test", scripted)
+    capture.start()
+
+    calls: list[tuple[PacketMetadata, bytes]] = []
+    list(capture_packets(capture, on_tcp_payload=lambda metadata, raw: calls.append((metadata, raw))))
+
+    assert len(calls) == 1
+    metadata, raw = calls[0]
+    assert metadata.protocol is Protocol.TCP
+    assert metadata.destination_port == 443
+    assert raw == scripted[0]
+
+
+def test_no_tcp_payload_callback_invoked_when_none_supplied() -> None:
+    capture = FakePacketCapture("eth-test", [_valid_tcp_packet(destination_port=443)])
+    capture.start()
+    list(capture_packets(capture))  # must not raise without on_tcp_payload

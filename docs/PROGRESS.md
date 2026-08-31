@@ -1869,7 +1869,7 @@ for what's actually built so far if this table looks incomplete.
 | B1 Creation-time behavior counters | Complete | Tested — see below |
 | B2 Slow-rate aggregate signal | Complete | Tested — see below |
 | B3 Evidence-maturity gate | Complete | Tested — see below |
-| B4 Heartbleed detector | Not started | — |
+| B4 Heartbleed detector | Complete | Tested — see below |
 | B5 JA3 fingerprinting | Not started | — |
 | B6 Empirical sqlmap-pattern test | Not started | — |
 | §7 WAFFY scope boundary (docs only) | Not started | — |
@@ -1935,6 +1935,43 @@ unrelated failure noted under B1.
 **Written, not executed this session** (same `AF_UNIX`-on-Windows gap as
 B1): `tests/integration/test_core_daemon.py::test_slow_rate_dos_detected_without_waiting_for_connections_to_close_or_time_out`.
 Run on the next macOS/Linux session, alongside B1's equivalent test.
+
+### B4 — Tested
+
+New `pirewall/detection/tls_heartbeat.py` (CVE-2014-0160 length-mismatch
+check) plus the plumbing to get real TCP payload bytes to it without
+adding payload bytes to the core pipeline: `pirewall.capture.parser.
+extract_tcp_payload` (new, narrow, not used by the primary parse path),
+`capture_packets(on_tcp_payload=...)` (new optional callback, TCP/443
+only), and `CoreDaemon._handle_tcp_payload`/`_tls_evidence` cache/
+`_pop_tls_evidence` tying a capture-time match to the `Flow` it belongs to
+once that flow completes. New `ProtocolSignatureEvidence` model feeds the
+existing scoring/threat-assessment machinery via a new
+`protocol_signature_weight` (75) contribution, and now also satisfies the
+B3 evidence-maturity gate's path (a). Full design, and the explicit
+"why this isn't payload inspection" argument, are in `docs/ADDENDUM_2.md`
+B4.
+
+**Tested**: 9 new tests in `tests/unit/test_tls_heartbeat.py`, 7 new tests
+in `tests/unit/test_parser.py`, 2 new tests in
+`tests/integration/test_capture_pipeline.py`. **Also a genuine, executed
+end-to-end test** — `tests/integration/test_tls_evidence_wiring.py` (5
+tests) — that drives a real `CoreDaemon`'s capture/detection-thread methods
+directly (never calling `.start()`/`.stop()`, which would need the
+`AF_UNIX` socket this Windows session can't open) and confirms a
+hand-built Heartbleed packet produces a real `ThreatAssessment` with
+`protocol_signature_evidence`, `HIGH`/`CRITICAL` severity, and a
+`RATE_LIMIT`/`BLOCK` decision — this is meaningfully stronger evidence than
+"written, not executed", since it actually ran and passed here. `ruff
+check .` and `pyright --strict` clean across the whole repo. Full suite:
+594 passed, 22 skipped, the same 1 pre-existing unrelated failure noted
+under B1.
+
+**Environment-dependent**: real-world TLS traffic diversity (multi-record
+segments, split records, real client/server implementations) — this
+session's traffic is all hand-constructed. Documented as a known,
+disclosed limitation in `docs/ADDENDUM_2.md` B4, not a crash risk (anything
+that doesn't cleanly parse degrades to no evidence, never an exception).
 
 ### B3 — Tested
 

@@ -225,3 +225,61 @@ def _parse_icmp(raw: bytes, offset: int, available: int, protocol: Protocol) -> 
     if available < _ICMP_MIN_HEADER_LEN or len(raw) < offset + _ICMP_MIN_HEADER_LEN:
         raise PacketParseError(f"truncated {protocol.value} header")
     return _L4Info(protocol, None, None, None, _ICMP_MIN_HEADER_LEN)
+
+
+def extract_tcp_payload(raw: bytes) -> bytes | None:
+    """Return one IPv4/TCP packet's raw payload bytes, or `None` for anything else.
+
+    **Only for ADDENDUM_2.md B4/B5's narrow TLS record-layer/ClientHello
+    structural parsing.** `parse_packet` above — the one path every other
+    consumer (flow aggregation, feature extraction, ML) actually uses —
+    never returns payload bytes at all, deliberately (spec §7 "do not
+    perform application-payload inspection as part of the core detection
+    pipeline"; see `pirewall.detection.tls_heartbeat`'s module docstring
+    for why the narrow TLS use case is a different category of work from
+    that). This function duplicates a small amount of `_parse_ipv4`/
+    `_parse_tcp`'s offset arithmetic rather than threading a payload slice
+    through `PacketMetadata` — deliberately: that would put payload bytes
+    one field away from every consumer of the primary parse path, which is
+    exactly the exposure spec §7 exists to avoid.
+
+    Degrades to `None` for anything that isn't cleanly parseable as
+    IPv4/TCP with a complete header — truncated, malformed, non-IPv4,
+    non-TCP. Never raises.
+    """
+    try:
+        return _extract_tcp_payload(raw)
+    except Exception:  # belt-and-suspenders, matching parse_packet's own guard
+        return None
+
+
+def _extract_tcp_payload(raw: bytes) -> bytes | None:
+    if len(raw) < _ETH_HEADER_LEN + _IPV4_MIN_HEADER_LEN:
+        return None
+    if struct.unpack("!H", raw[12:14])[0] != _ETHERTYPE_IPV4:
+        return None
+
+    offset = _ETH_HEADER_LEN
+    if (raw[offset] >> 4) != 4:
+        return None
+    ihl = (raw[offset] & 0x0F) * 4
+    if ihl < _IPV4_MIN_HEADER_LEN or len(raw) < offset + ihl:
+        return None
+    if raw[offset + 9] != _IP_PROTO_TCP:
+        return None
+
+    total_length = struct.unpack("!H", raw[offset + 2 : offset + 4])[0]
+    l4_offset = offset + ihl
+    if len(raw) < l4_offset + _TCP_MIN_HEADER_LEN:
+        return None
+    data_offset = (raw[l4_offset + 12] >> 4) * 4
+    if data_offset < _TCP_MIN_HEADER_LEN or len(raw) < l4_offset + data_offset:
+        return None
+
+    payload_offset = l4_offset + data_offset
+    # Bounded by the IPv4 header's own declared total_length, then by
+    # whatever was actually captured — never read past either.
+    payload_end = min(offset + total_length, len(raw))
+    if payload_offset > payload_end:
+        return None
+    return raw[payload_offset:payload_end]

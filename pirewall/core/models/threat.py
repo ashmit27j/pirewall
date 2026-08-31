@@ -7,11 +7,11 @@ from pydantic import AwareDatetime, Field
 from pirewall.core.enums import ThreatLevel
 from pirewall.core.models.behavior import BehaviorAssessment
 from pirewall.core.models.common import PirewallModel
-from pirewall.core.models.evidence import AnomalyEvidence, KnownEvidence
+from pirewall.core.models.evidence import AnomalyEvidence, KnownEvidence, ProtocolSignatureEvidence
 
 
 class ThreatAssessment(PirewallModel):
-    """Combined known-attack, anomaly, and behavioral evidence for one flow.
+    """Combined known-attack, anomaly, behavioral, and protocol-signature evidence for one flow.
 
     This is the single object the decision engine (spec §19) consumes to
     produce a `FirewallDecision` — it never sees the raw evidence models
@@ -30,6 +30,7 @@ class ThreatAssessment(PirewallModel):
     known_evidence: KnownEvidence | None = None
     anomaly_evidence: AnomalyEvidence | None = None
     behavior_assessment: BehaviorAssessment | None = None
+    protocol_signature_evidence: ProtocolSignatureEvidence | None = None
 
     explanation: str = Field(min_length=1)
     contributing_evidence: tuple[str, ...] = Field(default_factory=tuple)

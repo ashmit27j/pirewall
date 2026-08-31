@@ -339,7 +339,114 @@ noted under B1.
 
 ## B4. Heartbleed detector — TLS record-layer length check
 
-*(filled in when B4 is implemented — see the B4 commit)*
+**What:** `pirewall.detection.tls_heartbeat.check_heartbleed` parses a raw
+TCP payload as a TLS record, and — only for content type 24 (Heartbeat) —
+compares the heartbeat message's claimed `payload_length` field against how
+many bytes the record's own fragment actually contains. A mismatch
+(`claimed_payload_length > available_bytes`) is exactly the CVE-2014-0160
+signature: a vulnerable server trusts the claimed length when building its
+response, leaking whatever heap memory follows its real (small) payload
+buffer. This is the same field-relationship network-based scanners checked
+against real CVE-2014-0160 servers in 2014 — not a technique invented here.
+
+**Why this is not "payload inspection" in spec §7's sense** (stated
+explicitly per the phase prompt's request, since it matters for the
+paper's honesty): spec §7 rules out inspecting *application content* — an
+HTTP body, message text, anything that was ever meant to be read by the
+application at the other end. A TLS record header and a heartbeat message
+header are neither of those things. They are sent **in cleartext, by
+protocol design**, before any encrypted application data exists on the
+connection — the same category of work as `pirewall.capture.parser`
+reading a TCP header's data-offset field. `check_heartbleed` parses
+exactly two fixed-width integers out of those headers; it never touches,
+and structurally cannot touch, anything that was ever encrypted.
+
+**Implementation:**
+
+* `pirewall/detection/tls_heartbeat.py` (new) — pure, degrades to `None`
+  for anything that isn't cleanly a heartbeat-record length mismatch
+  (wrong content type, truncated, a well-formed heartbeat). Never raises
+  (wrapped in its own belt-and-suspenders `except Exception`, matching
+  `pirewall.capture.parser.parse_packet`'s own guard).
+* `pirewall.capture.parser.extract_tcp_payload` (new) — the one place raw
+  TCP payload bytes are ever produced at all. Deliberately **not** added
+  to `PacketMetadata` (the path every other consumer — flow aggregation,
+  features, ML — actually uses): that would put payload bytes one field
+  away from every consumer of the primary parse path, exactly the exposure
+  spec §7 exists to avoid. It duplicates a small amount of `parse_packet`'s
+  own IPv4/TCP offset arithmetic instead, in a function whose only callers
+  are the new TLS detectors.
+* `pirewall.capture.pipeline.capture_packets` gained an optional
+  `on_tcp_payload: Callable[[PacketMetadata, bytes], None]` callback — a
+  plain `Callable`, not an import of anything detection-related, same
+  pattern as its existing `on_event` and `FlowAggregator.on_new_flow`
+  (ADDENDUM_2.md B1). Invoked only for already-successfully-parsed TCP
+  packets on port 443 (the same 443 heuristic B5 uses) — capture itself
+  still never imports `pirewall.detection`.
+* **Wiring, end to end:** `pirewall.runtime.core.CoreDaemon._handle_tcp_payload`
+  (the actual callback, capture-thread-only) extracts the payload, runs
+  `check_heartbleed`, and on a match caches a `_CachedTlsMatch` in a new
+  bounded LRU `_tls_evidence` dict keyed by the packet's `FlowKey` — the
+  *same* undirected key `pirewall.flow.aggregator.FlowAggregator` uses for
+  its own table, guarded by the same `_flow_lock`. A match can't be
+  attached to a `ProtocolSignatureEvidence` yet at capture time because
+  that model requires `flow_id`, which isn't minted until the flow
+  actually completes. When a flow *does* complete, the detection thread's
+  `_pop_tls_evidence` looks up (and consumes) any cached match by
+  recomputing the same key from the completed `Flow`'s own fields, fills
+  in the real `flow_id`, and hands the resulting `ProtocolSignatureEvidence`
+  into `FlowPipeline.process` -> `DetectionCoordinator.analyze` (now embeds
+  it in `DetectionRecord`) -> `assess_threat` (new
+  `protocol_signature_weight=75` contribution, `weight * confidence`, same
+  shape as known-attack) -> `ThreatAssessment.protocol_signature_evidence`
+  — reusing 100% of the existing evidence/scoring/decision machinery, no
+  parallel path.
+* **B3 interaction**: a positive `protocol_signature_evidence` was added as
+  a third qualifying case under the evidence-maturity gate's path (a) — see
+  `pirewall.engine.decision`'s updated module docstring — since it's a
+  deterministic structural match, not a raw score, the same category of
+  conclusiveness as a completed-flow ML classification.
+
+**Tested:** `tests/unit/test_tls_heartbeat.py` (9 tests) — the literal
+CVE-2014-0160 proof-of-concept byte shape detected, a well-formed heartbeat
+with correct padding not triggering, Handshake/ApplicationData records not
+triggering, and five malformed/truncated/lying-about-its-own-length
+variants degrading to `None` without raising. `tests/unit/test_parser.py`
+(7 new tests) — `extract_tcp_payload` against valid TCP-with-payload,
+bare-SYN, IPv6, UDP, truncated, and a declared `total_length` far exceeding
+what was actually captured (proving the bound is against captured bytes,
+not the attacker-controlled header field). `tests/integration/
+test_capture_pipeline.py` (2 new tests) — `on_tcp_payload` fires for TCP
+port 443 only, never for other TCP or UDP traffic, and is safely omittable.
+
+**`tests/integration/test_tls_evidence_wiring.py` (new, 5 tests) — a real,
+executable end-to-end test, not just written-and-unverified.** Unlike
+`test_core_daemon.py`, this constructs a `CoreDaemon` and calls its
+capture-thread/detection-thread methods (`_handle_tcp_payload`,
+`_pop_tls_evidence`, `_pipeline.process`) directly, **never** calling
+`.start()`/`.stop()` — those are what bind the real `AF_UNIX` RPC socket
+this Windows dev session cannot open. Everything this pass's B4 wiring
+actually does lives below that socket, in already-constructed subsystems,
+so this genuinely runs (and passed) here: a hand-built Heartbleed-signature
+packet gets cached by flow key, popped correctly when a matching `Flow`
+completes (and consumed — a second pop finds nothing), an unrelated flow's
+pop finds nothing, and feeding the result through the real
+`FlowPipeline.process` produces a `ThreatAssessment` with
+`protocol_signature_evidence` populated, `threat_level` at `HIGH`/
+`CRITICAL`, and a `RATE_LIMIT`/`BLOCK` decision (confirming the B3 gate's
+path (a) extension actually works end to end). `ruff check .` and
+`pyright --strict` clean across the whole repo; full suite 594 passed, 22
+skipped, the same 1 pre-existing unrelated failure noted under B1.
+
+**Environment-dependent**: real TLS traffic diversity on real hardware —
+this session's traffic is all hand-constructed. The parsing logic itself
+is exercised thoroughly (above); what's unverified is how real-world TLS
+implementations' heartbeat/record framing behaves in practice (e.g.
+multiple records coalesced into one TCP segment, or a heartbeat split
+across segments — both are simply not detected by design, since detection
+only inspects a single captured TCP payload slice at a time; documented as
+a known limitation, not a crash risk, since malformed/incomplete input
+already degrades to `None`).
 
 ## B5. TLS ClientHello fingerprinting for known attack tooling (JA3-style)
 

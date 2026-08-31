@@ -51,24 +51,32 @@ import logging
 import queue
 import signal
 import threading
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from ipaddress import IPv4Address
 from types import FrameType
 
 from pirewall.capture.af_packet import AFPacketCapture
 from pirewall.capture.interfaces import PacketCapture
+from pirewall.capture.parser import extract_tcp_payload
 from pirewall.capture.pipeline import capture_packets
 from pirewall.config.models import PirewallConfig
 from pirewall.core.enums import EventSeverity, FailureMode, SecurityEventType
 from pirewall.core.exceptions import CaptureError, PirewallError
 from pirewall.core.models.event import SecurityEvent
+from pirewall.core.models.evidence import ProtocolSignatureEvidence
 from pirewall.core.models.flow import Flow
+from pirewall.core.models.packet import PacketMetadata
 from pirewall.detection.coordinator import DetectionCoordinator, load_models
+from pirewall.detection.tls_heartbeat import check_heartbleed
 from pirewall.firewall.backend.nftables import NftablesBackend
 from pirewall.firewall.interface import FirewallBackend
 from pirewall.firewall.manager import FirewallManager
 from pirewall.flow.aggregator import FlowAggregator, NewFlowSignal, SlowConnectionCluster
+from pirewall.flow.key import FlowKey, compute_flow_key
 from pirewall.integration.netdata import NetdataExporter, StatsdNetdataTransport
 from pirewall.integration.wazuh import SyslogWazuhTransport, WazuhForwarder
 from pirewall.ipc.dispatcher import CoreRpcDispatcher
@@ -99,6 +107,11 @@ _NEW_FLOW_QUEUE_MAX = 50_000
 # concurrent-slow-connection threshold, produced at most once per sweep
 # interval — orders of magnitude fewer than either flow queue.
 _SLOW_CLUSTER_QUEUE_MAX = 1_000
+# Bounded LRU cache of TLS structural matches awaiting the flow they belong
+# to (ADDENDUM_2.md B4/B5), keyed by the same undirected `FlowKey` the flow
+# table itself uses. Written by the capture thread, read/popped by the
+# detection thread — see `_handle_tcp_payload`/`_pop_tls_evidence`.
+_TLS_EVIDENCE_CACHE_MAX = 10_000
 # How long the queue drain waits before re-checking the stop flag.
 _QUEUE_POLL_SECONDS = 0.5
 # Threads get this long to finish after `stop()` before the process gives up
@@ -108,6 +121,23 @@ _THREAD_JOIN_TIMEOUT_SECONDS = 5.0
 # Report dropped-flow backpressure at most this often, so a sustained
 # overload produces a steady signal instead of a log flood.
 _BACKPRESSURE_REPORT_INTERVAL = 1000
+
+
+@dataclass(frozen=True, slots=True)
+class _CachedTlsMatch:
+    """One TLS structural match awaiting the flow it belongs to (ADDENDUM_2.md B4/B5).
+
+    Not `ProtocolSignatureEvidence` itself: that model requires `flow_id`,
+    which isn't assigned until the flow actually completes
+    (`pirewall.flow.aggregator.FlowAggregator` mints it via `uuid4()` at
+    finalization) — long after the packet that revealed this match was
+    seen. `_pop_tls_evidence` fills in the real `flow_id` once it's known.
+    """
+
+    signature: str
+    confidence: float
+    detail: str
+    generated_at: datetime
 
 
 class _SynchronizedDispatcher(CoreRpcDispatcher):
@@ -205,6 +235,11 @@ class CoreDaemon:
         )
         self._slow_clusters_dropped = 0
         self._aggregator = FlowAggregator(config.flow, on_new_flow=self._handle_new_flow)
+        # ADDENDUM_2.md B4/B5 — written by the capture thread
+        # (`_handle_tcp_payload`), read/popped by the detection thread
+        # (`_pop_tls_evidence`) once the flow it belongs to completes.
+        # Guarded by `_flow_lock`, same as the aggregator's own table.
+        self._tls_evidence: OrderedDict[FlowKey, _CachedTlsMatch] = OrderedDict()
 
         models = load_models(config.ml)
         self._model_load_errors = models.load_errors
@@ -445,7 +480,9 @@ class CoreDaemon:
     def _capture_loop(self) -> None:
         """Capture -> parse -> aggregate. Completed flows go onto the detection queue."""
         try:
-            for packet in capture_packets(self._capture, self._forwarder):
+            for packet in capture_packets(
+                self._capture, self._forwarder, on_tcp_payload=self._handle_tcp_payload
+            ):
                 if self._stop.is_set():
                     return
                 with self._flow_lock:
@@ -502,6 +539,87 @@ class CoreDaemon:
                     "new-flow signal queue full, dropped %d so far",
                     self._new_flow_signals_dropped,
                 )
+
+    def _handle_tcp_payload(self, metadata: PacketMetadata, raw: bytes) -> None:
+        """`capture_packets`'s TCP/443 callback (ADDENDUM_2.md B4/B5). Runs on the capture thread.
+
+        Extracts the TCP payload and runs the narrow TLS structural
+        detectors against it. A match is cached by flow key for
+        `_pop_tls_evidence` to pick up once the flow it belongs to
+        completes — this method never touches `BehaviorAnalyzer`, the flow
+        queue, or anything else detection-thread-owned.
+
+        Must never raise: a bug or a genuinely malformed/adversarial packet
+        here must degrade to "no TLS evidence for this packet", never take
+        the capture loop down with it (this runs inside `capture_packets`'s
+        generator body, ahead of `_capture_loop`'s own try/except, which
+        would otherwise treat an escaped exception as a fatal capture-loop
+        crash).
+        """
+        try:
+            self._handle_tcp_payload_unsafe(metadata, raw)
+        except Exception:
+            _logger.exception("TLS structural inspection failed for a packet; continuing")
+
+    def _handle_tcp_payload_unsafe(self, metadata: PacketMetadata, raw: bytes) -> None:
+        if not isinstance(metadata.source_ip, IPv4Address) or not isinstance(
+            metadata.destination_ip, IPv4Address
+        ):
+            return
+        payload = extract_tcp_payload(raw)
+        if not payload:
+            return
+
+        heartbleed = check_heartbleed(payload)
+        if heartbleed is not None:
+            self._cache_tls_match(
+                metadata,
+                signature="heartbleed",
+                confidence=1.0,
+                detail=(
+                    f"TLS heartbeat claimed payload_length={heartbleed.claimed_payload_length} "
+                    f"but the record held only {heartbleed.available_bytes} bytes "
+                    "(CVE-2014-0160 signature)"
+                ),
+            )
+
+    def _cache_tls_match(
+        self, metadata: PacketMetadata, *, signature: str, confidence: float, detail: str
+    ) -> None:
+        assert isinstance(metadata.source_ip, IPv4Address)
+        assert isinstance(metadata.destination_ip, IPv4Address)
+        key = compute_flow_key(
+            metadata.source_ip,
+            metadata.destination_ip,
+            metadata.source_port,
+            metadata.destination_port,
+            metadata.protocol,
+        )
+        match = _CachedTlsMatch(
+            signature=signature, confidence=confidence, detail=detail, generated_at=metadata.timestamp
+        )
+        with self._flow_lock:
+            if key not in self._tls_evidence and len(self._tls_evidence) >= _TLS_EVIDENCE_CACHE_MAX:
+                self._tls_evidence.popitem(last=False)
+            self._tls_evidence[key] = match
+            self._tls_evidence.move_to_end(key)
+
+    def _pop_tls_evidence(self, flow: Flow) -> ProtocolSignatureEvidence | None:
+        """Look up and consume any cached TLS match for `flow`'s key. Detection thread only."""
+        key = compute_flow_key(
+            flow.source_ip, flow.destination_ip, flow.source_port, flow.destination_port, flow.protocol
+        )
+        with self._flow_lock:
+            cached = self._tls_evidence.pop(key, None)
+        if cached is None:
+            return None
+        return ProtocolSignatureEvidence(
+            flow_id=flow.flow_id,
+            signature=cached.signature,
+            confidence=cached.confidence,
+            detail=cached.detail,
+            generated_at=cached.generated_at,
+        )
 
     def _drain_new_flow_signals(self) -> None:
         """Fold every pending creation-time signal into `BehaviorAnalyzer`. Detection thread only."""
@@ -581,7 +699,8 @@ class CoreDaemon:
             except queue.Empty:
                 continue
             try:
-                self._pipeline.process(flow, datetime.now(UTC))
+                protocol_signature = self._pop_tls_evidence(flow)
+                self._pipeline.process(flow, datetime.now(UTC), protocol_signature)
             finally:
                 self._flow_queue.task_done()
         self._drain_new_flow_signals()

@@ -42,6 +42,7 @@ from pirewall.config.models import PirewallConfig
 from pirewall.core.enums import EventSeverity, FirewallAction, SecurityEventType, ThreatLevel
 from pirewall.core.exceptions import FeatureExtractionError, PirewallError
 from pirewall.core.models.event import SecurityEvent
+from pirewall.core.models.evidence import ProtocolSignatureEvidence
 from pirewall.core.models.flow import Flow
 from pirewall.detection.coordinator import DetectionCoordinator
 from pirewall.engine.decision import EvidenceMaturityTracker, decide
@@ -89,17 +90,30 @@ class FlowPipeline:
         # thread reads both to answer `/status`, `/rules`, `/threats`.
         self._lock = lock
 
-    def process(self, flow: Flow, now: datetime) -> None:
-        """Process one completed flow. Never raises — see the module docstring."""
+    def process(
+        self,
+        flow: Flow,
+        now: datetime,
+        protocol_signature: ProtocolSignatureEvidence | None = None,
+    ) -> None:
+        """Process one completed flow. Never raises — see the module docstring.
+
+        `protocol_signature` (ADDENDUM_2.md B4/B5) is supplied by
+        `pirewall.runtime.core.CoreDaemon`, looked up by this flow's key
+        from raw-payload inspection performed while the connection was
+        still open — this class has no capture-layer access of its own.
+        """
         try:
-            self._process(flow, now)
+            self._process(flow, now, protocol_signature)
         except PirewallError as exc:
             self._report_failure(flow, now, exc)
         except Exception as exc:  # a bug here must not take capture down with it
             _logger.exception("unexpected error processing flow %s", flow.flow_id)
             self._report_failure(flow, now, exc)
 
-    def _process(self, flow: Flow, now: datetime) -> None:
+    def _process(
+        self, flow: Flow, now: datetime, protocol_signature: ProtocolSignatureEvidence | None
+    ) -> None:
         with self._lock:
             self._state.record_flow(flow)
 
@@ -110,7 +124,7 @@ class FlowPipeline:
             return
 
         started = time.perf_counter()
-        outcome = self._coordinator.analyze(flow, features, now)
+        outcome = self._coordinator.analyze(flow, features, now, protocol_signature)
         elapsed_seconds = time.perf_counter() - started
         if self._coordinator.models.any_loaded:
             self._counters.add(inferences=1, inference_seconds_total=elapsed_seconds)
@@ -124,6 +138,7 @@ class FlowPipeline:
             anomaly_evidence=outcome.record.anomaly_evidence,
             behavior_assessment=outcome.behavior,
             assessed_at=now,
+            protocol_signature_evidence=outcome.record.protocol_signature_evidence,
         )
         decision = decide(assessment, now, self._maturity_tracker)
 

@@ -143,6 +143,19 @@ class ThreatConfig(PirewallModel):
     anomaly_weight: float = Field(default=15.0, ge=0.0, le=100.0)
     behavior_weight: float = Field(default=25.0, ge=0.0, le=100.0)
 
+    # ADDENDUM_2.md B4/B5 — a structural TLS protocol-field match
+    # (Heartbleed length mismatch, a JA3 fingerprint hit against known
+    # attack tooling). Weighted above `known_attack_weight`: a Heartbleed
+    # length mismatch is a near-certain structural protocol violation, not
+    # a probabilistic classification, so a confident match (confidence=1.0
+    # for Heartbleed) alone should already be actionable — see
+    # `pirewall.detection.tls_heartbeat`/`tls_fingerprint` for how each
+    # detector sets its own `confidence` (JA3 tool matches are honestly
+    # weaker/evadable and set a lower one, so this single weight still
+    # differentiates them the same way `known_attack_weight * confidence`
+    # already does for LightGBM's classifications).
+    protocol_signature_weight: float = Field(default=75.0, ge=0.0, le=100.0)
+
     # ADDENDUM_2.md B3 — the evidence-maturity gate. A source whose evidence
     # never qualifies on its own (no completed-flow classification, no
     # multi-observation behavioral pattern — e.g. anomaly evidence alone)

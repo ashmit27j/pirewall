@@ -18,7 +18,11 @@ exactly one of:
 
 (a) a fully completed flow's known-attack classification
     (`ThreatAssessment.known_evidence is not None`) — this is already
-    single-flow-conclusive by what it *is*, not by any threshold;
+    single-flow-conclusive by what it *is*, not by any threshold — or a
+    positive protocol-structure match (`protocol_signature_evidence is not
+    None`, ADDENDUM_2.md B4/B5: a Heartbleed length mismatch or a JA3
+    fingerprint hit) — a deterministic pattern match, not a raw score,
+    same category of conclusiveness as a classification;
 (b) a behavioral signal that already requires multiple independent
     observations by construction — every current
     `BehaviorPatternType` does (see `pirewall.detection.behavior`'s module
@@ -32,12 +36,16 @@ exactly one of:
 Anything reaching `BLOCK`/`RATE_LIMIT` without meeting one of these is
 downgraded to `MONITOR`. This is a safety net, not a new bottleneck on
 detection already trusted: under the current scoring weights
-(`known_attack_weight=60, anomaly_weight=15, behavior_weight=25`), every
-existing completed-flow-classification and volumetric-pattern scenario
-already satisfies (a) or (b) and is unaffected — see
-`docs/ADDENDUM_2.md` B3 for the arithmetic showing anomaly evidence alone
-cannot reach either action's threshold today regardless. It exists so a
-future retrain or threshold change can't silently erode this property.
+(`known_attack_weight=60, anomaly_weight=15, behavior_weight=25,
+protocol_signature_weight=75`), `anomaly_weight` alone cannot even reach
+`low_threshold` (25) — so today, real scoring output can only ever reach
+`high_threshold`/`critical_threshold` (75/90) by already having
+`known_evidence`, a behavioral pattern, or `protocol_signature_evidence`
+contributing, i.e. (a) or (b) already holds whenever this gate would
+apply. Path (c) is therefore not reachable from today's real scoring
+output at all — it exists purely as a forward-looking safety net for a
+future weight/threshold change, verified by construction rather than
+assumed (see `docs/ADDENDUM_2.md` B3 for the full arithmetic).
 """
 
 from collections import OrderedDict
@@ -138,6 +146,8 @@ def decide(
 def _has_mature_evidence(assessment: ThreatAssessment, tracker: EvidenceMaturityTracker | None) -> bool:
     """Paths (a)/(b)/(c) from the module docstring, in order."""
     if assessment.known_evidence is not None:
+        return True
+    if assessment.protocol_signature_evidence is not None:
         return True
     if assessment.behavior_assessment is not None and assessment.behavior_assessment.detected_patterns:
         return True

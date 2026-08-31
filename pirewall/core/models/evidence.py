@@ -37,3 +37,23 @@ class AnomalyEvidence(PirewallModel):
     model_version: str = Field(min_length=1)
     feature_schema_version: str = Field(min_length=1)
     generated_at: AwareDatetime
+
+
+class ProtocolSignatureEvidence(PirewallModel):
+    """A structural TLS protocol-field match — Heartbleed, JA3 tool fingerprinting (ADDENDUM_2.md B4/B5).
+
+    Deliberately its own evidence type, not `KnownEvidence`: this is not an
+    ML classification (no model version, no learned feature schema) — it's
+    a deterministic match against protocol fields sent in cleartext by
+    design (a TLS record header, a ClientHello), the same category of
+    "evidence, never commands" as the other two evidence models, just from
+    a third source. `signature` is a short, stable identifier
+    (`"heartbleed"`, or `"ja3:<hash>:<tool-name>"`) so `/detections` and the
+    audit trail can say plainly what matched.
+    """
+
+    flow_id: str = Field(min_length=1)
+    signature: str = Field(min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+    detail: str = Field(min_length=1)
+    generated_at: AwareDatetime

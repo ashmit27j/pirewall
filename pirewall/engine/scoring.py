@@ -39,8 +39,16 @@ configured weight:
 * **Behavior** (`behavior_weight`): `weight * (patterns detected / total
   possible pattern types)` — more corroborating behavioral signals scale
   the contribution up linearly.
+* **Protocol signature** (`protocol_signature_weight`, ADDENDUM_2.md
+  B4/B5): `weight * confidence` — same shape as known-attack, but the
+  evidence comes from a deterministic TLS structural match
+  (`pirewall.detection.tls_heartbeat`/`tls_fingerprint`) rather than an ML
+  classification. Weighted above `known_attack_weight` because a Heartbleed
+  length mismatch (confidence 1.0) is a near-certain protocol violation,
+  not a probabilistic score; a JA3 tool-fingerprint match sets a lower
+  `confidence`, reflecting that it's an honestly weaker, evadable signal.
 
-The three contributions are summed and clamped to `[0, 100]`.
+The four contributions are summed and clamped to `[0, 100]`.
 """
 
 from dataclasses import dataclass
@@ -48,7 +56,7 @@ from dataclasses import dataclass
 from pirewall.config.models import ThreatConfig
 from pirewall.core.enums import BehaviorPatternType
 from pirewall.core.models.behavior import BehaviorAssessment
-from pirewall.core.models.evidence import AnomalyEvidence, KnownEvidence
+from pirewall.core.models.evidence import AnomalyEvidence, KnownEvidence, ProtocolSignatureEvidence
 from pirewall.ml.labels import is_attack_label
 
 _TOTAL_PATTERN_TYPES = len(BehaviorPatternType)
@@ -62,6 +70,7 @@ class ScoreBreakdown:
     known_attack_contribution: float
     anomaly_contribution: float
     behavior_contribution: float
+    protocol_signature_contribution: float = 0.0
 
 
 def score_evidence(
@@ -69,6 +78,7 @@ def score_evidence(
     known_evidence: KnownEvidence | None,
     anomaly_evidence: AnomalyEvidence | None,
     behavior_assessment: BehaviorAssessment | None,
+    protocol_signature_evidence: ProtocolSignatureEvidence | None = None,
 ) -> ScoreBreakdown:
     """Combine whichever evidence is present into a `ScoreBreakdown`.
 
@@ -90,10 +100,23 @@ def score_evidence(
             len(behavior_assessment.detected_patterns) / _TOTAL_PATTERN_TYPES
         )
 
-    total = min(100.0, known_attack_contribution + anomaly_contribution + behavior_contribution)
+    protocol_signature_contribution = 0.0
+    if protocol_signature_evidence is not None:
+        protocol_signature_contribution = (
+            config.protocol_signature_weight * protocol_signature_evidence.confidence
+        )
+
+    total = min(
+        100.0,
+        known_attack_contribution
+        + anomaly_contribution
+        + behavior_contribution
+        + protocol_signature_contribution,
+    )
     return ScoreBreakdown(
         total=total,
         known_attack_contribution=known_attack_contribution,
         anomaly_contribution=anomaly_contribution,
         behavior_contribution=behavior_contribution,
+        protocol_signature_contribution=protocol_signature_contribution,
     )

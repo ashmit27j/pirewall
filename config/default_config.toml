@@ -97,6 +97,13 @@ known_attack_weight = 60.0
 anomaly_weight = 15.0
 behavior_weight = 25.0
 
+# ADDENDUM_2.md B4/B5 — a structural TLS protocol-field match (Heartbleed
+# length mismatch, a JA3 fingerprint hit against known attack tooling).
+# Weighted above known_attack_weight: a Heartbleed length mismatch is a
+# near-certain structural protocol violation, not a probabilistic
+# classification, so a confident match alone should already be actionable.
+protocol_signature_weight = 75.0
+
 # ADDENDUM_2.md B3 — evidence-maturity gate. A source whose evidence never
 # qualifies on its own (no completed-flow classification, no
 # multi-observation behavioral pattern) can still reach BLOCK/RATE_LIMIT if

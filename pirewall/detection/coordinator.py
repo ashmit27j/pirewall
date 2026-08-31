@@ -33,7 +33,7 @@ from pirewall.core.exceptions import ModelInferenceError, ModelLoadError
 from pirewall.core.models.behavior import BehaviorAssessment
 from pirewall.core.models.detection_record import DetectionRecord
 from pirewall.core.models.event import SecurityEvent
-from pirewall.core.models.evidence import AnomalyEvidence, KnownEvidence
+from pirewall.core.models.evidence import AnomalyEvidence, KnownEvidence, ProtocolSignatureEvidence
 from pirewall.core.models.feature_vector import FeatureVector
 from pirewall.core.models.flow import Flow
 from pirewall.detection.anomaly import detect as detect_anomaly
@@ -171,7 +171,13 @@ class DetectionCoordinator:
         """Total per-model inference failures since startup (not just the ones that emitted events)."""
         return dict(self._inference_failures)
 
-    def analyze(self, flow: Flow, features: FeatureVector, now: datetime) -> DetectionOutcome:
+    def analyze(
+        self,
+        flow: Flow,
+        features: FeatureVector,
+        now: datetime,
+        protocol_signature: ProtocolSignatureEvidence | None = None,
+    ) -> DetectionOutcome:
         """Observe `flow`, run every available detector, and return the combined evidence.
 
         Never raises for a detector-level failure: an inference error
@@ -186,6 +192,15 @@ class DetectionCoordinator:
         `behavior_analyzer.observe_new_connection` directly from the capture
         path. Calling `observe_flow` here instead would double-count every
         real flow's connection.
+
+        `protocol_signature` (ADDENDUM_2.md B4/B5) is computed upstream, not
+        here — `pirewall.runtime.core.CoreDaemon` inspects raw TCP payload
+        bytes for this flow's key while the connection is still open (this
+        module never sees payload bytes, only already-aggregated `Flow`/
+        `FeatureVector` data) and hands the result in at completion time.
+        This module's only job for it is to embed it in the combined
+        `DetectionRecord`, the same passthrough role it already plays for
+        `known`/`anomaly` evidence computed by other modules.
         """
         self._behavior.observe_completion(flow)
         known = self._classify_known(features, now)
@@ -194,6 +209,7 @@ class DetectionCoordinator:
             flow_id=flow.flow_id,
             known_evidence=known,
             anomaly_evidence=anomaly,
+            protocol_signature_evidence=protocol_signature,
             recorded_at=now,
         )
         return DetectionOutcome(record=record, behavior=self._behavior.assess(flow.source_ip))

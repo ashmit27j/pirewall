@@ -69,6 +69,10 @@ slow_connection_min_duration_seconds = 15.0
 slow_connection_max_bytes_per_second = 5.0
 concurrent_slow_connections_threshold = 8
 
+# ADDENDUM_2.md B5 — seed list of known-attack-tool JA3 fingerprints. See
+# that file's own header for its source and honest staleness limitation.
+known_tool_fingerprints_path = "config/known_tool_fingerprints.toml"
+
 [ml]
 lightgbm_model_path = "pirewall/ml/artifacts/lightgbm_model.txt"
 isolation_forest_model_path = "pirewall/ml/artifacts/isolation_forest_model.joblib"

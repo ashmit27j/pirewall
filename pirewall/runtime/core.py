@@ -57,6 +57,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from ipaddress import IPv4Address
+from pathlib import Path
 from types import FrameType
 
 from pirewall.capture.af_packet import AFPacketCapture
@@ -71,6 +72,11 @@ from pirewall.core.models.evidence import ProtocolSignatureEvidence
 from pirewall.core.models.flow import Flow
 from pirewall.core.models.packet import PacketMetadata
 from pirewall.detection.coordinator import DetectionCoordinator, load_models
+from pirewall.detection.tls_fingerprint import (
+    compute_ja3,
+    load_known_tool_fingerprints,
+    match_known_tool,
+)
 from pirewall.detection.tls_heartbeat import check_heartbleed
 from pirewall.firewall.backend.nftables import NftablesBackend
 from pirewall.firewall.interface import FirewallBackend
@@ -240,6 +246,18 @@ class CoreDaemon:
         # (`_pop_tls_evidence`) once the flow it belongs to completes.
         # Guarded by `_flow_lock`, same as the aggregator's own table.
         self._tls_evidence: OrderedDict[FlowKey, _CachedTlsMatch] = OrderedDict()
+        # ADDENDUM_2.md B5 — read once at startup; a missing/malformed file
+        # degrades to no JA3 matches ever being reported (see
+        # `load_known_tool_fingerprints`'s own docstring), never a startup
+        # failure.
+        self._known_tool_fingerprints = load_known_tool_fingerprints(
+            Path(config.detection.known_tool_fingerprints_path)
+        )
+        _logger.info(
+            "loaded %d known-tool JA3 fingerprint(s) from %s",
+            len(self._known_tool_fingerprints),
+            config.detection.known_tool_fingerprints_path,
+        )
 
         models = load_models(config.ml)
         self._model_load_errors = models.load_errors
@@ -581,6 +599,22 @@ class CoreDaemon:
                     f"but the record held only {heartbleed.available_bytes} bytes "
                     "(CVE-2014-0160 signature)"
                 ),
+            )
+            return  # a single payload is either a heartbeat or a handshake record, never both
+
+        fingerprint = compute_ja3(payload)
+        if fingerprint is None:
+            return
+        known_tool = match_known_tool(fingerprint, self._known_tool_fingerprints)
+        if known_tool is not None:
+            self._cache_tls_match(
+                metadata,
+                signature=f"ja3:{known_tool.ja3_hash}",
+                # Honestly weaker than a Heartbleed length mismatch (ADDENDUM_2.md
+                # B5): a JA3 match against known, *unmodified* tooling is real
+                # signal, but trivially evaded by randomizing the TLS stack.
+                confidence=0.6,
+                detail=f"TLS ClientHello JA3 fingerprint matches known tool {known_tool.tool!r}",
             )
 
     def _cache_tls_match(

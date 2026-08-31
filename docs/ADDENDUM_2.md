@@ -450,7 +450,112 @@ already degrades to `None`).
 
 ## B5. TLS ClientHello fingerprinting for known attack tooling (JA3-style)
 
-*(filled in when B5 is implemented — see the B5 commit)*
+**What:** `pirewall.detection.tls_fingerprint.compute_ja3` computes the
+[JA3](https://github.com/salesforce/ja3) fingerprint (Althouse, Atkinson,
+Atkins; Salesforce, 2017) of a TLS ClientHello — five fields (TLS version,
+cipher suites, extension types, elliptic curves, EC point formats), GREASE
+values (RFC 8701) excluded from every field exactly as the specification
+requires, joined and MD5-hashed. `match_known_tool` looks the resulting
+hash up in a small seed table of publicly documented fingerprints for
+known attack/exploitation tooling
+(`config/known_tool_fingerprints.toml`), loaded once at startup by
+`load_known_tool_fingerprints`.
+
+**Implemented from the actual JA3 specification, verified, not
+invented**: `tests/unit/test_tls_fingerprint.py::test_matches_the_official_ja3_specification_example`
+reproduces the *exact* worked example from the JA3 README byte-for-byte —
+input fields `769,47-53-5-10-...,0-10-11,23-24-25,0` producing hash
+`ada70206e40642a3e4461f35503241d5` — and passes. GREASE exclusion is
+separately tested
+(`test_grease_values_are_excluded_from_every_field`): a ClientHello with a
+GREASE cipher and a GREASE extension injected produces the *identical*
+hash to one without them.
+
+**Why this is "lookahead", not payload inspection** (same argument B4
+makes, applied to the ClientHello): cipher suites, extensions, elliptic
+curves, and point formats are the client announcing its own TLS
+capabilities to negotiate a handshake with — sent in cleartext, by
+protocol design, before any encrypted data exists on the connection. This
+is not application content and never touches anything that was ever
+encrypted.
+
+**Honest limitation, stated plainly per the phase prompt's explicit
+request — this is real but partial coverage, not a general solution**:
+this detects known, *unmodified* tooling only. An attacker who randomizes
+their TLS library's cipher/extension ordering, or simply uses a different
+TLS stack, trivially produces a different JA3 hash — there is no
+cryptographic or structural reason a real attacker couldn't evade this.
+Both the module docstring and `config/known_tool_fingerprints.toml`'s own
+header state this explicitly, and state the seed list's own ongoing-
+maintenance need (JA3 hashes drift with TLS library versions; see below
+for where the seed values actually came from).
+
+**The seed list, sourced not fabricated:** `config/known_tool_fingerprints.toml`
+carries 8 entries from **trisulnsm/ja3prints**
+(<https://github.com/trisulnsm/ja3prints>), a long-standing, publicly
+documented JA3 fingerprint database — Metasploit's HTTP/CCS/HeartBleed/SSL
+scanners, three Nikto (2.1.6) captures, and Rapid7 Nexpose. Every
+`hash`/`tool`/`tested` value is copied verbatim from that source, verified
+via `WebFetch` against the live repository during this session, not
+invented or guessed. Generic HTTP client libraries (curl, Python Requests,
+wget) also appear in that same public source but were deliberately
+**not** seeded here — they're used by an enormous amount of ordinary
+legitimate traffic, so including them would make this a source of false
+positives rather than attack-tool signal; the file's own header states
+this exclusion explicitly.
+
+**Implementation:**
+
+* `pirewall/detection/tls_fingerprint.py` (new) — `compute_ja3` (pure,
+  degrades to `None` for anything that isn't cleanly a ClientHello),
+  `match_known_tool` (a plain dict lookup), and `load_known_tool_fingerprints`
+  (TOML loading via a small `PirewallModel`-based schema, so a malformed
+  file degrades to an empty table — same "must not prevent pirewall-core
+  from starting" principle `pirewall.detection.coordinator.load_models`
+  established for missing ML artifacts).
+* **Reuses every piece of B4's plumbing rather than building a parallel
+  path**: the same `extract_tcp_payload`/`on_tcp_payload` callback/
+  `_tls_evidence` cache/`_pop_tls_evidence` lookup, the same
+  `ProtocolSignatureEvidence` model, the same `protocol_signature_weight`
+  scoring contribution. `CoreDaemon._handle_tcp_payload` runs
+  `check_heartbleed` first (content type 24) then `compute_ja3` +
+  `match_known_tool` (content type 22) against the same payload — a single
+  TCP payload can only ever be one or the other, never both, since they're
+  gated on different TLS record content types.
+* **Confidence is honestly lower than Heartbleed's**: `0.6`, not `1.0` —
+  set in `CoreDaemon._handle_tcp_payload_unsafe`, with an inline comment
+  stating why (a JA3 match is real signal but trivially evadable, unlike a
+  Heartbleed length mismatch, which is a near-certain structural protocol
+  violation). Against `protocol_signature_weight=75`, a JA3 match alone
+  contributes 45 — `MEDIUM`, not enough alone to reach `RATE_LIMIT`/`BLOCK`
+  without a corroborating signal, which is the intended, honest weighting
+  for a partial/evadable detector.
+* New `DetectionConfig.known_tool_fingerprints_path` (default
+  `config/known_tool_fingerprints.toml`) points at the seed file.
+
+**Tested:** `tests/unit/test_tls_fingerprint.py` (19 tests) — the official
+JA3 example vector, GREASE exclusion, a hand-built ClientHello matching a
+(test-)seeded fingerprint, a differently-shaped "browser-like" ClientHello
+(different cipher list) not matching, non-Handshake/non-ClientHello
+records returning `None`, four malformed/truncated/garbage inputs not
+crashing, loading the *real* shipped seed file successfully, and four
+`load_known_tool_fingerprints` edge cases (missing file, malformed TOML,
+invalid schema, hash lowercasing). `tests/integration/test_tls_evidence_wiring.py`
+gained 3 more real, executed end-to-end tests (8 total in that file) —
+a hand-built ClientHello, seeded into the daemon's fingerprint table at
+test time (the real Nikto/Metasploit byte-level captures aren't available
+to reproduce here — see B4's equivalent honest note about hand-constructed
+vs. real captured traffic), gets cached, popped at flow completion with
+`confidence=0.6`, and produces a real `ThreatAssessment` whose explanation
+names the matched tool; an unseeded ClientHello caches nothing. `ruff
+check .` and `pyright --strict` clean across the whole repo; full suite
+616 passed, 22 skipped, the same 1 pre-existing unrelated failure noted
+under B1.
+
+**Environment-dependent**: the seed list's currency and coverage against
+real, current attack tooling (stated as a standing limitation, not
+something this session could resolve — see the file header); real-world
+TLS traffic diversity, same caveat as B4.
 
 ## B6. Empirical test: does the volumetric layer catch automated web-app probing?
 

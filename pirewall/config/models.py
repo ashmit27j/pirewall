@@ -101,6 +101,14 @@ class DetectionConfig(PirewallModel):
     slow_connection_max_bytes_per_second: float = Field(default=5.0, gt=0.0)
     concurrent_slow_connections_threshold: int = Field(default=8, gt=0)
 
+    # ADDENDUM_2.md B5 — seed list of known-attack-tool JA3 fingerprints
+    # (pirewall.detection.tls_fingerprint). A missing/malformed file
+    # degrades to no JA3 matches ever being reported, same as a missing ML
+    # artifact degrades that one evidence type — never a startup failure.
+    known_tool_fingerprints_path: str = Field(
+        default="config/known_tool_fingerprints.toml", min_length=1
+    )
+
 
 class MLConfig(PirewallModel):
     """Model artifact locations and expected feature schema (spec §15)."""

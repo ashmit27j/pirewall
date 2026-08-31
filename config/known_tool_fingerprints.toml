@@ -1,0 +1,67 @@
+# Seed list of publicly documented JA3 (TLS ClientHello) fingerprints for
+# known attack/exploitation tooling (ADDENDUM_2.md B5).
+#
+# HONEST LIMITATION, stated plainly rather than glossed over: this list
+# needs an ongoing maintenance process to stay useful. JA3 hashes shift
+# whenever a tool's underlying TLS library/version changes, and this
+# particular public source is, by its own admission, a snapshot from
+# several years ago rather than a continuously updated feed. Treat this as
+# illustrative starter coverage of *known, unmodified* tooling, not a
+# comprehensive or current attack-tool database — see
+# pirewall/detection/tls_fingerprint.py's module docstring for the fuller
+# limitation (an attacker who randomizes their TLS stack trivially evades
+# this).
+#
+# Source: trisulnsm/ja3prints, a long-standing, widely-cited open-source
+# JA3 fingerprint database — https://github.com/trisulnsm/ja3prints
+# (file: ja3fingerprint.json). Every `hash`/`tool`/`tested` value below is
+# copied verbatim from that source, not invented; `tested` is that file's
+# own description of which tool version/OS produced the hash.
+#
+# Entries deliberately NOT seeded here: generic HTTP client libraries
+# (curl, Python Requests, wget) also appear in public JA3 lists, but they
+# are used by an enormous amount of ordinary, legitimate traffic (health
+# checks, IoT devices, scripted API clients) — seeding them here would
+# make this list a source of false positives rather than attack-tool
+# signal, so only entries whose tool is itself a security scanner or
+# exploitation framework are included.
+
+[[fingerprint]]
+hash = "16f17c896273d1d098314a02e87dd4cb"
+tool = "Metasploit HTTP scanner"
+tested = "4.11.5 Kali"
+
+[[fingerprint]]
+hash = "950ccdd64d360a7b24c70678ac116a44"
+tool = "Metasploit CCS Scanner"
+tested = "unspecified (trisulnsm/ja3prints)"
+
+[[fingerprint]]
+hash = "ee031b874122d97ab269e0d8740be31a"
+tool = "Metasploit HeartBleed Scanner"
+tested = "unspecified (trisulnsm/ja3prints)"
+
+[[fingerprint]]
+hash = "6825b330bf9de50ccc8745553cb61b2f"
+tool = "Metasploit SSL Scanner"
+tested = "unspecified (trisulnsm/ja3prints)"
+
+[[fingerprint]]
+hash = "f4262963691a8f123d4434c7308ad7fe"
+tool = "Nikto"
+tested = "2.1.6 - Kali"
+
+[[fingerprint]]
+hash = "5eeeafdbc41e5ca7b81c92dbefa03ab7"
+tool = "Nikto"
+tested = "2.1.6 - Kali"
+
+[[fingerprint]]
+hash = "a563bb123396e545f5704a9a2d16bcb0"
+tool = "Nikto"
+tested = "v2.1.6"
+
+[[fingerprint]]
+hash = "c22dea495cef869edbeb3458adaf497f"
+tool = "Rapid7 Nexpose"
+tested = "unspecified (trisulnsm/ja3prints)"

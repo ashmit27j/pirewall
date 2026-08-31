@@ -1870,7 +1870,7 @@ for what's actually built so far if this table looks incomplete.
 | B2 Slow-rate aggregate signal | Complete | Tested — see below |
 | B3 Evidence-maturity gate | Complete | Tested — see below |
 | B4 Heartbleed detector | Complete | Tested — see below |
-| B5 JA3 fingerprinting | Not started | — |
+| B5 JA3 fingerprinting | Complete | Tested — see below |
 | B6 Empirical sqlmap-pattern test | Not started | — |
 | §7 WAFFY scope boundary (docs only) | Not started | — |
 
@@ -1972,6 +1972,36 @@ segments, split records, real client/server implementations) — this
 session's traffic is all hand-constructed. Documented as a known,
 disclosed limitation in `docs/ADDENDUM_2.md` B4, not a crash risk (anything
 that doesn't cleanly parse degrades to no evidence, never an exception).
+
+### B5 — Tested
+
+New `pirewall/detection/tls_fingerprint.py`: JA3 ClientHello fingerprinting
+(Althouse/Atkinson/Atkins, Salesforce, 2017), implemented from and verified
+against the specification's own worked example (exact byte-for-byte match,
+including GREASE exclusion), matched against a small, honestly-sourced seed
+list of known attack-tool fingerprints (`config/known_tool_fingerprints.toml`
+— 8 entries from trisulnsm/ja3prints, fetched and verified live during this
+session, not fabricated: Metasploit's HTTP/CCS/HeartBleed/SSL scanners,
+Nikto, Rapid7 Nexpose). Reuses 100% of B4's plumbing (payload extraction,
+the `_tls_evidence` cache, `ProtocolSignatureEvidence`, the scoring
+contribution) — no parallel path. Full design, the exact worked-example
+citation, and the honest evasion/staleness limitations are in
+`docs/ADDENDUM_2.md` B5.
+
+**Tested**: 19 new tests in `tests/unit/test_tls_fingerprint.py` (the
+official JA3 example vector, GREASE exclusion, seeded/unseeded matching,
+malformed-input safety, and loading both the real shipped seed file and
+synthetic edge cases). `tests/integration/test_tls_evidence_wiring.py`
+gained 3 more real, executed end-to-end tests (8 total) confirming a
+hand-built ClientHello seeded into the fingerprint table produces a real
+`ThreatAssessment` naming the matched tool, at the documented lower
+`confidence=0.6`. `ruff check .` and `pyright --strict` clean across the
+whole repo. Full suite: 616 passed, 22 skipped, the same 1 pre-existing
+unrelated failure noted under B1.
+
+**Environment-dependent**: the seed list's currency/coverage against real,
+current attack tooling — stated as a standing, disclosed limitation in the
+seed file's own header, not something resolvable from this session.
 
 ### B3 — Tested
 

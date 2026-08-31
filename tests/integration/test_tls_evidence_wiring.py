@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pirewall.capture.fake import FakePacketCapture
 from pirewall.capture.parser import parse_packet
 from pirewall.core.enums import ThreatLevel
+from pirewall.detection.tls_fingerprint import compute_ja3
 from pirewall.firewall.backend.fake import FakeFirewallBackend
 from pirewall.runtime.core import CoreDaemon
 from pirewall.runtime.watchdog import SystemdNotifier
@@ -132,3 +133,88 @@ def test_heartbleed_evidence_reaches_a_real_threat_assessment_through_the_pipeli
     assert len(daemon._state.decisions) == 1  # pyright: ignore[reportPrivateUsage]
     decision = daemon._state.decisions[0]  # pyright: ignore[reportPrivateUsage]
     assert decision.action.value in ("rate_limit", "block")
+
+
+# --- B5: JA3 fingerprint match ---
+
+
+def _client_hello_packet() -> bytes:
+    cipher_suites = (47, 53, 5, 10, 49161, 49162, 49171, 49172, 50, 56, 19, 4)
+    extensions = (
+        struct.pack("!HH", 0, 0)
+        + struct.pack("!HH", 10, 6)
+        + struct.pack("!H", 6)
+        + struct.pack("!3H", 23, 24, 25)
+        + struct.pack("!HH", 11, 2)
+        + bytes([1, 0])
+    )
+    body = (
+        struct.pack("!H", 0x0301)
+        + b"\x00" * 32
+        + b"\x00"  # empty session_id
+        + struct.pack("!H", len(cipher_suites) * 2)
+        + struct.pack(f"!{len(cipher_suites)}H", *cipher_suites)
+        + b"\x01\x00"
+        + struct.pack("!H", len(extensions))
+        + extensions
+    )
+    fragment = bytes([1]) + len(body).to_bytes(3, "big") + body
+    tls_record = bytes([22]) + b"\x03\x01" + struct.pack("!H", len(fragment)) + fragment
+    tcp = tcp_header(_SRC_PORT, _DST_PORT, flags=0x18)
+    ip = ipv4_header(protocol=6, total_length=20 + len(tcp) + len(tls_record), src=_SRC, dst=_DST)
+    return eth(0x0800) + ip + tcp + tls_record
+
+
+def test_ja3_match_against_a_seeded_fingerprint_is_cached() -> None:
+    """A ClientHello whose JA3 hash is in the (test-seeded) known-tool table gets cached."""
+    daemon = _daemon()
+    raw = _client_hello_packet()
+    metadata = parse_packet(raw, NOW)
+    fingerprint = compute_ja3(raw[54:])  # skip eth+ip+tcp to get at the TLS record for the hash
+    assert fingerprint is not None
+    daemon._known_tool_fingerprints[fingerprint.ja3_hash] = "test-attack-tool"  # pyright: ignore[reportPrivateUsage]
+
+    assert len(daemon._tls_evidence) == 0  # pyright: ignore[reportPrivateUsage]
+    daemon._handle_tcp_payload(metadata, raw)  # pyright: ignore[reportPrivateUsage]
+
+    assert len(daemon._tls_evidence) == 1  # pyright: ignore[reportPrivateUsage]
+
+
+def test_ja3_evidence_reaches_a_real_threat_assessment_through_the_pipeline() -> None:
+    daemon = _daemon()
+    raw = _client_hello_packet()
+    metadata = parse_packet(raw, NOW)
+    fingerprint = compute_ja3(raw[54:])
+    assert fingerprint is not None
+    daemon._known_tool_fingerprints[fingerprint.ja3_hash] = "test-attack-tool"  # pyright: ignore[reportPrivateUsage]
+    daemon._handle_tcp_payload(metadata, raw)  # pyright: ignore[reportPrivateUsage]
+
+    flow = make_flow(
+        source_ip=_SRC,
+        destination_ip=_DST,
+        source_port=_SRC_PORT,
+        destination_port=_DST_PORT,
+        first_seen=NOW,
+    )
+    protocol_signature = daemon._pop_tls_evidence(flow)  # pyright: ignore[reportPrivateUsage]
+    assert protocol_signature is not None
+    assert protocol_signature.signature == f"ja3:{fingerprint.ja3_hash}"
+    assert protocol_signature.confidence == 0.6  # honestly weaker than Heartbleed's 1.0
+
+    daemon._pipeline.process(flow, NOW, protocol_signature)  # pyright: ignore[reportPrivateUsage]
+
+    assert len(daemon._state.threats) == 1  # pyright: ignore[reportPrivateUsage]
+    assessment = daemon._state.threats[0]  # pyright: ignore[reportPrivateUsage]
+    assert assessment.protocol_signature_evidence is not None
+    assert "test-attack-tool" in assessment.explanation
+
+
+def test_ja3_no_match_against_an_unseeded_fingerprint_caches_nothing() -> None:
+    """Without seeding, an ordinary ClientHello must not produce any cached evidence."""
+    daemon = _daemon()
+    raw = _client_hello_packet()
+    metadata = parse_packet(raw, NOW)
+
+    daemon._handle_tcp_payload(metadata, raw)  # pyright: ignore[reportPrivateUsage]
+
+    assert len(daemon._tls_evidence) == 0  # pyright: ignore[reportPrivateUsage]

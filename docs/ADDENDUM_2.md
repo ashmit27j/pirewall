@@ -142,6 +142,69 @@ creation and completion), `observe_completion` falls back to a full
 *single* state, recreated fresh in the eviction case, so it cannot double
 anything that came before it.
 
+**A real bug found on a real POSIX run, fixed here — the wrong turn worth
+keeping, not glossed over.** The session that wrote B1 could not execute
+`tests/integration/test_core_daemon.py` at all (Windows lacks `AF_UNIX`),
+so its own scanning-latency claim was verified only at the unit level
+(`BehaviorAnalyzer`/`FlowAggregator` directly) plus a written-but-unrun
+end-to-end test. A later fresh-clone run on a real POSIX machine actually
+executed that test and it **failed**: `detected_patterns=()` despite
+driving 6 distinct-port scan flows well past `scanning_port_threshold`.
+
+Root cause, confirmed by reproducing it (not just inspecting the code):
+`CoreDaemon.start()` spawns the detection thread *before* the capture
+thread. `_detection_loop`'s very first iteration typically finds both
+queues empty and falls into a blocking `_flow_queue.get(timeout=0.5)`
+before the capture thread has produced anything. The capture thread is a
+single sequential producer — for a burst of new connections followed by
+one completing flow, it pushes every `NewFlowSignal` for that burst
+strictly before it pushes the completed `Flow` (plain program order on
+one thread). That completed flow immediately unblocks the detection
+thread's `get()` — **before** that thread has drained the burst of
+signals that arrived while it was blocked, since the only drain call was
+at the *top* of the loop, not after waking from the blocking call. The
+completing flow's own `BehaviorAssessment` then reflected only itself,
+never the sibling connections already sitting in the queue, unseen.
+
+This is **not** the B1/B3 interaction it was first hypothesized to be —
+`pirewall.engine.decision` never reads or mutates `detected_patterns`; it
+only caps what *action* a decision may take. Checked directly, confirmed
+innocent, and worth recording so the same wrong hypothesis doesn't
+recur. The bug was entirely inside `CoreDaemon._detection_loop`'s own
+queue-drain ordering, introduced by B1 (the two-queue design) and never
+exercised until a real thread actually raced the way production threads
+do.
+
+**Fix:** `_detection_loop` now calls `_drain_new_flow_signals()`/
+`_drain_slow_clusters()` a second time immediately after
+`_flow_queue.get()` returns, before `FlowPipeline.process` runs — not
+only once at the top of the loop. Program order on the capture thread
+guarantees every signal for a burst is enqueued before the flow that
+burst's own detection depends on, so draining again right before
+processing is what actually closes the race, deterministically (not
+probabilistically): by the time `_flow_queue.get()` returns an item, the
+`put` for it has already happened on the producer thread, so — per
+`queue.Queue`'s own locking — every earlier `put` from that same thread
+(the whole `_new_flow_queue` burst) is already fully visible to this
+consumer thread too.
+
+**Regression test, added specifically for this exact interaction** (not
+just re-running the test that already caught it once):
+`tests/integration/test_detection_loop_ordering.py` runs the real
+`_detection_loop` method in a genuine background thread — no `AF_UNIX`
+needed, since that method never touches the RPC socket — deliberately
+lets it reach its first blocking `get()` on empty queues, then, from the
+main thread, pushes a real 6-port scan burst followed by a real
+completing flow, exactly reproducing the race. **Verified as a true
+regression test, not just a passing one**: temporarily reverting the
+second drain call reproduces the exact original failure
+(`detected_patterns=()`, `AssertionError`) against this new test; restoring
+the fix makes it pass again. This is now the Windows-runnable proof this
+pass's central claim (scanning visible before flow completion) actually
+holds under real threading, complementing (not replacing) the
+`AF_UNIX`-gated end-to-end test in `test_core_daemon.py`, which should now
+also pass on the next Linux/macOS run.
+
 **Tested:**
 `tests/unit/test_behavior.py` (`test_scanning_detected_from_new_connections_before_any_completion`,
 `test_single_new_connection_triggers_nothing`,

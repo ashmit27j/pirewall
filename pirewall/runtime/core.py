@@ -724,6 +724,25 @@ class CoreDaemon:
         arrived in that window — this is what bounds volumetric-pattern
         detection latency to roughly that interval instead of however long
         the constituent flows take to complete.
+
+        **Drains again immediately before processing a completed flow, not
+        just once at the top of the loop.** This closes a real race: this
+        thread can be sitting inside the blocking `_flow_queue.get()` call
+        with an empty `_new_flow_queue` (nothing produced yet) when the
+        capture thread — a single sequential producer — pushes a burst of
+        new-flow signals *and then* the very flow whose completion just
+        unblocks this `get()`. Program order on the capture thread
+        guarantees every signal for that burst was enqueued strictly before
+        the completed flow was, so re-draining right here, right before
+        `FlowPipeline.process` runs, is what actually guarantees a
+        completing flow's own assessment sees everything the capture
+        thread already knows about its source — not just whatever this
+        thread happened to have drained on an earlier, possibly-premature
+        pass through the top of the loop. Without this second drain, a
+        flow that completes very early (before this thread's first
+        top-of-loop drain has anything to find) can be assessed against an
+        empty `BehaviorAnalyzer` state despite a whole burst of sibling
+        connections already sitting in the queue, unseen.
         """
         while not self._stop.is_set():
             self._drain_new_flow_signals()
@@ -732,6 +751,8 @@ class CoreDaemon:
                 flow = self._flow_queue.get(timeout=_QUEUE_POLL_SECONDS)
             except queue.Empty:
                 continue
+            self._drain_new_flow_signals()
+            self._drain_slow_clusters()
             try:
                 protocol_signature = self._pop_tls_evidence(flow)
                 self._pipeline.process(flow, datetime.now(UTC), protocol_signature)

@@ -1936,6 +1936,30 @@ unrelated failure noted under B1.
 B1): `tests/integration/test_core_daemon.py::test_slow_rate_dos_detected_without_waiting_for_connections_to_close_or_time_out`.
 Run on the next macOS/Linux session, alongside B1's equivalent test.
 
+### B3 — Tested
+
+New `EvidenceMaturityTracker` + gate in `pirewall.engine.decision.decide`:
+`BLOCK`/`RATE_LIMIT` now require "mature" evidence (a completed-flow
+classification, a multi-observation behavioral pattern, or a consistent
+multi-window reading from the same source), else the decision downgrades
+to `MONITOR`. Full rationale, why it lives in `decision.py` rather than
+`validator.py`, and the arithmetic proof that this doesn't regress any
+scenario already reachable under today's scoring weights are in
+`docs/ADDENDUM_2.md` B3.
+
+**Tested**: `tests/unit/test_decision.py` rewritten — the pre-existing
+`test_high_maps_to_rate_limit`/`test_critical_maps_to_block` were renamed
+and given realistic (evidence-carrying) assessments, matching what real
+detection actually produces, since a bare threat_level with no evidence
+was never a real scenario the old tests represented accurately; 6 new
+tests cover the downgrade-to-MONITOR case, path (b) alone, and the
+consistency tracker (including per-source isolation). `ruff check .` and
+`pyright --strict` clean across the whole repo. Full suite: 571 passed, 22
+skipped, the same 1 pre-existing unrelated failure noted under B1 — no
+other test in the repo needed a change, confirming the invariant's blast
+radius is exactly what B3's own arithmetic predicted (nothing that already
+carries real evidence is affected).
+
 ### B4 — Tested
 
 New `pirewall/detection/tls_heartbeat.py` (CVE-2014-0160 length-mismatch
@@ -2117,26 +2141,85 @@ substantially more real, executed coverage than "written, not verified"
 for its core mechanisms, and is honest about the specific parts that
 still need a Linux/macOS session or real hardware.
 
-### B3 — Tested
+### Post-pass audit session — a real bug found on a fresh POSIX run, fixed
 
-New `EvidenceMaturityTracker` + gate in `pirewall.engine.decision.decide`:
-`BLOCK`/`RATE_LIMIT` now require "mature" evidence (a completed-flow
-classification, a multi-observation behavioral pattern, or a consistent
-multi-window reading from the same source), else the decision downgrades
-to `MONITOR`. Full rationale, why it lives in `decision.py` rather than
-`validator.py`, and the arithmetic proof that this doesn't regress any
-scenario already reachable under today's scoring weights are in
-`docs/ADDENDUM_2.md` B3.
+The claim above ("619 passed, clean throughout") was **only true on this
+Windows machine**, where `tests/integration/test_core_daemon.py` is
+entirely skipped (`AF_UNIX` unavailable) — including the one test that
+directly exercises B1's central claim. A fresh clone, full-suite run on a
+real POSIX machine actually executed that file and found **2 real
+failures**, not 0. Both are fixed in this session; see
+`docs/ADDENDUM_2.md` B1 for the detection-loop bug's full root-cause
+writeup (not duplicated here).
 
-**Tested**: `tests/unit/test_decision.py` rewritten — the pre-existing
-`test_high_maps_to_rate_limit`/`test_critical_maps_to_block` were renamed
-and given realistic (evidence-carrying) assessments, matching what real
-detection actually produces, since a bare threat_level with no evidence
-was never a real scenario the old tests represented accurately; 6 new
-tests cover the downgrade-to-MONITOR case, path (b) alone, and the
-consistency tracker (including per-source isolation). `ruff check .` and
-`pyright --strict` clean across the whole repo. Full suite: 571 passed, 22
-skipped, the same 1 pre-existing unrelated failure noted under B1 — no
-other test in the repo needed a change, confirming the invariant's blast
-radius is exactly what B3's own arithmetic predicted (nothing that already
-carries real evidence is affected).
+1. **A real bug in `CoreDaemon._detection_loop`'s queue-drain ordering**
+   (introduced by B1, never exercised until a real thread actually raced
+   the way production threads do):
+   `test_scanning_visible_through_a_completing_flow_while_scan_flows_stay_open`
+   failed with `detected_patterns=()`. Root cause, confirmed by
+   reproducing it: the detection thread can reach its first blocking
+   `_flow_queue.get()` before the capture thread (spawned after it) has
+   produced anything; when a completing flow later unblocks that `get()`,
+   the burst of `NewFlowSignal`s the same capture thread already queued
+   *before* that flow (single-thread program order) hadn't been drained
+   yet, since the only drain call was at the top of the loop, not after
+   waking from the blocking call. **This was not the B1/B3 interaction it
+   was first hypothesized to be** — `pirewall.engine.decision` never reads
+   `detected_patterns`, only caps what action a decision may take; checked
+   directly and ruled out, worth recording so the same wrong hypothesis
+   doesn't recur. Fixed by draining a second time immediately after
+   `_flow_queue.get()` returns, before `FlowPipeline.process` runs.
+   **New regression test**: `tests/integration/test_detection_loop_ordering.py`
+   runs the real `_detection_loop` in a genuine background thread (no
+   `AF_UNIX` needed — that method never touches the RPC socket) and
+   reproduces the exact race directly. Verified as a true regression test,
+   not just a passing one: temporarily reverting the fix reproduces the
+   original failure against this new test byte-for-byte
+   (`AssertionError`, `detected_patterns=()`); restoring the fix passes it
+   again.
+2. **A stale test, not a code bug**:
+   `test_management_access_restricted_to_admin_pc_placeholder` was
+   asserting that *every* `tcp dport accept` line in the input chain is
+   Admin-PC-scoped, which stopped being correct the moment
+   `deploy/firewall/base.nft.template` legitimately gained a
+   `${PROTECTED_NETWORK}`-scoped DNS rule (commit `b82953e`, real Pi
+   deployment work, predates this whole B1-B6 pass) — DNS/DHCP are
+   ordinary LAN services the Pi provides to every client, not "management
+   access". Fixed the test's *intent*, not just its assertion: it now
+   checks specifically that the management-access rule (port 22 / the API
+   port) is Admin-PC-scoped, and a new second test,
+   `test_dns_and_dhcp_are_scoped_to_the_protected_network_not_the_admin_pc`,
+   asserts the DNS/DHCP rules are protected-network-scoped and explicitly
+   **not** Admin-PC-scoped — guarding the failure mode in both directions
+   instead of generically weakening the original check.
+
+**Real, fresh, final verification — the actual commands and their actual
+output, on this machine** (POSIX-only failure #1 above cannot manifest
+here; its fix is proven instead by the new thread-based regression test,
+which does run here and which was confirmed to fail without the fix):
+
+```
+$ uv run ruff check .
+All checks passed!
+
+$ uv run pyright
+0 errors, 0 warnings, 0 informations
+
+$ uv run pytest -q
+622 passed, 22 skipped, 2405 warnings in 9.35s
+```
+
+22 skipped = the `AF_UNIX`-on-Windows gate, unchanged in count from before
+this audit (the fix added one new test to a file that already ran here,
+`test_detection_loop_ordering.py`, plus fixed one that already ran here,
+`test_firewall_base_template.py` — neither touches the skip count). **This
+machine cannot execute the exact two tests that found the real bugs**
+(`test_core_daemon.py` is entirely `AF_UNIX`-gated); the queue-drain fix
+is proven by the new same-behavior thread-based test instead, verified
+both ways (fails without the fix, passes with it). The DNS/admin-PC fix
+is proven directly — `tests/security/test_firewall_base_template.py`
+ran here and both its tests (the fixed original, plus the new one) pass.
+**The next macOS/Linux session should re-run
+`tests/integration/test_core_daemon.py` specifically** to confirm the
+queue-drain fix also closes the originally-reported failure there, not
+just its Windows-runnable proxy.

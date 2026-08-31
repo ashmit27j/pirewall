@@ -269,3 +269,48 @@ Unix domain socket using the typed request/response protocol in
   deployment must never use this — doing so would defeat the entire point
   of A4's process isolation (a compromised `pirewall-api` sharing memory
   with `pirewall-core` instead of talking over a narrow, typed socket).
+
+## Known limitations — scope boundary, not an unaddressed gap
+
+Spec §34 draws the line plainly: flow-metadata-based detection is
+*strongly observable* for SYN floods, port scanning, brute-force
+connection patterns, connection floods, DoS patterns, and abnormal traffic
+rates — and *potentially limited* for XSS, SQL injection, and reverse-shell
+payload contents, because those live in application-layer content this
+project deliberately never inspects (spec §7). ADDENDUM_2.md's B1/B2 pass
+(creation-time behavioral counters, the slow-rate aggregate signal) and B6
+sharpen this rather than change it: B6's empirical test confirms a
+realistic, intensive automated web-app probing scan (sqlmap testing
+multiple SQL injection techniques against one parameter) is caught
+*indirectly*, via its connection-volume/rate pattern looking like the
+brute-force patterns pirewall already detects well — but a light, targeted
+probe, or any scan that reuses one persistent connection across many
+application-layer requests, is not, because pirewall has no visibility
+into HTTP request framing at all. That is a real, structural limit of a
+network-layer, per-flow detector, not a bug to fix here.
+
+ADDENDUM_2.md's B4/B5 (the Heartbleed length check, JA3 ClientHello
+fingerprinting) narrow that boundary slightly but do not move it: both
+work specifically *because* TLS sends certain fields in cleartext by
+protocol design (the record/heartbeat headers, the ClientHello) — they are
+protocol-structure parsing, the same category as this project's TCP/IPv4
+header parsing, not content inspection, and both detectors say so
+explicitly in their own module docstrings. Neither one, nor anything else
+in this project, can see inside a TLS application-data record, an HTTP
+request body, or any other encrypted or decoded application payload.
+
+**This is a deliberate scope decision, not an unaddressed gap.**
+pirewall is the network-layer, volumetric/behavioral/adaptive firewall:
+capture, flow aggregation, ML-assisted and deterministic behavioral
+detection, threat scoring, and adaptive nftables enforcement, all
+operating on packet/flow metadata. Application-layer content inspection —
+actually recognizing a SQL injection payload, an XSS string, or a
+reverse-shell's command content, the exact gap spec §34 and B6 both name —
+is being deliberately addressed by a separate, complementary sibling
+project, **WAFFY**, a per-host web application firewall, rather than by
+expanding this project's own scope to include payload decoding. WAFFY is
+referenced here only as a sibling project; nothing WAFFY-related is
+implemented in this repository, and nothing here depends on it existing.
+The two are meant to compose: pirewall covers the network perimeter and
+the traffic patterns visible there, WAFFY covers per-host application
+content the same traffic carries.

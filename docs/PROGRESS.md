@@ -1872,7 +1872,7 @@ for what's actually built so far if this table looks incomplete.
 | B4 Heartbleed detector | Complete | Tested — see below |
 | B5 JA3 fingerprinting | Complete | Tested — see below |
 | B6 Empirical sqlmap-pattern test | Complete | Tested — see below |
-| §7 WAFFY scope boundary (docs only) | Not started | — |
+| §7 WAFFY scope boundary (docs only) | Complete | Implemented (docs) — see below |
 
 ### B1 — Tested
 
@@ -2025,6 +2025,27 @@ and `pyright --strict` clean across the whole repo. Full suite: 619
 passed, 22 skipped, the same 1 pre-existing unrelated failure noted under
 B1. No runtime code changed, per the phase prompt's own scope for this
 section.
+
+### §7 WAFFY scope boundary — Implemented (documentation only)
+
+Added a new "Known limitations — scope boundary, not an unaddressed gap"
+section to `docs/ARCHITECTURE.md`, connecting spec §34's existing
+observable/limited detection list to this pass's own B4/B5 (why TLS
+structural parsing doesn't move the payload-inspection boundary) and B6
+(the concrete, measured limit: light/targeted probes and keep-alive-
+reusing scans aren't caught) findings, then stating plainly that
+application-layer content inspection is being deliberately left to a
+separate sibling project, **WAFFY** (a per-host web application firewall),
+rather than expanding pirewall's own scope. WAFFY is referenced only as a
+sibling project — nothing WAFFY-related is implemented here, and nothing
+here depends on it.
+
+`docs/PROJECT_SUMMARY.md` was **not created** — the phase prompt's own
+wording ("if it exists yet") makes updating it conditional on it already
+existing, and it doesn't. Not treated as a gap; noted here so a future
+session doesn't wonder why it's missing.
+
+No runtime code changed. No tests apply to a documentation-only section.
 
 ### B3 — Tested
 

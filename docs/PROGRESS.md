@@ -2047,6 +2047,76 @@ session doesn't wonder why it's missing.
 
 No runtime code changed. No tests apply to a documentation-only section.
 
+### Section 8 — final integration and reconciliation
+
+**Full suite, clean, verified after every section above, not just once at
+the end**: `ruff check .` clean, `pyright --strict` clean (whole repo,
+every run throughout this pass), `pytest` **619 passed, 22 skipped, 1
+failed**. That one failure
+(`tests/security/test_firewall_base_template.py::test_management_access_restricted_to_admin_pc_placeholder`)
+is **pre-existing and unrelated** — confirmed via `git stash` back to
+before this pass's first commit and re-running it in isolation, where it
+fails identically. It's a base-nftables-template DNS-rule scoping issue
+with no connection to detection timing, B1-B6, or ADDENDUM_2.md; flagged
+under B1 the first time it was noticed and not touched since, so it isn't
+mistakenly attributed to this pass. The 22 skips are the same
+`AF_UNIX`-on-Windows platform gate `tests/integration/test_core_daemon.py`
+already carried before this pass — 3 new tests were added to that file
+during B1/B2 (written, lint/type-clean, honestly labeled "not executed
+this session" in each section above) rather than silently ignored.
+
+**Confirmed this pass regresses neither Track 2 (ML classification) nor
+the A1-A8 addendum mechanisms** — run explicitly, not just implied by the
+full-suite pass count: `tests/ml/` (102 tests, LightGBM/Isolation Forest
+training+inference, unchanged) and `tests/integration/test_addendum_lifecycle.py`
+together, `tests/unit/test_models_events_metadata_allowlist.py` (A2),
+`tests/unit/test_rate_limiter.py` (A3), and `tests/integration/test_firewall_lifecycle.py`
+(shadow/assisted/kill-switch lifecycle) all still pass, all unmodified by
+this pass except where B2/B3 required updating a hardcoded pattern-count
+denominator (3 pre-existing tests, `test_enums.py`/`test_scoring.py`,
+documented under B2) or a bare-threat-level test fixture that never
+represented a real detection scenario (`test_decision.py`, documented
+under B3) — never a weakening of what those tests actually assert.
+
+**Given this pass touches core detection timing behavior** — B1 moves
+*when* volumetric counters update, B2 adds a new periodic sweep-triggered
+detection path, B3 adds a new decision-time gate, B4/B5 add new capture-
+thread payload inspection on port 443 — **this entire pass should be run
+and watched in `SHADOW` mode on real hardware before any reliance on
+`ACTIVE` mode**, the same discipline `docs/ADDENDUM.md` A1 already
+prescribes for any change to the core detection loop. Concretely, before
+trusting this in `ACTIVE`/`ASSISTED`:
+
+1. Deploy with `firewall.enforcement_mode = "shadow"` (the shipped
+   default — this pass did not change it) and watch the shadow log/
+   `SecurityEvent` stream against real traffic for the recommended 1-2
+   week observation window per ADDENDUM.md A1.
+2. Specifically confirm, on real hardware, the three things this session
+   could only verify with `FakePacketCapture`/hand-built packets:
+   B1/B2's new-flow-signal and slow-cluster queues don't back up under
+   real traffic volume (`tests/integration/test_core_daemon.py`'s 3 new
+   tests, still unexecuted here — run them on macOS/Linux first, then
+   watch the equivalent real-traffic behavior); B4/B5's TLS record
+   parsing against genuine, diverse TLS implementations rather than
+   hand-constructed records (the attack-lab exercise spec §34 already
+   calls for, extended to cover this pass's two new detectors); and B2's
+   documented SHADOW-mode re-snapshotting behavior (a persisting slow-rate
+   cluster logs repeatedly, not once) reads as expected rather than as
+   log noise.
+3. Only then consider `ASSISTED`, and only `ACTIVE` after that, per
+   ADDENDUM.md A1's existing recommended path — this pass changes
+   *nothing* about that path or its ordering.
+
+**Environment-dependent, summarized across B1-B6** (see each section
+above for full detail): the 3 `test_core_daemon.py` tests (`AF_UNIX`
+unavailable on this Windows session); B4/B5's real-world TLS traffic
+diversity; B5's seed-list currency against current attack tooling. The 8
+`tests/integration/test_tls_evidence_wiring.py` tests and all of
+B1-B3/B6's own tests **did** run and pass on this machine — this pass has
+substantially more real, executed coverage than "written, not verified"
+for its core mechanisms, and is honest about the specific parts that
+still need a Linux/macOS session or real hardware.
+
 ### B3 — Tested
 
 New `EvidenceMaturityTracker` + gate in `pirewall.engine.decision.decide`:

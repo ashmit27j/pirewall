@@ -87,9 +87,15 @@ uv python install 3.12                            # standalone build, no apt inv
 
 This is the same mechanism used on the development machine, so the Pi runs
 the interpreter version the project is actually tested against rather than
-whatever the distro happens to ship. (If you are on a Trixie-based image,
-its system Python is 3.13 and would also satisfy the requirement — but
-using `uv`'s pinned interpreter everywhere keeps dev and Pi identical.)
+whatever the distro happens to ship. **This is now enforced, not just a
+documented convention**: the repository root carries a `.python-version`
+file pinning `3.12`, which `uv` reads automatically — `uv sync`/`uv run`
+select the pinned 3.12 interpreter on both the dev machine and the Pi
+without a human having to remember to run `uv python install 3.12` on each
+one. (If you are on a Trixie-based image, its system Python is 3.13 and
+would also satisfy `pyproject.toml`'s `>=3.12` floor — but the
+`.python-version` pin means `uv` still selects 3.12 by default, keeping dev
+and Pi identical rather than depending on the image's system Python.)
 
 ## 3. Install pirewall
 

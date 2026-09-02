@@ -367,13 +367,21 @@ handshakes (not `REPEATED_FAILURES`). `PERSISTENCE` or
 identically for a user making twenty requests to one site — nothing here is
 specific to SQL injection.
 
-**This is a genuine, currently-undetected coverage gap, recorded rather
-than solved.** Closing it needs payload/L7 inspection, which the
-flow-level feature schema deliberately does not do. It is *not* an argument
-against the exclusion policy: with 21 total examples the supervised
-classifier could not learn it reliably either, and v0.3.0 — which did train
-on its 15 rows — caught 2 of 3 test rows on a sample far too small to mean
-anything.
+**This is a genuine, currently-undetected coverage gap within pirewall's
+own pipeline, recorded rather than solved.** Closing it needs payload/L7
+inspection, which the flow-level feature schema deliberately does not do.
+It is *not* an argument against the exclusion policy: with 21 total
+examples the supervised classifier could not learn it reliably either, and
+v0.3.0 — which did train on its 15 rows — caught 2 of 3 test rows on a
+sample far too small to mean anything.
+
+**Resolution note (settled, not open):** whether to accept this gap and
+keep the exclusion policy on is decided in `docs/PROGRESS.md`'s "Decision
+entry — rare-class exclusion" resolution note (2026-09-02) — exclusion
+stays ON. SQL Injection's gap here is accepted because WAFFY covers it at
+the payload layer, conditional on WAFFY actually being deployed alongside
+pirewall. Full reasoning and the WAFFY-dependency caveat live there, not
+duplicated here.
 
 ### The three weak classes — assessment and recommendation
 

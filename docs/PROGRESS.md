@@ -1647,6 +1647,55 @@ supervised coverage of two high-severity classes. Enabling it is a
 one-line change at the trainer's call site; the function, its threshold
 and its boundary tests already exist.
 
+**Resolution (human decision, 2026-09-02): exclusion stays ON.** This
+supersedes the "leave exclusion available but off" recommendation directly
+above — that recommendation was written before the threshold decision
+recorded later in this file ("Decisions, settled") and before the
+excluded-class coverage was actually measured. The exclusion policy has
+been enforced since v0.4.0 and stays that way; no retraining, no model
+version change.
+
+The reasoning has moved on from what this entry originally worried about.
+At the time, excluding Heartbleed/Infiltration/SQL-Injection from LightGBM
+training read as "the only line of defense for these three classes goes
+away." Measured against the shipped Isolation Forest (see "Leakage audit
+and excluded-class coverage" below and `docs/ML_PIPELINE.md`'s "Detection
+coverage for the excluded classes"), that is no longer true for two of the
+three:
+
+- **Heartbleed: 100.00% flagged (11/11) and Infiltration: 86.11% (31/36)**,
+  both far above the 9.93% benign false-positive baseline — the Isolation
+  Forest already covers these two well. A LightGBM classifier trained on
+  11 and 36 total examples respectively would be a redundant second signal
+  on evidence too thin to trust as a primary detector anyway, not the sole
+  safety net this entry originally worried about losing.
+- **Web Attack – SQL Injection scores 0% from both LightGBM (excluded by
+  policy) and the Isolation Forest (0/21, below the benign baseline)** —
+  genuinely uncovered by the adaptive pipeline on its own. This is accepted
+  because **WAFFY**, the sibling per-host web application firewall (see
+  "§7 WAFFY scope boundary" and "WAFFY coexistence" elsewhere in this
+  file — now a real, deployable sibling system, not just a referenced one),
+  covers SQL injection at the payload layer. A network-layer flow
+  classifier trained on flow-level features was never going to reliably
+  catch content-based SQL injection — the feature schema carries no payload
+  for it to learn from. Excluding SQL Injection from LightGBM training no
+  longer means "uncovered"; it means "covered by the system actually suited
+  to catching it."
+
+**This reasoning is a real dependency, not a footnote: it holds only if
+WAFFY is actually deployed alongside pirewall.** The WAFFY-coexistence
+question elsewhere in this file (whether WAFFY's own firewall/port
+footprint collides with pirewall's) is still open, and WAFFY deployment
+itself is not yet confirmed. If WAFFY deployment is delayed, dropped, or
+the two systems don't end up running together, SQL Injection reverts to
+genuinely uncovered — no detector in pirewall's own pipeline catches it —
+and this decision should be revisited at that point. Do not treat "WAFFY
+covers it" as true independent of an actual WAFFY deployment.
+
+No code, trainer, or model-artifact change accompanies this note — the
+shipped v0.4.0 behavior already matches this decision; this is a
+documentation resolution only.
+
 **Also revised by the same bug:** the "Controlled ablation" table earlier
 in this file concluded that resampling, class weighting and threshold
 tuning all underperform the plain baseline. That conclusion still holds on
@@ -2557,6 +2606,25 @@ fixed here (adding a `.python-version` pin is an infrastructure decision
 beyond "fix the docs to match the code" — flagged for a human to decide,
 not assumed).
 
+**Resolved (decision session, 2026-09-02): pinned.** A `.python-version`
+file was added at the repository root containing `3.12` (matching
+`pyproject.toml`'s `requires-python = ">=3.12"` and `docs/DEPLOYMENT.md`'s
+`uv python install 3.12` — minor-version precision, no patch pin, since
+nothing else in the repository pins a specific patch). **Verified, not
+assumed**: deleting `.venv` and running `uv sync` fresh, before the pin,
+built a venv against the system's Python 3.14.4 (`pyvenv.cfg` confirmed
+`version_info = 3.14.4`); after adding the file, the identical `rm -rf
+.venv && uv sync` picked up Python 3.12.2 instead (`pyvenv.cfg` confirmed
+`version_info = 3.12.2`) — the pin demonstrably changes `uv`'s interpreter
+selection rather than being an inert file. **Tested, under the now-pinned
+3.12.2, this session**: `ruff check .` clean, `pyright` (strict, via
+`pyproject.toml`) 0 errors, `pytest -q` **640 passed, 24 skipped, 0
+failed** (skips are the pre-existing `AF_UNIX`-on-Windows platform gate,
+unrelated to the Python version) — no behavioral difference found between
+3.12 and the previously-verified 3.14. `docs/DEPLOYMENT.md` §2 updated to
+state the pin is enforced, not just documented convention. See the go/no-go
+checklist below, now marked resolved.
+
 **Pi deployment go/no-go checklist**
 
 *Verified in this repository* (ruff/pyright/pytest-covered, this session
@@ -2580,6 +2648,12 @@ or earlier ones):
 - [x] systemd unit paths, cert config field names, and referenced
   deployment scripts all match the repository's actual paths (section 5
   audit above).
+- [x] **Python-version pinning gap resolved** (decision session,
+  2026-09-02) — `.python-version` (`3.12`) added, verified to actually
+  change `uv sync`'s interpreter selection (3.14.4 -> 3.12.2), and the full
+  `ruff`/`pyright`/`pytest -q` suite re-run clean under the now-pinned
+  3.12.2. `docs/DEPLOYMENT.md` §2 updated to match. See the resolution note
+  under section 5 above.
 - [x] Full suite, fresh, on a real POSIX machine, after every change in
   this session: **`ruff check .` clean, `pyright --strict` 0 errors, `pytest`
   664 passed, 0 skipped, 0 failed.** **Correction (documentation-
@@ -2625,11 +2699,6 @@ any of these done from this session):
   actual repository/deployment docs (section 4's open question) — needed
   before relying on pirewall and WAFFY running together in `ACTIVE` mode on
   the same host.
-- [ ] **The Python-version pinning gap** (section 5's soft-drift finding)
-  — a human decision on whether to add a `.python-version` file, not a
-  blocking deployment issue but worth resolving before treating "dev and
-  Pi run identical interpreters" as an actual guarantee rather than a
-  manual convention.
 
 **`enforcement_mode`'s shipped default (`"shadow"`) and every other
 safety-relevant default are unchanged by this entire session** — confirmed

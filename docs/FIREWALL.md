@@ -60,6 +60,17 @@ spec text or tuned against real data:
 This module never re-scores or re-interprets evidence itself — detection/
 scoring and decision-making stay separate layers (CLAUDE.md).
 
+**This ladder is necessary but not sufficient for `BLOCK`/`RATE_LIMIT`
+(ADDENDUM_2.md B3).** `decide` applies the table above, then downgrades a
+`BLOCK`/`RATE_LIMIT` result to `MONITOR` unless the assessment carries
+"mature" evidence — a known-attack classification, a behavioral pattern
+(which already requires multiple observations by construction), or the
+same weak reading recurring for `evidence_maturity_consistency_windows`
+consecutive assessments from the same source (`EvidenceMaturityTracker`).
+So a raw `HIGH`/`CRITICAL` `threat_level` alone does not guarantee
+`RATE_LIMIT`/`BLOCK` — see `docs/ADDENDUM_2.md` §B3 for the full invariant
+and why it lives here rather than in the validator.
+
 ## Candidate rule generation (spec §22, §23)
 
 `pirewall.firewall.generator.generate_candidate_rule` produces the

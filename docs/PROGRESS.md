@@ -2454,6 +2454,24 @@ ARM, **not** a Pi, and a different machine again from the "dev machine"
   from the 644 baseline in section 0 — 8 section-1, 3 section-2, 9 unit +
   2 integration for section 3).
 
+  **Correction (documentation-reconciliation session, 2026-09-02):** this
+  664-passed count silently depended on `pirewall/ml/artifacts/` already
+  holding this machine's locally-trained model files — gitignored,
+  machine-local, and *not* the repository's permanent state (see the
+  "model artifacts" row under "Acceptance criteria reconciliation" above,
+  which this same claim contradicts). The 2 new integration tests this
+  section added
+  (`test_batched_anomaly_scoring_uses_far_fewer_inference_calls_than_flows`,
+  `test_anomaly_scoring_backpressure_still_finishes_every_flow`) assert
+  `isolation_forest is not None` with no skip guard, so on an actual fresh
+  clone — no locally-trained model present — they hard-fail with
+  `AssertionError`, not pass. A later session confirmed this directly (a
+  fresh `uv sync && uv run pytest -q` on this same checkout, before any
+  fix, reproduced exactly 2 failures) and added a per-test skip guarded on
+  the model artifact actually being present at the configured path, so
+  these two tests now show `SKIPPED` rather than failing on a model-less
+  clone. See that session's own entry at the end of this file.
+
 **3e. Honest before/after — dev hardware only, real-Pi verification still
   outstanding.** This session's own numbers (3a) are the only ones
   gathered here; the real hardware improvement is **not measured this
@@ -2564,7 +2582,13 @@ or earlier ones):
   audit above).
 - [x] Full suite, fresh, on a real POSIX machine, after every change in
   this session: **`ruff check .` clean, `pyright --strict` 0 errors, `pytest`
-  664 passed, 0 skipped, 0 failed.**
+  664 passed, 0 skipped, 0 failed.** **Correction (documentation-
+  reconciliation session, 2026-09-02): not reproducible on a genuine fresh
+  clone** — this session's own working tree already held locally-trained
+  model artifacts (gitignored, machine-local per CLAUDE.md), which the 2
+  new batching integration tests silently depended on without a skip
+  guard. See the correction note under section 3 above and this file's
+  final entry.
 
 *Requires the human, on real hardware, and cannot be scripted* (do not mark
 any of these done from this session):
@@ -2611,3 +2635,113 @@ any of these done from this session):
 safety-relevant default are unchanged by this entire session** — confirmed
 by re-reading `config/default_config.toml`'s `[firewall]`/`[failure]`
 sections after every section's edits, not just by intent.
+
+## Documentation-reconciliation + fresh-clone test-gap session (2026-09-02)
+
+Two-part session, kept deliberately separate: a documentation-only pass
+reconciling every file under `docs/` against the real current state of
+`pirewall/`/`tests/` (not against prior doc text), plus a small,
+independently-scoped fix for two tests that hard-fail on any fresh clone.
+**No runtime code under `pirewall/` was changed.**
+
+**Reproduced before touching anything**, per the session's own
+instruction not to trust the prompt: `uv sync && uv run pytest -q` on a
+fresh checkout showed exactly 2 failures in
+`tests/integration/test_core_daemon.py`, both `AssertionError:
+isolation_forest is not None`. `pirewall/ml/artifacts/` in this working
+tree held a locally-trained `.joblib`/`.txt` model and sidecars (someone's
+prior local training output, gitignored, machine-local, dated 2026-08-28)
+— present in *this* checkout, absent by design on a genuine fresh clone,
+exactly the condition the failing tests didn't guard against.
+
+**Part 2 — Implemented + Tested.** Added a per-test (not module-level)
+skip in `tests/integration/test_core_daemon.py` for
+`test_batched_anomaly_scoring_uses_far_fewer_inference_calls_than_flows`
+and `test_anomaly_scoring_backpressure_still_finishes_every_flow`, guarded
+on `pirewall/ml/artifacts/isolation_forest_model.joblib` actually existing
+on disk, with a skip reason pointing at
+`scripts/train/train_isolation_forest.py`. Verified both directions by
+hand: with the local model artifact temporarily moved aside, both tests
+show `SKIPPED` with that reason (10 passed, 2 skipped in this file); moved
+back, both run and pass exactly as before (12 passed). The assertion
+itself (`is not None`) and everything the tests check once a model is
+present are untouched — only the ability to *not run* the test without a
+model was added. Confirms and formally documents the correction filed
+above under section 3's "664 passed" claim: that count silently depended
+on this machine already holding a trained model, which is not this
+repository's permanent state.
+
+**Part 1 — Implemented (documentation only).** `docs/ARCHITECTURE.md`'s
+top-of-file "System pipeline" diagram — stale since the B1-B6 pass and its
+batched-anomaly-scoring follow-up, still showing the pre-redesign linear
+capture -> flow -> features -> {LightGBM, Isolation Forest} -> behavior ->
+threat chain — replaced with a diagram showing the real current shape:
+flow aggregation fanning out to three bounded queues (`_flow_queue`,
+`_new_flow_queue` for B1, `_slow_cluster_queue` for B2), the four
+detectors (LightGBM, behavior analysis, Heartbleed/JA3 for B4/B5) as a
+parallel row with B4/B5 noted as capture-thread work cached by flow key
+rather than run inline in detection, an explicit Isolation-Forest-loaded
+branch handing off to a new "Anomaly-inference detail" sub-diagram for the
+dedicated `pirewall-anomaly-inference` thread and its `_anomaly_queue`,
+and B3's evidence-maturity gate shown as its own stage between threat
+assessment and firewall decision (verified against
+`pirewall.engine.decision.decide`'s actual call order, not assumed from
+the addendum prose alone). Built by reading `pirewall/runtime/core.py`'s
+own module docstring (the authoritative thread table), `pirewall/runtime/
+pipeline.py`'s `process`/`finish` split, and `pirewall/detection/
+coordinator.py` directly, not by paraphrasing existing docs.
+
+The rest of `docs/` was reconciled file by file against current code
+(four parallel research passes, each covering a different subset, findings
+verified before applying): real fixes made, beyond the diagram, in
+`docs/ADDENDUM_2.md` (a false `docs/PROJECT_SUMMARY.md` reference in the
+B1-B6 summary table — that file was deliberately never created; and a
+dangling "1 pre-existing unrelated failure noted under B1" cross-reference
+that B2-B6 all repeat but B1 itself never explains — named the actual test
+(`test_management_access_restricted_to_admin_pc_placeholder`) and noted it
+was fixed in a later commit, so the full suite has 0 failures, not 1, as
+of that fix), `docs/DEPLOYMENT.md` and `docs/DEPLOYMENT_COMPLETE.md`
+(anomaly-scoring batching was documented as "still open" / "one flow per
+call" in both — now implemented and on by default, updated with the real
+Pi-4 numbers and pointers to `docs/ARCHITECTURE.md`; both control-panel
+rendering gaps `DEPLOYMENT_COMPLETE.md` listed as open are confirmed
+closed), `docs/FIREWALL.md` (the decision-ladder table never mentioned
+B3's maturity gate, which can downgrade its own output), `docs/
+ML_PIPELINE.md` (a pre-rare-class-exclusion ablation table and per-class
+numbers left in place after v0.4.0 shipped, without saying so — marked
+historical, current numbers cross-referenced), `docs/DEVELOPMENT_WORKFLOW.md`
+(doc map missing `ADDENDUM_2.md`, `ML_DATA_AUDIT.md`,
+`CODING_STANDARDS.md`, `DEPLOYMENT_COMPLETE.md` entirely), `docs/
+TESTING.md` (the `tests/integration/` tier description named 4 of 8 real
+files; the "no real trained ML models" opening claim is now false for the
+2 tests Part 2 fixed — corrected with an explicit carve-out and the real
+664 count), and `docs/SETUP.md` (its condensed `uv sync` install step
+should read `uv sync --no-dev`, matching `docs/DEPLOYMENT.md`'s own
+deliberate production-install flag for the identical step).
+
+**Flagged, not fixed — left for a human, not guessed at:**
+- `CLAUDE.md` (repo root, outside this session's `docs/`-only scope) never
+  mentions `docs/ADDENDUM_2.md` at all, despite it being a heavily-cited
+  addendum-tier document that wins conflicts the same way `docs/ADDENDUM.md`
+  does.
+- `docs/TESTING.md`'s pre-existing "All 400+ tests..." framing (now
+  corrected to the real 664, see above) was technically true as a floor
+  but understated current coverage — fixed rather than left, since the
+  real number was already in hand from this session's own verified run.
+
+**Everything else audited and found accurate**, verified against real
+code/config/tests, not assumed: `docs/ADDENDUM.md`, `docs/API.md`,
+`docs/FEATURE_SCHEMA.md`, `docs/ML_DATA_AUDIT.md`, `docs/SECURITY.md`,
+`docs/CODING_STANDARDS.md`, `docs/SETUP.md` (beyond the one flag above),
+and `docs/MASTER_SPEC.md` (confirmed untouched since it was seeded —
+`git log` shows one commit ever on that file — so it remains genuinely
+frozen, not just nominally).
+
+**Verified clean, fresh, this session, real POSIX (WSL2 Ubuntu)**: `uv run
+ruff check .` clean, `uv run pyright` 0 errors/0 warnings, `uv run pytest -q`
+**664 passed** (this machine's working tree still holds the locally-trained
+model from the section above, so the 2 newly-skippable tests ran and
+passed rather than skipped here — independently confirmed to skip cleanly
+with a clear reason when that artifact is temporarily absent, per Part 2
+above). A genuine fresh clone with no locally-trained model present should
+now show **662 passed, 2 skipped, 0 failed**.

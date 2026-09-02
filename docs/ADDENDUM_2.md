@@ -228,6 +228,24 @@ tests in that file are in the same state here) and this session ran on a
 Windows dev machine, which lacks `AF_UNIX`. It should be run on the next
 macOS/Linux session before relying on it.
 
+**The "1 pre-existing unrelated failure" every later section in this
+document references** (B2 through B6, each phrased "the same 1
+pre-existing unrelated failure noted under B1"):
+`tests/security/test_firewall_base_template.py::test_management_access_restricted_to_admin_pc_placeholder`,
+failing identically on a clean checkout before any of this pass's changes
+(confirmed via `git stash`) — `deploy/firewall/base.nft.template`'s DNS
+(port 53) accept rule is scoped to `${PROTECTED_NETWORK}`, not
+`${ADMIN_PC_IP}`, which the test asserted for every `tcp dport` accept
+line including DNS. Out of scope for this pass at the time, so noted in
+passing rather than fixed. **Since fixed**, in a later session
+(`fix(tests): scope the admin-PC template test to management ports only`)
+— the test now checks specifically that the management-access rule
+(port 22 / the API port) is Admin-PC-scoped, with a second test asserting
+DNS/DHCP are correctly protected-network-scoped and *not* Admin-PC-scoped.
+A reader hitting one of the "noted under B1" references below in a
+current checkout should not go looking for this failure — the full suite
+has 0 failures as of that fix.
+
 **Not changed:** the actual pattern thresholds/config fields, `_assess_state`
 itself, and `ThreatAssessment`/scoring — B1 only changes *when* the inputs
 to `_assess_state` are collected, not the detection logic itself.
@@ -702,4 +720,4 @@ this section, per the phase prompt.
 | B4 Heartbleed detector | `pirewall/detection/tls_heartbeat.py` (new), `pirewall/capture/parser.py`, `pirewall/engine/scoring.py`, `pirewall/engine/threat.py`, `pirewall/core/models/evidence.py`, `pirewall/core/models/threat.py`, `pirewall/core/models/detection_record.py`, `pirewall/runtime/core.py` |
 | B5 JA3 fingerprinting | `pirewall/detection/tls_fingerprint.py` (new), `config/known_tool_fingerprints.toml` (new) |
 | B6 Empirical test | `tests/` only, no runtime code |
-| §7 WAFFY scope boundary | `docs/ARCHITECTURE.md`, `docs/PROJECT_SUMMARY.md` (docs only) |
+| §7 WAFFY scope boundary | `docs/ARCHITECTURE.md` (docs only — `docs/PROJECT_SUMMARY.md` was never created; see `docs/PROGRESS.md`'s note on why) |

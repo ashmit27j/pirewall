@@ -122,7 +122,7 @@ sudo mkdir -p /opt/pirewall
 sudo chown "$USER" /opt/pirewall
 git clone <your-repo-url> /opt/pirewall
 cd /opt/pirewall
-uv sync
+uv sync --no-dev   # production install, skips pytest/ruff/pyright
 ```
 
 ## 2. Create the service users and log directories

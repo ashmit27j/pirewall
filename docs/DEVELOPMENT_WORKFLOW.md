@@ -94,13 +94,17 @@ implement a later phase's scope early:
 |---|---|
 | What pirewall does, architecture overview | `README.md`, `docs/ARCHITECTURE.md` |
 | Full original spec | `docs/MASTER_SPEC.md` (frozen, verbatim) |
-| Safety-oriented additions on top of the spec | `docs/ADDENDUM.md` (wins on conflict) |
+| Safety-oriented additions on top of the spec | `docs/ADDENDUM.md` (A1-A8, wins on conflict with `MASTER_SPEC.md`) |
+| Second-wave additions (B1-B6 behavioral detection, batched anomaly scoring) | `docs/ADDENDUM_2.md` (wins on conflict with `MASTER_SPEC.md`/`ADDENDUM.md`) |
 | Current phase status, honest labels, open questions | `docs/PROGRESS.md` |
 | The canonical feature list | `docs/FEATURE_SCHEMA.md` |
 | Dataset adapters, training, runtime inference | `docs/ML_PIPELINE.md` |
+| ML training dataset/artifact provenance and honesty audit | `docs/ML_DATA_AUDIT.md` |
 | Decision -> candidate -> validation -> deploy -> lifecycle | `docs/FIREWALL.md` |
 | API endpoints, auth model | `docs/API.md` |
 | How to run/extend tests, what's Fake vs. real | `docs/TESTING.md` |
+| Coding conventions beyond `CLAUDE.md`'s non-negotiables | `docs/CODING_STANDARDS.md` |
 | Hardening, threat model, resource-exhaustion protections | `docs/SECURITY.md` |
 | Real-Pi deployment steps | `docs/DEPLOYMENT.md` |
+| Entry-point/runtime build record (`pirewall/runtime/`, both processes run for real) | `docs/DEPLOYMENT_COMPLETE.md` |
 | Dependency decisions beyond the base allowed list | `docs/ARCHITECTURE.md` |

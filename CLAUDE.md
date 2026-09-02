@@ -20,6 +20,17 @@ a rate cap on rule creation (A3), the privileged/unprivileged process split
 systemd watchdog (A6), an approval queue for high-confidence BLOCK actions
 (A7), and an emergency kill-switch (A8).
 
+**`docs/ADDENDUM_2.md` is a second-wave set of additions on top of both —
+read it too, every session.** Where it conflicts with `MASTER_SPEC.md` or
+`docs/ADDENDUM.md`, `ADDENDUM_2.md` wins (it's the newest and most
+specific). It covers: decoupling fast/volumetric behavioral detection from
+flow completion (B1), a slow-rate aggregate DoS signal (B2), an
+evidence-maturity gate that caps BLOCK/RATE_LIMIT without mature evidence
+(B3), a Heartbleed record-length detector (B4), TLS ClientHello (JA3)
+fingerprinting for known attack tooling (B5), and the batched-anomaly-
+scoring follow-up pass (a dedicated `pirewall-anomaly-inference` thread and
+its own bounded queue).
+
 Current status of every phase is tracked in `docs/PROGRESS.md`.
 
 ## Session start checklist

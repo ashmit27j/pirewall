@@ -52,7 +52,8 @@ import of it from the API process would defeat ADDENDUM.md A4.
 | `runtime/metrics.py` | `MetricsCollector`, `RuntimeCounters` — builds a live `NetdataMetricsSnapshot`. |
 | `runtime/watchdog.py` | `SystemdNotifier` — `sd_notify` `READY=1` / `WATCHDOG=1` / `STOPPING=1`. |
 
-Threads, and why there is more than one:
+Threads, and why there is more than one (this table is as of this session;
+a later session added a fifth thread — see the update note below):
 
 | Thread | Work |
 |---|---|
@@ -69,6 +70,17 @@ stall `recv()` and drop packets in the kernel. The queue between them is
 **bounded and drops on overflow rather than blocking** — a detection
 backlog must cost detection coverage, never packet capture. Drops are
 counted and reported as `SYSTEM_WARNING` events, never silent.
+
+**Update (batched-anomaly-scoring follow-up pass):** a real Pi 4 run
+measured single-flow Isolation Forest scoring at ~30.7 ms/call, 92% of
+end-to-end cost, causing real kernel packet drops — confirming this split
+mattered and going further. `CoreDaemon` now runs one more thread,
+`anomaly-inference` (spawned only when an Isolation Forest model is
+loaded), which batches many flows into one `decision_function` call
+instead of scoring them one at a time. See `docs/ARCHITECTURE.md`'s system
+pipeline diagram and "Batched anomaly scoring" section for the current,
+authoritative thread table and data flow — the table above is left as
+written for this session's own record rather than silently rewritten.
 
 `CoreStateStore` and `FirewallManager` are guarded by one reentrant lock
 shared with the RPC dispatcher (`_SynchronizedDispatcher`), so an RPC
@@ -227,21 +239,25 @@ state policy directly. Confirmed with the operator before omitting.
 * **`api_health` in the Netdata snapshot is not a measurement of the
   pirewall-api process.** A4 gives pirewall-core no handle on it. It
   reports whether the RPC socket pirewall-api depends on is being served.
-* **Anomaly scoring is still one flow per `decision_function` call** —
-  ~15.6 ms each, est. 10–20 flows/s on a Pi 4. Batching remains the open
-  design question `docs/PROGRESS.md` records; the queue's backpressure
-  reporting now makes it *observable* rather than silent, but does not fix
-  it.
+* **(Superseded — see the "Update" note in §2 above.)** Anomaly scoring
+  was one flow per `decision_function` call at the time of this session
+  (~15.6 ms each, est. 10–20 flows/s on a Pi 4), with batching left as an
+  open design question. A later real-Pi-4 benchmark measured the actual
+  single-flow cost at ~30.7 ms/call (92% of end-to-end cost) and a
+  follow-up pass implemented batching via a dedicated
+  `pirewall-anomaly-inference` thread, on by default whenever a model is
+  loaded. See `docs/ARCHITECTURE.md`.
 * **`config/local_config.toml` is gitignored and does not travel with the
   repository** — it must be created on the Pi. That is now a single
   command: `python -m scripts.deployment.configure` detects the network
   layout with `ip` and prompts only for the Admin PC and the admin
   password. See §8 below and `docs/SETUP.md`.
-* **Two control-panel rendering gaps remain open** (`docs/PROGRESS.md`):
-  the "network statistics" section and the "detections" section are not
-  rendered in the HTML panel. The underlying data is now reachable over
-  the JSON API for both — `/api/v1/capture-stats` was the missing half —
-  so what is left is `pirewall/web/render.py` work only.
+* **(Superseded.)** At the time of this session, two control-panel
+  rendering gaps were open: the "network statistics" section and the
+  "detections" section were not rendered in the HTML panel, only reachable
+  over the JSON API. Both are now rendered
+  (`pirewall/web/render.py`'s `_render_network_section` /
+  `_render_detections_section`, wired into `render_dashboard`).
 
 ## 7. Setup tooling
 

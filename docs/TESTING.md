@@ -10,9 +10,23 @@ uv run ruff check .
 uv run pyright                # strict mode, per pyproject.toml
 ```
 
-All 400+ tests run without root, without a real NIC, without a real `nft`
-binary, and without real trained ML models or real datasets — see "Fakes
-vs. real hardware" below for exactly what that means and doesn't mean.
+All 664 tests run without root, without a real NIC, and without a real
+`nft` binary or real datasets — see "Fakes vs. real hardware" below for
+exactly what that means and doesn't mean. Almost every test also needs no
+real trained ML model: `tests/ml/` and the performance smoke pass each
+train a fresh tiny placeholder model on demand, and the rest of the suite
+runs with both `pirewall/ml/artifacts/*` models absent by design (they are
+gitignored, machine-local, and never checked in — see
+`docs/ML_DATA_AUDIT.md`). The two exceptions are
+`test_batched_anomaly_scoring_uses_far_fewer_inference_calls_than_flows`
+and `test_anomaly_scoring_backpressure_still_finishes_every_flow` in
+`tests/integration/test_core_daemon.py`, which genuinely need the real
+shipped Isolation Forest artifact to exercise real batching timings —
+each is individually skipped with a clear reason (not failed, not
+silently passed) when that artifact isn't present at
+`pirewall/ml/artifacts/isolation_forest_model.joblib`, which is the case
+on every fresh clone. Run `scripts/train/train_isolation_forest.py`
+locally to produce one and un-skip them.
 
 ## Test tiers (`tests/`)
 
@@ -20,7 +34,7 @@ vs. real hardware" below for exactly what that means and doesn't mean.
 |---|---|
 | `tests/unit/` | One module/class at a time: domain models, config loading, parsing, flow keys/state/table, feature extraction, ML training/inference building blocks, decision engine, rule generation, validator (every stage independently), rate limiter, auth, API routes, control panel rendering, IPC dispatcher. |
 | `tests/ml/` | Dataset adapters, training pipelines, model artifacts/metadata, inference — all against small synthetic fixture data (see `docs/ML_PIPELINE.md`). |
-| `tests/integration/` | Multi-module pipelines exercised together: capture->parse, the full addendum-driven rule lifecycle (SHADOW/ASSISTED/kill-switch), candidate->validation->backend, and (Phase 9) the complete `Packet -> Flow -> FeatureVector -> Behavior -> ThreatAssessment -> FirewallDecision -> CandidateRule -> Validation -> FirewallBackend` chain against scripted benign/port-scan/SYN-flood traffic. |
+| `tests/integration/` | Multi-module pipelines exercised together: capture->parse, the full addendum-driven rule lifecycle (SHADOW/ASSISTED/kill-switch), candidate->validation->backend, the complete `Packet -> Flow -> FeatureVector -> Behavior -> ThreatAssessment -> FirewallDecision -> CandidateRule -> Validation -> FirewallBackend` chain against scripted benign/port-scan/SYN-flood traffic, the whole `CoreDaemon` running end to end through every real thread and the real `AF_UNIX` transport (`test_core_daemon.py`, `AF_UNIX`-gated), the real `UnixSocketRpcServer`/`UnixSocketRpcClient` transport on its own (`test_rpc_unix_socket.py`), a detection-loop queue-drain ordering regression (`test_detection_loop_ordering.py`), and `CoreDaemon`'s B4/B5 TLS structural-evidence wiring (`test_tls_evidence_wiring.py`, not `AF_UNIX`-gated — runs below the RPC socket). |
 | `tests/security/` | Adversarial/safety-focused: malformed/truncated packets, injection attempts, Admin-PC-lockout prevention, firewall backend failure handling, resource exhaustion under flood conditions, import-graph isolation proofs (A4, backend-isolation), static structure checks on `deploy/systemd/*.service` and `deploy/firewall/base.nft.template`. |
 | `tests/system/` | End-to-end smoke checks that don't fit the tiers above — currently the performance smoke pass regression guard. |
 | `tests/helpers/` | Shared fixture factories (`make_config`, `make_flow`, `make_packet`, `make_candidate`, ...) — not tests themselves. |

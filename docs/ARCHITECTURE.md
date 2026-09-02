@@ -5,35 +5,83 @@
 The complete detection/enforcement pipeline, and the one separation the
 whole system must preserve — detection produces evidence, evidence is
 scored into a threat assessment, a decision is made, and only *then* does
-anything touch the firewall:
+anything touch the firewall. Since the ADDENDUM_2.md B1-B5 pass and its
+batched-anomaly-scoring follow-up, this is no longer a single linear
+chain: flow aggregation fans out to three bounded queues, four detectors
+run (three inline, one on its own thread), and B3's evidence-maturity gate
+sits between scoring and decision. `pirewall.runtime.core.CoreDaemon`'s own
+module docstring is the authoritative thread table this diagram follows.
 
 ```text
                  NETWORK
                     |
                     v
              PACKET CAPTURE           pirewall.capture (AFPacketCapture / FakePacketCapture)
+              (capture thread)
                     |
                     v
              FLOW AGGREGATION         pirewall.flow (FlowAggregator, bounded FlowTable)
                     |
-                    v
-            FEATURE EXTRACTION        pirewall.features (one canonical extractor)
+        +-----------+----------------------+
+        |           |                      |
+        v           v                      v
+    completed   new-flow-opened        slow-conn-cluster
+     flow        signal (B1)             snapshot (B2)
+        |           |                      |
+        v           v                      v
+  _flow_queue  _new_flow_queue       _slow_cluster_queue
+        |           |                      |
+        |           v                      v
+        |     detection thread folds both into BehaviorAnalyzer
+        |     (B2 also re-enqueues its representative flow onto _flow_queue)
+        |                                   |
+        +----------------<------------------+
+        |
+        v
+   detection thread drains _flow_queue, runs FEATURE EXTRACTION
+        |                                  pirewall.features (one canonical extractor)
+        v
+  +-----+--------------------+---------------------------------+
+  |                          |                                  |
+  v                          v                                  v
+LightGBM              Behavior analysis          Heartbleed / JA3 fingerprint
+(known-attack)         (deterministic;             (B4/B5 — TLS record-layer /
+ pirewall.detection.    B1/B2 signals folded in)     ClientHello parsing, run on
+ known_attack           pirewall.detection.behavior  the capture thread against raw
+                                                      TCP/443 payload, cached by flow
+                                                      key, popped here at completion —
+                                                      pirewall.detection.tls_heartbeat
+                                                      / tls_fingerprint)
+  |                          |                                  |
+  +------------+-------------+----------------------------------+
+               |
+               v
+     Isolation Forest model loaded?      pirewall.detection.anomaly, wrapping
+       |                    |             pirewall.ml.inference.isolation_forest_predictor
+       | no                | yes
+       v                    v
+  score inline         hand off to the pirewall-anomaly-inference thread's
+  (as before)           _anomaly_queue — process() returns here; see
+       |                "Anomaly-inference detail" below. This flow resumes
+       |                at THREAT ASSESSMENT once that thread calls
+       |                FlowPipeline.finish() for it.
+       v                    |
+       +---------<----------+
+       |
+       v
+     THREAT ASSESSMENT        pirewall.engine.threat + pirewall.engine.scoring
+                               (combines known + anomaly + behavior +
+                                protocol-signature evidence)
                     |
-          +---------+---------+
-          |                   |
-          v                   v
-       LightGBM        Isolation Forest   pirewall.ml.inference, wrapped by
-          |                   |            pirewall.detection.{known_attack,anomaly}
-          +---------+---------+
+                    v
+     EVIDENCE MATURITY GATE   pirewall.engine.decision.EvidenceMaturityTracker
+                               (ADDENDUM_2.md B3 — caps a BLOCK/RATE_LIMIT
+                                decision to MONITOR unless it carries
+                                mature evidence; lives inside `decide`, not
+                                as a separate module)
                     |
                     v
-             BEHAVIOR ANALYSIS         pirewall.detection.behavior (deterministic, no ML)
-                    |
-                    v
-             THREAT ASSESSMENT         pirewall.engine.threat + pirewall.engine.scoring
-                    |
-                    v
-             FIREWALL DECISION         pirewall.engine.decision
+             FIREWALL DECISION         pirewall.engine.decision.decide
                     |
                     v
              CANDIDATE RULE            pirewall.firewall.generator
@@ -50,6 +98,56 @@ anything touch the firewall:
                     v
              NETWORK TRAFFIC
 ```
+
+**Anomaly-inference detail** (ADDENDUM_2 follow-up pass, section 3) — the
+hand-off above, expanded. This thread is only spawned when
+`DetectionCoordinator.models.isolation_forest is not None`; when no model
+is loaded, the hand-off never happens and detection stays exactly the
+single-threaded, synchronous path it always was:
+
+```text
+  detection thread                    pirewall-anomaly-inference thread
+  (FlowPipeline.process)
+        |
+        v
+  PendingAnomalyScoring
+  (flow + features + known/
+   behavior evidence already
+   computed; anomaly_evidence
+   left None)
+        |
+        v
+  _anomaly_queue (bounded)  ------->  _collect_anomaly_batch
+                                       flushes on whichever comes first:
+                                       - detection.anomaly_batch_size flows
+                                         (default 50)
+                                       - detection.anomaly_batch_max_wait_seconds
+                                         since the batch's first flow (default 0.2s)
+                                             |
+                                             v
+                                       one detect_batch() /
+                                       anomaly_score_batch() call per
+                                       batch — N flows' feature rows
+                                       stacked into a single
+                                       decision_function() call
+                                             |
+                                             v
+                                       FlowPipeline.finish() once per
+                                       flow in the batch — rejoins the
+                                       main pipeline at THREAT ASSESSMENT
+```
+
+**Backpressure on `_anomaly_queue` degrades, it does not drop the flow.**
+Unlike the other three queues, a full `_anomaly_queue` does not lose a
+flow: known-attack and behavior evidence were already computed inline
+before the hand-off, so `_enqueue_anomaly_scoring` calls
+`FlowPipeline.finish` immediately with `anomaly_evidence` left `None` —
+the flow still reaches a real `ThreatAssessment`, just without an
+Isolation Forest score. Counted by its own
+`RuntimeCounters.anomaly_scores_dropped_for_backpressure` field and its
+own rate-limited `SecurityEvent`, deliberately distinct from
+`flows_dropped_for_backpressure` (a flow never assessed at all, when
+`_flow_queue` itself is full).
 
 Security events flow separately, out of every stage above that can emit
 one, to two independent consumers:

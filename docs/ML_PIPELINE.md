@@ -452,12 +452,13 @@ leaf values grow unbounded, so boosting *diverged*. Macro-F1 fell from
 `docs/ML_DATA_AUDIT.md` §F has the mechanism, the measured before/after,
 and the three hypotheses that were wrong.
 
-**Architecture** — chosen by a full-scale five-way ablation on one fixed
-split, not assumed:
+**Architecture, as it stood right after the `lambda_l2` fix, before the
+rare-class exclusion policy existed** — chosen by a full-scale five-way
+ablation on one fixed split:
 
 | configuration | macro-F1 | leak-free macro-F1 |
 |---|---:|---:|
-| **flat multiclass, plain (kept)** | **0.8724** | **0.8855** |
+| **flat multiclass, plain (kept at the time)** | **0.8724** | **0.8855** |
 | flat multiclass + rare-class exclusion | 0.8546 | 0.8542 |
 | flat multiclass + under/oversampling | 0.8291 | 0.8310 |
 | two-stage (binary gate -> attack-type) | 0.8217 | 0.8173 |
@@ -466,20 +467,33 @@ split, not assumed:
 Every imbalance intervention *costs* macro-F1 once the divergence is fixed.
 The two-stage gate is near-perfect on its own (99.69% accuracy) and still
 loses end-to-end, so the extra artifact, the extra inference call and the
-composed failure mode buy nothing — architecture A stays.
+composed failure mode bought nothing at the time.
 
-**Known remaining weaknesses — stated plainly:**
+**Superseded by "Architecture decision — flat multiclass, on evidence"
+above, and by v0.4.0 being shipped.** The exclusion row in this table
+(0.8546) is what the "Rare-class exclusion policy — settled" section
+above later adopted for v0.4.0, once measured against the *fixed* baseline
+rather than left as "plain" — so "architecture A stays" no longer means
+the exclusion-free config here. Kept for the historical record of how the
+choice evolved; do not read this table as describing the current shipped
+model. Same caveat applies to the per-class numbers immediately below,
+which predate rare-class exclusion — the "Full per-class table (v0.4.0...)"
+above is the current one.
 
-- **Web Attack – XSS 15.31% recall** (98 test rows), **Bot 44.75%** (295),
-  **Web Attack – Brute Force 51.33%** (226). These are the genuinely weak
-  classes now, and no technique tried here fixed them.
-- **Heartbleed, Infiltration and Web Attack – Sql Injection are caught
-  (2/2, 5/5, 2/3) but on 2-5 test rows each.** Do not read those as
-  reliable detection; they have 11, 36 and 21 total examples.
-- **17.71% of test rows are exact duplicates of a training row**
-  (`docs/ML_DATA_AUDIT.md` §D), so absolute figures carry some
-  memorisation. The leak-free column above excludes them. PortScan (55.6%
-  leaked) and SSH-Patator (49.7%) are the most affected; DDoS (0.01%) and
-  Bot (2.03%) are essentially clean.
-- **Trained and evaluated on one 2017 dataset.** Nothing here measures
-  performance on this project's actual traffic.
+**Known weaknesses at that point in the project's history — kept for
+context, not current:**
+
+- Web Attack – XSS 15.31% recall (98 test rows), Bot 44.75% (295),
+  Web Attack – Brute Force 51.33% (226) — the pre-exclusion, pre-v0.4.0
+  numbers for these classes. See the v0.4.0 per-class table above for the
+  current figures (11.22% / 45.42% / 50.44% respectively — still weak, not
+  fixed, just re-measured on the current artifact).
+- Heartbleed, Infiltration and Web Attack – Sql Injection were caught
+  (2/2, 5/5, 2/3) on 2-5 test rows each in this pre-exclusion run. They are
+  excluded from supervised training entirely as of v0.4.0 (see "Rare-class
+  exclusion policy" above); their current detection coverage is Isolation
+  Forest + behaviour analysis, audited in `docs/ML_DATA_AUDIT.md`.
+- 17.71% of test rows are exact duplicates of a training row
+  (`docs/ML_DATA_AUDIT.md` §D) — still true, dataset-level, not
+  model-version-specific.
+- Trained and evaluated on one 2017 dataset — still true.

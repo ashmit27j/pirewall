@@ -45,6 +45,31 @@ pytestmark = pytest.mark.skipif(
 _DEADLINE_SECONDS = 10.0
 _POLL_SECONDS = 0.02
 
+# `make_config()`'s default `ml.isolation_forest_model_path`
+# (`pirewall/ml/artifacts/isolation_forest_model.joblib`). The two tests
+# below need a real, loadable model there to exercise the real batching
+# machinery — but `pirewall/ml/artifacts/` ships only `.gitkeep`,
+# `__init__.py` and `metadata.py` by design (CLAUDE.md): trained `.joblib`
+# artifacts are gitignored and never committed. That is the repository's
+# permanent state on every checkout, not a one-off gap.
+_ISOLATION_FOREST_MODEL_PATH = Path("pirewall/ml/artifacts/isolation_forest_model.joblib")
+
+
+def _skip_without_trained_isolation_forest() -> None:
+    """Skip a test that needs a real Isolation Forest artifact on disk.
+
+    A per-test guard, not a module-level one: every other test in this file
+    runs happily with both models absent (that's the degraded-ML path
+    `test_daemon_starts_serves_rpc_and_stops_cleanly` exists to cover).
+    """
+    if not _ISOLATION_FOREST_MODEL_PATH.exists():
+        pytest.skip(
+            f"needs a locally-trained Isolation Forest model at "
+            f"{_ISOLATION_FOREST_MODEL_PATH}, which is gitignored and not "
+            "checked in (CLAUDE.md) -- run "
+            "scripts/train/train_isolation_forest.py to produce one locally"
+        )
+
 _SYN = 0x02
 _FIN_ACK = 0x11
 
@@ -247,6 +272,7 @@ def test_batched_anomaly_scoring_uses_far_fewer_inference_calls_than_flows(socke
     between it and the detection thread — not a fake or a mock of any of
     pirewall's own code.
     """
+    _skip_without_trained_isolation_forest()
     n_flows = 20
     packets: list[bytes] = []
     for index in range(n_flows):
@@ -288,6 +314,7 @@ def test_anomaly_scoring_backpressure_still_finishes_every_flow(socket_path: str
     field, distinct from `_note_backpressure_drop`'s "never assessed at
     all" failure mode.
     """
+    _skip_without_trained_isolation_forest()
     n_flows = 5
     packets: list[bytes] = []
     for index in range(n_flows):

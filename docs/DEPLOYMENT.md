@@ -628,9 +628,10 @@ official Arch packages.
 
 ## 8b. Raspberry Pi 4 (4 GB) sizing notes
 
-Measured on the development machine, not on a Pi — treat as budgeting
-input, and re-measure on the target with
-`scripts/diagnostics/performance_smoke.py` (spec §40, §46).
+Measured on a real Pi 4 (`docs/PROGRESS.md`, "Real-hardware performance
+benchmark session"), superseding the dev-machine estimates this section
+used to carry — treat as budgeting input, and re-measure on your own Pi
+with `scripts/diagnostics/performance_smoke.py` (spec §40, §46).
 
 **Memory — comfortable.** A full flow table at the default
 `flow.max_flows = 100000` measures ~93 MiB of Python objects (~979 bytes
@@ -638,31 +639,43 @@ per tracked flow). Add the ML stack resident (numpy/scipy/scikit-learn/
 lightgbm, roughly 200–250 MiB) and the interpreter, and `pirewall-core`
 sits well inside the `MemoryMax=768M` its unit sets, which in turn leaves
 most of a 4 GB Pi free. `pirewall-api` is capped at 256M and does no
-packet-rate work. No tuning needed for 4 GB.
+packet-rate work. On the real benchmark run, `pirewall-core` RSS stayed at
+147.80–168.78 MB start to finish. No tuning needed for 4 GB.
 
-**Inference throughput — the real constraint.** Anomaly scoring currently
-runs one flow per `IsolationForest.decision_function` call, and at
-`n_estimators=100` that measures ~15.6 ms/call on x86 — almost entirely
-scikit-learn's fixed per-call overhead, not tree traversal. The same
-forest scoring a batch of 200 costs ~0.088 ms/flow, a ~178× difference.
+**Inference throughput — batched by default, still the biggest single
+cost.** Single-flow `IsolationForest.decision_function` measured **~30.7
+ms/call on a real Pi 4 — 92% of end-to-end packet-to-decision cost** — and
+caused real kernel packet drops (38.5% in one 15 s window) once flows
+completed faster than that. This is no longer something an operator has to
+work around: `pirewall-core` runs a dedicated `pirewall-anomaly-inference`
+thread (`docs/ARCHITECTURE.md`'s "Batched anomaly scoring" section) that
+coalesces many flows into one `decision_function` call —
+`detection.anomaly_batch_size` (default 50) or
+`detection.anomaly_batch_max_wait_seconds` (default 0.2 s), whichever
+triggers first — on by default whenever an Isolation Forest model is
+loaded, no config change needed. A dev-machine (not yet Pi-re-measured)
+quick benchmark found batch scoring costs ~3.2–3.4 ms/call regardless of
+batch size 1 through 100, i.e. the fixed per-call cost is amortized across
+the whole batch instead of paid once per flow.
 
-That puts single-flow scoring at roughly 64 flows/sec on a fast x86
-laptop, so plausibly **~10–20 flows/sec on a Pi 4's Cortex-A72**. A busy
-household can complete more flows than that, in which case anomaly
-scoring becomes the pipeline's bottleneck. Mitigations, cheapest first:
+The real, still-relevant constraint after batching: sustained load that
+exceeds what one `pirewall-anomaly-inference` thread can drain will still
+back up `_anomaly_queue` and, once full, flows finish without an Isolation
+Forest score rather than blocking (never lost — see
+`docs/ARCHITECTURE.md`'s backpressure note). If Netdata shows
+`anomaly_scores_dropped_for_backpressure` climbing, cheap remaining
+mitigations:
 
-1. Retrain with fewer trees — `--n-estimators 25` measured ~4.3 ms/call,
-   a 3.6× improvement, at some detection-quality cost.
-2. Score flows in batches rather than one at a time. This is the real
-   fix (two orders of magnitude) but changes the shape of the detection
-   layer's inference call, so it is recorded as an open design item in
-   `docs/PROGRESS.md` rather than done implicitly.
+1. Raise `detection.anomaly_batch_size` so more flows amortize into fewer
+   calls per unit time.
+2. Retrain with fewer trees — `--n-estimators 25` measured ~4.3 ms/call on
+   the pre-batching single-flow path, a 3.6× improvement, at some
+   detection-quality cost; combines with batching rather than replacing it.
 
-Neither is required for a **SHADOW**-mode first deployment (ADDENDUM.md
-A1), where falling behind delays observations but enforces nothing —
-which is another reason to run SHADOW for the recommended 1–2 weeks and
-watch `pirewall.inference_latency_ms` in Netdata before enabling
-enforcement.
+Not required for a **SHADOW**-mode first deployment (ADDENDUM.md A1),
+where falling behind delays observations but enforces nothing — which is
+another reason to run SHADOW for the recommended 1–2 weeks and watch
+`pirewall.inference_latency_ms` in Netdata before enabling enforcement.
 
 ## 9. Secure update procedure
 

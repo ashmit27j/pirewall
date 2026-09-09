@@ -1,0 +1,101 @@
+[Unit]
+Description=pirewall-portal — LAN captive portal sign-in page (ADDENDUM_3.md C1)
+# TEMPLATE — review before trusting it in production (spec §27). Nothing in
+# this repository installs or starts it.
+#
+# The third and least-privileged process. It serves the sign-in page to
+# untrusted clients on the protected network, holds no state, and cannot
+# reach pirewall-core's privileged RPC socket at all — only the portal
+# socket, whose dispatcher implements four operations and knows nothing
+# about rules, the allowlist, or the kill switch.
+#
+# "After=" is ordering only, deliberately not "Requires="/"BindsTo=":
+# pirewall-portal must outlive a pirewall-core restart so it can tell LAN
+# clients the controller is unreachable rather than refusing connections
+# (ADDENDUM.md A6).
+Documentation=file:///opt/pirewall/docs/SETUP.md
+After=network-online.target pirewall-core.service
+Wants=network-online.target
+
+# StartLimit* live in [Unit], not [Service]: systemd reads them only here and
+# silently ignores them under [Service], so a misplaced pair means the
+# crash-loop bound ADDENDUM.md A6 asks for is never actually armed.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# `pirewall.portal` loads config, refuses to start unless portal.enabled is
+# set and the listen port is unprivileged, then serves
+# `pirewall.portal.app.create_app` over uvicorn.
+#
+# Validate before enabling:
+#   /opt/pirewall/.venv/bin/python -m pirewall.portal --check-config
+ExecStart=/opt/pirewall/.venv/bin/python -m pirewall.portal
+WorkingDirectory=/opt/pirewall
+
+Restart=on-failure
+RestartSec=5s
+
+# --- Least privilege (spec §27, §45, ADDENDUM_3.md C1) ----------------------
+# A third distinct user. Its supplementary group is pirewall-portal-ipc,
+# NOT pirewall-ipc: that is the whole access-control mechanism behind the
+# two-socket split. Adding pirewall-ipc here would hand the kill switch and
+# every rule mutation to the process untrusted LAN clients talk to.
+User=pirewall-portal
+Group=pirewall-portal
+SupplementaryGroups=pirewall-portal-ipc
+
+# No capabilities at all. In particular no CAP_NET_BIND_SERVICE: the portal
+# binds an unprivileged port (portal.listen_port, default 8080) and port 80
+# reaches it through the nat redirect in deploy/firewall/portal.nft. A
+# captive portal that needed to bind 80 itself would be the one process on
+# this box with a privileged capability and the widest attack surface.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+
+# --- Service isolation (spec §27) ------------------------------------------
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+PrivateDevices=true
+# AF_UNIX for the portal RPC socket, AF_INET to serve HTTP to LAN clients.
+# No AF_INET6 (v1 is IPv4-only, ADDENDUM.md A5), no AF_PACKET, no AF_NETLINK.
+RestrictAddressFamilies=AF_UNIX AF_INET
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @obsolete
+SystemCallErrorNumber=EPERM
+
+# Read-only everywhere that matters. It needs the portal socket in
+# /run/pirewall-portal (group pirewall-portal-ipc, created and chgrp-ed
+# by pirewall-core) and its own log directory. It has no access to
+# /run/pirewall at all, which is where the privileged socket lives. It has NO access to the user store: pirewall-core
+# is the only reader and writer of that file (ADDENDUM_3.md C3), and this
+# process asks core to verify a credential rather than reading hashes
+# itself.
+ReadWritePaths=/run/pirewall-portal /var/log/pirewall-portal
+ReadOnlyPaths=/opt/pirewall/config
+InaccessiblePaths=/var/lib/pirewall
+
+# --- Resource limits (spec §27 "Resource exhaustion") -----------------------
+# The smallest of the three: it renders two small pages and proxies four RPC
+# calls. Anything approaching these numbers is a LAN client abusing it.
+MemoryMax=128M
+MemoryHigh=96M
+TasksMax=64
+CPUQuota=40%
+
+[Install]
+WantedBy=multi-user.target

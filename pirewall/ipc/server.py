@@ -10,18 +10,19 @@ systemd's `RuntimeDirectory=`. See `docs/PROGRESS.md`.
 """
 
 import contextlib
+import grp
 import logging
 import os
 import socket
 import threading
 from collections.abc import Generator
 from pathlib import Path
+from typing import Protocol
 
 from pydantic import ValidationError
 
 from pirewall.core.exceptions import RpcError
 from pirewall.ipc._framing import read_all
-from pirewall.ipc.dispatcher import CoreRpcDispatcher
 from pirewall.ipc.protocol import RpcRequest, RpcResponse
 
 _logger = logging.getLogger(__name__)
@@ -41,6 +42,18 @@ _SOCKET_MODE = 0o660
 # directory to reach the socket, so this needs its execute bits (a mode
 # derived from a 0o117 umask would be 0o660 — no traversal at all).
 _SOCKET_DIR_MODE = 0o750
+
+
+class RpcDispatcher(Protocol):
+    """What this transport needs of a dispatcher: turn one request into one response.
+
+    Structural rather than a base class so `CoreRpcDispatcher` and
+    `PortalRpcDispatcher` stay unrelated types with no shared handler
+    table to accidentally inherit from each other.
+    """
+
+    def handle(self, request: RpcRequest) -> RpcResponse:
+        ...
 
 
 @contextlib.contextmanager
@@ -66,7 +79,14 @@ def _umask_for(mode: int) -> Generator[None]:
 
 
 class UnixSocketRpcServer:
-    """Binds a Unix domain socket and serves `CoreRpcDispatcher` requests, one connection at a time.
+    """Binds a Unix domain socket and serves `RpcDispatcher` requests, one connection at a time.
+
+    Dispatcher-agnostic on purpose (ADDENDUM_3.md C1): pirewall-core runs
+    two of these — one carrying `CoreRpcDispatcher` on the socket
+    pirewall-api reaches, and one carrying `PortalRpcDispatcher` on a
+    separate socket, in a separate group, that the LAN-facing
+    pirewall-portal process reaches. The transport is identical; the
+    *surface* is not, and that difference is the security boundary.
 
     The socket is created mode `0o660` (owner+group read/write) by `start()`
     itself, so restricting it to the two service users does not depend on
@@ -76,9 +96,28 @@ class UnixSocketRpcServer:
     this class guarantees only that nothing outside that group can reach it.
     """
 
-    def __init__(self, socket_path: str, dispatcher: CoreRpcDispatcher) -> None:
+    def __init__(
+        self, socket_path: str, dispatcher: "RpcDispatcher", socket_group: str | None = None
+    ) -> None:
         self._socket_path = socket_path
         self._dispatcher = dispatcher
+        # When set, the bound socket is *verified* to be in this group.
+        # pirewall-core runs with `pirewall-ipc` as its primary group, so its
+        # own socket gets the right group for free; the portal socket must
+        # land in a *different* group (`pirewall-portal-ipc`) so that being
+        # able to reach one socket does not imply being able to reach the
+        # other (ADDENDUM_3.md C1).
+        #
+        # Verified rather than set, because this process cannot chown: its
+        # unit carries `SystemCallFilter=~@privileged`, which includes the
+        # chown family, and relaxing that to let the most privileged process
+        # on the box call chown would be a poor trade for one directory
+        # setting. Instead `deploy/systemd/pirewall-tmpfiles.conf` creates
+        # the socket directory **setgid** with the right group, so the socket
+        # inherits it on bind with no privileged call at all. This check is
+        # what turns a missing or misapplied tmpfiles entry into a loud
+        # startup failure rather than an unreachable socket.
+        self._socket_group = socket_group
         self._server_socket: socket.socket | None = None
 
     def start(self) -> None:
@@ -112,6 +151,15 @@ class UnixSocketRpcServer:
             sock.listen(_LISTEN_BACKLOG)
         except OSError as exc:
             raise RpcError(f"failed to bind RPC socket at {self._socket_path}: {exc}") from exc
+
+        if self._socket_group is not None:
+            try:
+                _verify_socket_group(path, self._socket_group)
+            except RpcError:
+                sock.close()
+                path.unlink(missing_ok=True)
+                raise
+
         self._server_socket = sock
 
     def stop(self) -> None:
@@ -175,3 +223,38 @@ class UnixSocketRpcServer:
             response = self._dispatcher.handle(request)
         connection.sendall(response.model_dump_json().encode("utf-8"))
         connection.shutdown(socket.SHUT_WR)
+
+
+def _verify_socket_group(path: Path, expected_group: str) -> None:
+    """Confirm the bound socket landed in `expected_group`, or raise `RpcError`.
+
+    The group is the entire access-control mechanism for this socket, so a
+    mismatch must stop startup rather than leave a socket that either the
+    wrong processes can reach or the right one cannot.
+    """
+    try:
+        expected_gid = grp.getgrnam(expected_group).gr_gid
+    except KeyError as exc:
+        raise RpcError(
+            f"RPC socket group {expected_group!r} does not exist on this system "
+            f"(create it, or install deploy/systemd/pirewall-tmpfiles.conf): {exc}"
+        ) from exc
+
+    actual_gid = path.stat().st_gid
+    if actual_gid == expected_gid:
+        return
+
+    actual_name = _group_name(actual_gid)
+    raise RpcError(
+        f"RPC socket {path} is in group {actual_name} but must be in {expected_group!r}. "
+        f"Its directory {path.parent} needs to be setgid ({expected_group}); install "
+        f"deploy/systemd/pirewall-tmpfiles.conf and run "
+        f"`systemd-tmpfiles --create` before starting pirewall-core."
+    )
+
+
+def _group_name(gid: int) -> str:
+    try:
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return str(gid)

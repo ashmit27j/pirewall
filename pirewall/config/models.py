@@ -259,9 +259,16 @@ class AuthenticationConfig(PirewallModel):
 
 
 class AdminConfig(PirewallModel):
-    """The Admin PC that management access is restricted to (spec §29)."""
+    """The Admin PC's address, and whether the Pi's own console may reach the panel."""
 
     admin_pc_ip: IPv4Address
+
+    # ADDENDUM_3.md C6. Loopback only — never a routable address. An
+    # operator at the Pi's desktop can open the control panel at
+    # https://127.0.0.1:<api.port> without the panel becoming reachable
+    # from the LAN, the WAN, or anything that can occupy the admin segment.
+    # Defaults off: a deployment gets this only by asking for it.
+    allow_local_console: bool = False
 
 
 class LoggingConfig(PirewallModel):
@@ -282,6 +289,66 @@ class IntegrationConfig(PirewallModel):
     netdata_enabled: bool = False
     netdata_host: str | None = None
     netdata_port: int | None = Field(default=None, gt=0, le=65535)
+
+
+class PortalConfig(PirewallModel):
+    """LAN captive portal (ADDENDUM_3.md C1-C5).
+
+    Disabled by default. Turning it on gates *forwarding* for the protected
+    network behind a login; it never gates association, DHCP, DNS, or
+    reaching the portal itself, so any device can always join the AP and be
+    shown the login page.
+    """
+
+    enabled: bool = False
+
+    # Shown on the login page. Defaults to the AP's SSID in practice;
+    # purely cosmetic, so a wrong value misleads nobody about access.
+    network_name: str = Field(default="pirewall-lan", min_length=1, max_length=64)
+
+    # Bound to the Pi's LAN address on an unprivileged port. Port 80 is
+    # redirected here by `pirewall_portal`'s nat chain, so the portal
+    # process needs no CAP_NET_BIND_SERVICE at all.
+    listen_host: IPv4Address = IPv4Address("192.168.100.1")
+    listen_port: int = Field(default=8080, gt=1023, le=65535)
+
+    # How long a login lasts. Handed to the kernel as the nft set element's
+    # own timeout, so expiry costs nothing at runtime, and shown to the
+    # client as the keepalive countdown.
+    session_timeout_seconds: int = Field(default=1800, gt=0)
+    keepalive_interval_seconds: int = Field(default=20, gt=0)
+
+    # Written and read only by pirewall-core (single writer, ADDENDUM_3.md C3).
+    user_store_path: str = Field(default="/var/lib/pirewall/portal_users.json", min_length=1)
+
+    # Its own log directory, separate from `logging.log_dir`. pirewall-core
+    # and pirewall-api share `/var/log/pirewall` through the `pirewall-ipc`
+    # group; pirewall-portal is deliberately not in that group, so it cannot
+    # write there and must not be asked to (ADDENDUM_3.md C1).
+    log_dir: str = Field(default="/var/log/pirewall-portal", min_length=1)
+
+    # A second RPC socket, distinct from `api.rpc_socket_path`, serving a
+    # dispatcher that exposes only the portal operations. The LAN-facing
+    # process must not be able to reach kill-switch or rule mutation.
+    #
+    # Its own *directory*, not a second file in `/run/pirewall`: that
+    # directory is mode 0750 group `pirewall-ipc`, so a process outside that
+    # group cannot traverse into it whatever the socket's own permissions
+    # say. Putting the portal socket there would have forced either
+    # pirewall-portal into `pirewall-ipc` (handing it the privileged socket,
+    # defeating the split) or the directory to 0751 (world-traversable).
+    rpc_socket_path: str = Field(default="/run/pirewall-portal/portal.sock", min_length=1)
+    rpc_socket_group: str = Field(default="pirewall-portal-ipc", min_length=1)
+
+    # Online password guessing against the portal is cheap for anyone who
+    # can associate with the AP; scrypt alone only slows it down.
+    max_failed_logins_per_ip: int = Field(default=5, gt=0)
+    failed_login_window_seconds: int = Field(default=300, gt=0)
+    max_sessions: int = Field(default=512, gt=0)
+
+    # Shown on the login page so users know who to contact when a block
+    # notice appears (ADDENDUM_3.md C4).
+    contact_message: str = Field(default="Please contact your network administrator.", min_length=1)
 
 
 class SecurityConfig(PirewallModel):
@@ -315,6 +382,7 @@ class PirewallConfig(PirewallModel):
     api: APIConfig
     authentication: AuthenticationConfig
     admin: AdminConfig
+    portal: PortalConfig = PortalConfig()
     logging: LoggingConfig
     integration: IntegrationConfig
     security: SecurityConfig

@@ -1,0 +1,88 @@
+#!/usr/sbin/nft -f
+# pirewall — captive portal gate (ADDENDUM_3.md C1, C2, C4)
+#
+# TEMPLATE — not applied automatically. Render it (see
+# ../network/README.md) and load the rendered copy by hand.
+#
+# A separate table from `pirewall_base` (static posture) and from the
+# `pirewall` table `NftablesBackend` manages at runtime (adaptive rules), so
+# that deleting or reloading any one of the three leaves the others
+# standing, and so a portal bug cannot corrupt the adaptive ruleset.
+#
+# ORDER OF EVALUATION at the `forward` hook — this is the whole design:
+#
+#   this file's `forward` chain     priority -10   (evaluated FIRST)
+#   pirewall's `adaptive` chain     priority 0
+#   pirewall_base's `forward` chain priority 10
+#
+# Portal gating is a *precondition*, not a threat response: an
+# unauthenticated client is rejected outright before anything else runs, and
+# an authenticated one falls through without a verdict so the adaptive chain
+# still gets its say. An authenticated device is not a trusted device.
+#
+# WHAT THIS DOES NOT GATE, deliberately: association, DHCP, DNS, and
+# reaching the portal itself all happen on the `input` hook and are
+# unaffected. Any device can always join the AP and be shown the login page.
+
+table inet pirewall_portal {
+	# Authorized clients, added by pirewall-core when a portal login
+	# succeeds. Each element carries its own `timeout`, so the kernel
+	# expires the session with no timer, no polling, and no process
+	# waking up to clean it up — this is what makes portal auto-logout
+	# free at runtime.
+	#
+	# `flags timeout` must be declared on the set for per-element
+	# timeouts to be accepted at all.
+	set authed {
+		type ipv4_addr
+		flags timeout
+		comment "captive portal: authenticated LAN clients"
+	}
+
+	chain forward {
+		type filter hook forward priority -10; policy accept;
+
+		# Only the protected LAN is gated. Traffic that did not arrive
+		# on the LAN interface is none of this table's business.
+		iifname != "${LAN_INTERFACE}" return
+
+		# Established flows are not re-gated: a session that expires
+		# mid-download stops at the next new connection, not by having
+		# the current one severed. `authed` membership is re-checked for
+		# every *new* connection, which is where gating belongs.
+		ct state established,related return
+
+		ip saddr @authed return
+
+		# Rejected, not dropped. A reject makes the client's captive
+		# portal detection fail immediately and show the sign-in sheet;
+		# a silent drop leaves it retransmitting into a black hole,
+		# which is both a worse user experience and more work for the Pi.
+		reject with icmpx type admin-prohibited
+	}
+
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+
+		iifname != "${LAN_INTERFACE}" return
+
+		# Already signed in: nothing to intercept.
+		ip saddr @authed return
+
+		# Traffic aimed at the Pi itself (portal, DNS, DHCP) must reach
+		# it unmolested, or an unauthenticated client could never load
+		# the page it is being redirected to.
+		ip daddr ${PIREWALL_LAN_IP} return
+
+		# Everything else on port 80 lands on the portal, whatever URL
+		# was asked for. The portal answers every path with a redirect
+		# to /portal for exactly this reason.
+		#
+		# Port 443 is deliberately NOT redirected: intercepting TLS
+		# would present a certificate for the wrong name and produce a
+		# security warning instead of a sign-in page. Unauthenticated
+		# HTTPS is rejected by the forward chain above, which is what
+		# makes OS captive-portal detection fire.
+		tcp dport 80 redirect to :${PORTAL_PORT}
+	}
+}

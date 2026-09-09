@@ -31,6 +31,16 @@ fingerprinting for known attack tooling (B5), and the batched-anomaly-
 scoring follow-up pass (a dedicated `pirewall-anomaly-inference` thread and
 its own bounded queue).
 
+**`docs/ADDENDUM_3.md` is a third-wave set of additions on top of all
+three — read it too, every session.** Where it conflicts with any earlier
+document, `ADDENDUM_3.md` wins (it is the newest and most specific). It
+covers: the LAN captive portal as a third process behind a second,
+restricted RPC socket (C1), portal sessions as kernel-expiring nftables set
+elements rather than rules (C2), the LAN user store and its single writer
+(C3), the channel that tells a blocked client why (C4), the portal's
+plaintext-HTTP limitation (C5), and loopback-only local console access to
+the control panel (C6).
+
 Current status of every phase is tracked in `docs/PROGRESS.md`.
 
 ## Session start checklist
@@ -81,6 +91,20 @@ At the start of every session, before writing code:
   import-graph level — if you find yourself importing `firewall.backend` or
   `capture` into anything under `pirewall/api/` or `pirewall/web/`, stop and
   re-read A4.
+- **The same rule applies to `pirewall/portal/`, for a stronger reason
+  (C1)** — that process is the one untrusted LAN clients talk to. Core-side
+  portal logic that needs `FirewallManager` lives in
+  `pirewall/ipc/portal_service.py`, outside that tree, so the rule can hold.
+- **`pirewall-portal` reaches only the portal RPC socket, never
+  `core.sock` (C1).** It is a member of `pirewall-portal-ipc` and never of
+  `pirewall-ipc`. `PortalRpcDispatcher` is a separate class with its own
+  handler table — never a filtered view over `CoreRpcDispatcher`, which
+  would be one missing branch away from handing the kill switch to the
+  most exposed process on the box.
+- **A portal session is an nft set element, not a `FirewallRule` (C2).** It
+  never enters the `RuleStatus` lifecycle and never consumes the A3 rate
+  cap — but it still goes through `FirewallManager`, which remains the only
+  holder of a backend reference.
 - **Default enforcement mode is `SHADOW` (A1) and default failure mode is
   `fail_open` (A6).** Don't quietly change these defaults in config
   templates — they're deliberate safety choices for a first deployment.

@@ -240,6 +240,16 @@ def test_registered_route_surface_matches_spec() -> None:
         ("/api/v1/allowlist", "POST"),
         ("/api/v1/allowlist/{entry_id}", "DELETE"),
         ("/api/v1/firewall/kill-switch", "POST"),
+        # Captive-portal administration (ADDENDUM_3.md C1, C3). These are the
+        # *admin* side, served to the Admin PC over the session-authenticated
+        # surface — not the LAN-facing portal, which is a different process on
+        # a different socket and shares no route with this app.
+        ("/api/v1/portal/users", "GET"),
+        ("/api/v1/portal/users", "POST"),
+        ("/api/v1/portal/users/{username}/password", "POST"),
+        ("/api/v1/portal/users/{username}", "DELETE"),
+        ("/api/v1/portal/sessions", "GET"),
+        ("/api/v1/portal/sessions/{client_ip}/logout", "POST"),
         ("/control-panel/login", "GET"),
         ("/control-panel", "GET"),
     }

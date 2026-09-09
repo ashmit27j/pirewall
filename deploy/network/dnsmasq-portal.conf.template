@@ -1,0 +1,29 @@
+# pirewall — captive portal discovery for LAN clients (ADDENDUM_3.md C1)
+#
+# TEMPLATE — render it, review it, then install the rendered copy to:
+#   /etc/NetworkManager/dnsmasq-shared.d/pirewall-portal.conf
+# and reload:
+#   sudo systemctl reload NetworkManager
+#
+# NetworkManager's `shared` mode already starts dnsmasq with
+# `--conf-dir=/etc/NetworkManager/dnsmasq-shared.d`, so a file dropped there
+# is picked up with no change to NetworkManager itself and no second DHCP
+# server to run. Confirm that on your box before relying on it:
+#   ps aux | grep dnsmasq
+#
+# RFC 8910 (DHCP option 114, "Captive-Portal Identification"). A client that
+# understands it — iOS 14+, Android 11+, Windows 11, NetworkManager — reads
+# the portal URL straight from its lease and opens the sign-in page itself,
+# with no traffic interception at all. Older clients fall back to the
+# port-80 redirect in ../firewall/portal.nft, which is why both exist.
+#
+# Note the URL names the Pi's LAN address on port 80, not the portal's
+# actual listen port: 80 is what the nat chain redirects.
+dhcp-option=114,http://${PIREWALL_LAN_IP}/portal
+
+# DNS is deliberately NOT hijacked. Redirecting every name to the portal
+# would break DNS-over-TLS/HTTPS clients, poison caches with answers that
+# become wrong the moment a client signs in, and force per-client DNS views
+# dnsmasq cannot express cleanly. Unauthenticated clients resolve normally
+# and are stopped at the forward hook instead, which is both simpler and
+# what modern captive-portal detection expects.

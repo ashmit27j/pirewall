@@ -13,6 +13,12 @@ Documentation=file:///opt/pirewall/docs/DEPLOYMENT.md
 After=network-online.target
 Wants=network-online.target
 
+# StartLimit* live in [Unit], not [Service]: systemd reads them only here and
+# silently ignores them under [Service], so a misplaced pair means the
+# crash-loop bound ADDENDUM.md A6 asks for is never actually armed.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
 [Service]
 Type=notify
 # ADDENDUM.md A6: pirewall-core sends sd_notify watchdog heartbeats; a
@@ -46,8 +52,6 @@ WorkingDirectory=/opt/pirewall
 # separate process, so it stays up to report "core is down").
 Restart=on-failure
 RestartSec=5s
-StartLimitIntervalSec=300
-StartLimitBurst=3
 
 # --- Least privilege (spec §27, §45) ---------------------------------------
 # Dedicated, non-login service user. Its *primary* group is the shared
@@ -62,6 +66,11 @@ StartLimitBurst=3
 # asks to be documented.
 User=pirewall-core
 Group=pirewall-ipc
+# ADDENDUM_3.md C1: core serves *both* RPC sockets, so it must be able to
+# hand the portal socket (and its directory) to the portal's own group.
+# Declared explicitly rather than relying on the passwd database, so the
+# unit states its own requirements.
+SupplementaryGroups=pirewall-portal-ipc
 UMask=0117
 
 # Exactly what packet capture (AF_PACKET, spec §6) and nftables rule
@@ -98,12 +107,15 @@ SystemCallErrorNumber=EPERM
 # owned pirewall-core:pirewall-ipc mode 0750 (group can traverse + list;
 # only pirewall-core, the owner, can create files inside without the group
 # write bit — the socket file itself gets 0660 per UMask above once bound).
-RuntimeDirectory=pirewall
-RuntimeDirectoryMode=0750
+# Deliberately NOT RuntimeDirectory=/StateDirectory=: those take this
+# service's primary Group= for every entry, and pirewall's two RPC sockets
+# must land in two *different* groups (ADDENDUM_3.md C1). The directories,
+# their modes, and the setgid bit that gives the portal socket its group are
+# declared in deploy/systemd/pirewall-tmpfiles.conf instead.
 
 # Only these paths are writable; everything else is read-only per
 # ProtectSystem=strict. Config and ML model artifacts are read-only inputs.
-ReadWritePaths=/var/log/pirewall /run/pirewall
+ReadWritePaths=/var/log/pirewall /run/pirewall /run/pirewall-portal /var/lib/pirewall
 ReadOnlyPaths=/opt/pirewall/config /opt/pirewall/pirewall/ml/artifacts
 
 # --- Resource limits (spec §27 "Resource exhaustion") -----------------------

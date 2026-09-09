@@ -177,6 +177,13 @@ token_expiry_seconds = 3600
 # The single PC allowed to reach administrative endpoints (spec §29).
 admin_pc_ip = "192.0.2.10"   # CHANGE_ME — placeholder only
 
+# Also permit loopback (127.0.0.1 / ::1) to reach the control panel, so an
+# operator sitting at the Pi's own desktop can open it without widening
+# access to a routable address (ADDENDUM_3.md C6). Loopback is unreachable
+# from any network, so this grants nothing to the LAN or the WAN. Off by
+# default: a deployment gets it only by asking.
+allow_local_console = false
+
 [logging]
 level = "INFO"
 log_dir = "/var/log/pirewall"
@@ -196,6 +203,57 @@ wazuh_port = 514
 netdata_enabled = false
 netdata_host = "CHANGE_ME"      # CHANGE_ME — Admin PC hostname/IP running Netdata
 netdata_port = 8125              # Netdata's StatsD listener default (not the 19999 dashboard port)
+
+[portal]
+# LAN captive portal (ADDENDUM_3.md C1-C5). When enabled, clients on the
+# protected network must sign in before their traffic is forwarded. It never
+# gates association, DHCP, DNS, or reaching the portal itself — any device
+# can always join the AP and be shown the login page.
+#
+# Requires deploy/firewall/portal.nft to be loaded and pirewall-portal.service
+# to be running. Enabling this without both means LAN clients are gated with
+# no page to sign in on. See docs/SETUP.md.
+enabled = false
+
+# Shown on the sign-in page. Cosmetic; set it to your SSID.
+network_name = "pirewall-lan"
+
+# The Pi's LAN address and an *unprivileged* port. Port 80 reaches the portal
+# through the nat redirect in portal.nft, so the process needs no
+# CAP_NET_BIND_SERVICE. Must be inside network.protected_network.
+listen_host = "192.168.100.1"   # CHANGE_ME — must match network.pirewall_lan_ip
+listen_port = 8080
+
+# How long a sign-in lasts. Handed to the kernel as the nftables set
+# element's own timeout, so expiry costs nothing at runtime, and shown to the
+# client as the countdown on the keepalive page.
+session_timeout_seconds = 1800
+keepalive_interval_seconds = 20
+
+# LAN accounts, written and read by pirewall-core only (single writer).
+# Manage with: python -m scripts.deployment.portal_users
+user_store_path = "/var/lib/pirewall/portal_users.json"
+
+# Its own log directory. pirewall-core and pirewall-api share
+# logging.log_dir through the pirewall-ipc group; pirewall-portal is
+# deliberately not in that group and cannot write there.
+log_dir = "/var/log/pirewall-portal"
+
+# A second RPC socket in its own directory and its own group. pirewall-portal
+# is a member of this group only — never pirewall-ipc — so a compromise of
+# the LAN-facing process cannot reach the kill switch or mutate a rule.
+rpc_socket_path = "/run/pirewall-portal/portal.sock"
+rpc_socket_group = "pirewall-portal-ipc"
+
+# Online password guessing against a login anything on the AP can reach is
+# cheap; scrypt alone only slows it down.
+max_failed_logins_per_ip = 5
+failed_login_window_seconds = 300
+max_sessions = 512
+
+# Shown on the sign-in page and appended to the block notice a device sees
+# when adaptive enforcement has suspended it (ADDENDUM_3.md C4).
+contact_message = "Please contact your network administrator."
 
 [security]
 min_tls_version = "TLSv1.3"

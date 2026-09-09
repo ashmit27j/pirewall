@@ -9,6 +9,7 @@ directly. `UnixSocketRpcClient` is the real, Linux-only transport; see
 
 import socket
 from abc import ABC, abstractmethod
+from ipaddress import IPv4Address
 from typing import Any, cast
 
 from pydantic import ValidationError
@@ -21,6 +22,7 @@ from pirewall.core.models.detection_record import DetectionRecord
 from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.flow import Flow
 from pirewall.core.models.model_metadata import ModelMetadata
+from pirewall.core.models.portal import PortalClientState, PortalSession, PortalUser
 from pirewall.core.models.rule import FirewallRule
 from pirewall.core.models.status import StatusResult
 from pirewall.core.models.threat import ThreatAssessment
@@ -93,6 +95,25 @@ class BaseRpcClient(ABC):
         data = self._require_data(RpcOperation.ADD_ALLOWLIST_ENTRY, entry.model_dump(mode="json"))
         return AllowlistEntry.model_validate(data)
 
+    def add_allowlist_entry_with_portal_user(
+        self, entry: AllowlistEntry, portal_username: str | None
+    ) -> dict[str, Any]:
+        """Add an entry, optionally provisioning a portal account alongside it.
+
+        Returns the raw response object rather than an `AllowlistEntry`
+        because it may carry `portal_username`/`portal_password` — the one
+        and only appearance of a generated portal password (ADDENDUM_3.md
+        C3). Parsing it into `AllowlistEntry` here would discard exactly the
+        field the caller needs.
+        """
+        params = entry.model_dump(mode="json")
+        if portal_username:
+            params["portal_username"] = portal_username
+        data = self._require_data(RpcOperation.ADD_ALLOWLIST_ENTRY, params)
+        if not isinstance(data, dict):
+            raise RpcError("add_allowlist_entry did not return an object")
+        return cast("dict[str, Any]", data)
+
     def remove_allowlist_entry(self, entry_id: str) -> bool:
         data = self._require_data(RpcOperation.REMOVE_ALLOWLIST_ENTRY, {"entry_id": entry_id})
         return bool(data)
@@ -103,6 +124,73 @@ class BaseRpcClient(ABC):
     def record_event(self, event: SecurityEvent) -> SecurityEvent:
         data = self._require_data(RpcOperation.RECORD_EVENT, event.model_dump(mode="json"))
         return SecurityEvent.model_validate(data)
+
+    # --- captive portal, client-facing (ADDENDUM_3.md C1) ------------------
+    # Available on both sockets' clients as typed methods, but only the
+    # portal socket's dispatcher implements these four; calling them against
+    # pirewall-core's own socket returns "unknown operation".
+
+    def portal_status(self) -> dict[str, Any]:
+        """Login-page prerequisites: demo-account warning, contact text, timings."""
+        data = self._require_data(RpcOperation.PORTAL_STATUS)
+        if not isinstance(data, dict):
+            raise RpcError("portal_status did not return an object")
+        return cast("dict[str, Any]", data)
+
+    def portal_login(self, username: str, password: str, client_ip: IPv4Address) -> PortalSession:
+        data = self._require_data(
+            RpcOperation.PORTAL_LOGIN,
+            {"username": username, "password": password, "client_ip": str(client_ip)},
+        )
+        return PortalSession.model_validate(data)
+
+    def portal_keepalive(self, token: str | None, client_ip: IPv4Address) -> PortalClientState:
+        data = self._require_data(
+            RpcOperation.PORTAL_KEEPALIVE, {"token": token or "", "client_ip": str(client_ip)}
+        )
+        return PortalClientState.model_validate(data)
+
+    def portal_logout(self, token: str, client_ip: IPv4Address) -> bool:
+        data = self._require_data(
+            RpcOperation.PORTAL_LOGOUT, {"token": token, "client_ip": str(client_ip)}
+        )
+        return bool(data)
+
+    # --- captive portal, admin-facing --------------------------------------
+
+    def portal_list_users(self) -> list[PortalUser]:
+        items = self._require_list(RpcOperation.PORTAL_LIST_USERS)
+        return [PortalUser.model_validate(item) for item in items]
+
+    def portal_add_user(
+        self, username: str, created_by: str, password: str | None = None, note: str = ""
+    ) -> tuple[PortalUser, str | None]:
+        """Create an account. Returns the user and the generated password, if one was generated."""
+        data = self._require_data(
+            RpcOperation.PORTAL_ADD_USER,
+            {"username": username, "created_by": created_by, "password": password or "", "note": note},
+        )
+        return _unpack_user_result(data)
+
+    def portal_set_password(
+        self, username: str, password: str | None = None
+    ) -> tuple[PortalUser, str | None]:
+        data = self._require_data(
+            RpcOperation.PORTAL_SET_PASSWORD, {"username": username, "password": password or ""}
+        )
+        return _unpack_user_result(data)
+
+    def portal_remove_user(self, username: str) -> bool:
+        return bool(self._require_data(RpcOperation.PORTAL_REMOVE_USER, {"username": username}))
+
+    def portal_list_sessions(self) -> list[PortalSession]:
+        items = self._require_list(RpcOperation.PORTAL_LIST_SESSIONS)
+        return [PortalSession.model_validate(item) for item in items]
+
+    def portal_force_logout(self, client_ip: IPv4Address) -> bool:
+        return bool(
+            self._require_data(RpcOperation.PORTAL_FORCE_LOGOUT, {"client_ip": str(client_ip)})
+        )
 
     def _require_data(self, operation: RpcOperation, params: dict[str, Any] | None = None) -> Any:
         response = self._call(operation, params)
@@ -123,6 +211,15 @@ class BaseRpcClient(ABC):
         if not isinstance(data, list):
             raise RpcError(f"RPC call {operation.value} did not return a list")
         return cast("list[Any]", data)
+
+
+def _unpack_user_result(data: Any) -> tuple[PortalUser, str | None]:
+    """Split the `{user, generated_password}` envelope the user-mutating operations return."""
+    if not isinstance(data, dict):
+        raise RpcError("portal user operation did not return an object")
+    payload = cast("dict[str, Any]", data)
+    generated = payload.get("generated_password")
+    return PortalUser.model_validate(payload.get("user")), generated if isinstance(generated, str) else None
 
 
 class UnixSocketRpcClient(BaseRpcClient):

@@ -49,6 +49,11 @@ class Response:
     def cookies(self) -> dict[str, str]:
         return dict(self._raw.cookies)
 
+    @property
+    def headers(self) -> dict[str, str]:
+        """Response headers — needed to assert on redirect `Location` values."""
+        return {str(key): str(value) for key, value in self._raw.headers.items()}
+
 
 @dataclass
 class TestHarness:

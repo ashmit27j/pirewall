@@ -30,6 +30,7 @@ from pirewall.core.models.capture_stats import CaptureStatistics
 from pirewall.core.models.detection_record import DetectionRecord
 from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.model_metadata import ModelMetadata
+from pirewall.core.models.portal import PortalSession, PortalUser
 from pirewall.core.models.rule import FirewallRule
 from pirewall.core.models.status import StatusResult
 from pirewall.core.models.threat import ThreatAssessment
@@ -48,6 +49,7 @@ th { background: #eee; }
 .kill-switch { background: #b02a37; color: #fff; border: none; padding: 0.6rem 1.2rem; font-size: 1rem;
   border-radius: 0.3rem; cursor: pointer; }
 .error { color: #b02a37; }
+.hint { font-size: 0.8rem; color: #5c6b7a; margin: 0.4rem 0 0; }
 form.inline { display: inline; }
 .page-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
 .help-btn { background: #0d6efd; color: #fff; border: none; border-radius: 0.3rem; padding: 0.5rem 1rem;
@@ -89,7 +91,43 @@ function addAllowlistEntry(event) {
   const body = {target: form.target.value, reason: form.reason.value};
   if (form.port.value) body.port = parseInt(form.port.value, 10);
   if (form.protocol.value) body.protocol = form.protocol.value;
-  pirewallCall("POST", "/api/v1/allowlist", body);
+  if (form.portal_username.value) body.portal_username = form.portal_username.value;
+  // A generated portal password comes back exactly once and is never
+  // stored in the clear, so it has to be shown before the page reloads.
+  fetch("/api/v1/allowlist", {
+    method: "POST", credentials: "same-origin",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
+  }).then(function (r) { return r.json().then(function (d) { return {ok: r.ok, data: d}; }); })
+    .then(function (res) {
+      if (!res.ok) { alert("Failed: " + (res.data.detail || "unknown error")); return; }
+      if (res.data.portal_password) {
+        alert("Portal account created.\n\nUsername: " + res.data.portal_username +
+              "\nPassword: " + res.data.portal_password +
+              "\n\nThis password is shown once and is not stored in readable form. " +
+              "Write it down now.");
+      }
+      location.reload();
+    }).catch(function (e) { alert("Request failed: " + e); });
+}
+function addPortalUser(event) {
+  event.preventDefault();
+  const form = event.target;
+  const body = {username: form.username.value, note: form.note.value};
+  if (form.password.value) body.password = form.password.value;
+  fetch("/api/v1/portal/users", {
+    method: "POST", credentials: "same-origin",
+    headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
+  }).then(function (r) { return r.json().then(function (d) { return {ok: r.ok, data: d}; }); })
+    .then(function (res) {
+      if (!res.ok) { alert("Failed: " + (res.data.detail || "unknown error")); return; }
+      if (res.data.generated_password) {
+        alert("Portal account created.\n\nUsername: " + res.data.user.username +
+              "\nPassword: " + res.data.generated_password +
+              "\n\nThis password is shown once and is not stored in readable form. " +
+              "Write it down now.");
+      }
+      location.reload();
+    }).catch(function (e) { alert("Request failed: " + e); });
 }
 function togglePanel(id) {
   const body = document.getElementById("panel-body-" + id);
@@ -411,8 +449,71 @@ def _render_allowlist_section(allowlist: list[AllowlistEntry]) -> str:
       <input name="port" placeholder="port (optional)">
       <input name="protocol" placeholder="tcp/udp/icmp (optional)">
       <input name="reason" placeholder="reason" required>
+      <input name="portal_username" placeholder="portal username (optional)">
       <button type="submit">Add</button>
     </form>
+    <p class="hint">Filling in a portal username also creates a captive-portal
+    account for this entry and shows its generated password once. Leave it empty
+    for devices that cannot sign in \u2014 a gateway, a printer, a server.</p>
+    """
+
+
+def _portal_user_row(user: PortalUser) -> str:
+    demo = '<span class="badge badge-pending">DEMO</span>' if user.is_demo else "&mdash;"
+    username = quote(user.username, safe="")
+    return (
+        f"<tr><td>{_e(user.username)}</td><td>{_e(user.created_at)}</td>"
+        f"<td>{_e(user.created_by)}</td><td>{demo}</td><td>{_e(user.note)}</td>"
+        f"<td>{_action_button('Reset password', 'POST', f'/api/v1/portal/users/{username}/password')} "
+        f"{_action_button('Delete', 'DELETE', f'/api/v1/portal/users/{username}')}</td></tr>"
+    )
+
+
+def _render_portal_users_section(users: list[PortalUser]) -> str:
+    rows = "".join(_portal_user_row(user) for user in users)
+    warning = ""
+    if any(user.is_demo for user in users):
+        warning = (
+            '<p class="hint error"><strong>Demo accounts are active.</strong> '
+            "Their passwords are published in docs/SETUP.md. Delete them before this network "
+            "carries real traffic.</p>"
+        )
+    return f"""
+    {warning}
+    <table>
+      <tr><th>Username</th><th>Created</th><th>Created by</th><th>Demo</th><th>Note</th><th></th></tr>
+      {rows or '<tr><td colspan="6">No portal accounts yet.</td></tr>'}
+    </table>
+    <form onsubmit="addPortalUser(event)">
+      <input name="username" placeholder="username" required>
+      <input name="password" type="password" placeholder="password (blank = generate one)">
+      <input name="note" placeholder="note (optional)">
+      <button type="submit">Create account</button>
+    </form>
+    """
+
+
+def _portal_session_row(session: PortalSession) -> str:
+    disconnect = _action_button(
+        "Disconnect", "POST", f"/api/v1/portal/sessions/{quote(str(session.client_ip), safe='')}/logout"
+    )
+    return (
+        f"<tr><td>{_e(session.username)}</td><td>{_e(session.client_ip)}</td>"
+        f"<td>{_e(session.issued_at)}</td><td>{_e(session.expires_at)}</td>"
+        f"<td>{disconnect}</td></tr>"
+    )
+
+
+def _render_portal_sessions_section(sessions: list[PortalSession]) -> str:
+    rows = "".join(_portal_session_row(session) for session in sessions)
+    return f"""
+    <table>
+      <tr><th>User</th><th>Device</th><th>Signed in</th><th>Expires</th><th></th></tr>
+      {rows or '<tr><td colspan="5">No clients are signed in.</td></tr>'}
+    </table>
+    <p class="hint">Sessions expire in the kernel: each signed-in device is an
+    nftables set element carrying its own timeout, so sign-out needs no timer here.
+    Disconnecting removes that element immediately.</p>
     """
 
 
@@ -545,6 +646,31 @@ def _help_dialog() -> str:
     """
 
 
+def _portal_panels(
+    users: list[PortalUser] | None, sessions: list[PortalSession] | None
+) -> str:
+    """The two captive-portal panels, or nothing when the portal is disabled.
+
+    `None` (rather than an empty list) means pirewall-core reported the
+    portal as disabled, which is different from "enabled with nobody signed
+    in" — so the panels are omitted entirely rather than shown empty and
+    implying a portal that is not there.
+    """
+    if users is None and sessions is None:
+        return ""
+    return _panel(
+        "portal-sessions",
+        "Portal — signed-in devices (ADDENDUM_3.md C1)",
+        _render_portal_sessions_section(sessions or []),
+        loggy=False,
+    ) + _panel(
+        "portal-users",
+        "Portal — LAN user accounts (ADDENDUM_3.md C3)",
+        _render_portal_users_section(users or []),
+        loggy=False,
+    )
+
+
 def render_dashboard(
     status: StatusResult,
     rules: list[FirewallRule],
@@ -554,6 +680,8 @@ def render_dashboard(
     allowlist: list[AllowlistEntry],
     capture_stats: CaptureStatistics | None,
     detections: list[DetectionRecord],
+    portal_users: list[PortalUser] | None = None,
+    portal_sessions: list[PortalSession] | None = None,
 ) -> str:
     """Render the full control panel (spec §30's sections, plus the addendum additions)."""
     body = (
@@ -577,6 +705,7 @@ def render_dashboard(
             _render_allowlist_section(allowlist),
             loggy=False,
         )
+        + _portal_panels(portal_users, portal_sessions)
         + _panel("events", "Events", _render_events_section(events), loggy=True)
         + _panel("ml", "ML", _render_ml_section(models), loggy=False)
         + _help_dialog()

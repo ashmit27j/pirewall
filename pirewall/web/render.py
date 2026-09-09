@@ -101,9 +101,9 @@ function addAllowlistEntry(event) {
     .then(function (res) {
       if (!res.ok) { alert("Failed: " + (res.data.detail || "unknown error")); return; }
       if (res.data.portal_password) {
-        alert("Portal account created.\n\nUsername: " + res.data.portal_username +
-              "\nPassword: " + res.data.portal_password +
-              "\n\nThis password is shown once and is not stored in readable form. " +
+        alert("Portal account created.\\n\\nUsername: " + res.data.portal_username +
+              "\\nPassword: " + res.data.portal_password +
+              "\\n\\nThis password is shown once and is not stored in readable form. " +
               "Write it down now.");
       }
       location.reload();
@@ -121,9 +121,9 @@ function addPortalUser(event) {
     .then(function (res) {
       if (!res.ok) { alert("Failed: " + (res.data.detail || "unknown error")); return; }
       if (res.data.generated_password) {
-        alert("Portal account created.\n\nUsername: " + res.data.user.username +
-              "\nPassword: " + res.data.generated_password +
-              "\n\nThis password is shown once and is not stored in readable form. " +
+        alert("Portal account created.\\n\\nUsername: " + res.data.user.username +
+              "\\nPassword: " + res.data.generated_password +
+              "\\n\\nThis password is shown once and is not stored in readable form. " +
               "Write it down now.");
       }
       location.reload();

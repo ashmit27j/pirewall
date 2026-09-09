@@ -18,10 +18,16 @@ _TEMPLATE_PATH = (
 
 
 def _chain_body(text: str, chain_name: str) -> str:
-    """Extract one `chain <name> { ... }` block's body (brace-depth aware, nested braces included)."""
-    match = re.search(rf"chain {re.escape(chain_name)} \{{", text)
-    assert match is not None, f"chain {chain_name!r} not found in template"
-    start = match.end()
+    """The body of the *last* `chain <name> { ... }` block — the one carrying rules.
+
+    The template declares each chain twice: once bare, so the `flush chain`
+    lines that make a reload idempotent cannot fail on a first load, and then
+    again with the actual rules. Matching the first declaration would read an
+    empty chain and quietly assert nothing.
+    """
+    matches = list(re.finditer(rf"chain {re.escape(chain_name)} \{{", text))
+    assert matches, f"chain {chain_name!r} not found in template"
+    start = matches[-1].end()
     depth = 1
     index = start
     while depth > 0:

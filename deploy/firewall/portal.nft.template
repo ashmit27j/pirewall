@@ -24,24 +24,37 @@
 # reaching the portal itself all happen on the `input` hook and are
 # unaffected. Any device can always join the AP and be shown the login page.
 
+# Reloading must be idempotent. `nft -f` *appends* rules to an existing
+# chain rather than replacing them, so without the flushes below every
+# re-run (every `pirewall-start`) stacks another copy of every rule — the
+# chain grows without bound and each packet is matched against the same
+# rules repeatedly.
+#
+# Flushing the chains rather than deleting the table is deliberate: deleting
+# it would take the `authed` set with it and sign every LAN client out on
+# every reload.
+
+# First ensure table, set and chains exist, so the flushes cannot fail on a
+# first load. Redeclaring them is a no-op when they are already there.
 table inet pirewall_portal {
-	# Authorized clients, added by pirewall-core when a portal login
-	# succeeds. Each element carries its own `timeout`, so the kernel
-	# expires the session with no timer, no polling, and no process
-	# waking up to clean it up — this is what makes portal auto-logout
-	# free at runtime.
-	#
-	# `flags timeout` must be declared on the set for per-element
-	# timeouts to be accepted at all.
 	set authed {
 		type ipv4_addr
 		flags timeout
 		comment "captive portal: authenticated LAN clients"
 	}
-
 	chain forward {
 		type filter hook forward priority -10; policy accept;
+	}
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+	}
+}
 
+flush chain inet pirewall_portal forward
+flush chain inet pirewall_portal prerouting
+
+table inet pirewall_portal {
+	chain forward {
 		# Only the protected LAN is gated. Traffic that did not arrive
 		# on the LAN interface is none of this table's business.
 		iifname != "${LAN_INTERFACE}" return
@@ -62,21 +75,30 @@ table inet pirewall_portal {
 	}
 
 	chain prerouting {
-		type nat hook prerouting priority dstnat; policy accept;
-
 		iifname != "${LAN_INTERFACE}" return
 
 		# Already signed in: nothing to intercept.
 		ip saddr @authed return
 
-		# Traffic aimed at the Pi itself (portal, DNS, DHCP) must reach
-		# it unmolested, or an unauthenticated client could never load
-		# the page it is being redirected to.
-		ip daddr ${PIREWALL_LAN_IP} return
+		# Let an unauthenticated client reach the Pi's own services, so
+		# it can resolve names, renew its lease, and actually load the
+		# page it is being sent to.
+		#
+		# Scoped to those specific ports rather than to the Pi's address
+		# as a whole. A blanket `ip daddr ${PIREWALL_LAN_IP} return`
+		# also exempts port 80 — and port 80 on the Pi is exactly what
+		# DHCP option 114 advertises (`http://${PIREWALL_LAN_IP}/portal`).
+		# Nothing listens on 80, so that URL would reach no DNAT, fall
+		# through to the base ruleset's `policy drop`, and hang: the
+		# primary discovery path for every modern client, dead.
+		ip daddr ${PIREWALL_LAN_IP} udp dport { 53, 67 } return
+		ip daddr ${PIREWALL_LAN_IP} tcp dport 53 return
+		ip daddr ${PIREWALL_LAN_IP} tcp dport ${PORTAL_PORT} return
 
 		# Everything else on port 80 lands on the portal, whatever URL
-		# was asked for. The portal answers every path with a redirect
-		# to /portal for exactly this reason.
+		# was asked for and whoever it was addressed to — including the
+		# Pi itself. The portal answers every path with a redirect to
+		# /portal for exactly this reason.
 		#
 		# Port 443 is deliberately NOT redirected: intercepting TLS
 		# would present a certificate for the wrong name and produce a

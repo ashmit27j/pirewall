@@ -118,6 +118,15 @@ Established flows `return` before the set is consulted, so a session
 expiring mid-download stops the *next* new connection rather than severing
 the current one.
 
+**A consequence worth stating plainly:** loading the gate onto a live
+network does not immediately cut off anyone already connected. Their
+existing conntrack entries match `established,related` and keep flowing
+until they age out; only *new* connections are gated. That is the right
+trade — severing in-flight transfers to enforce a policy that was not in
+place when they started would be worse — but it means "the table is loaded"
+and "everyone is signed out" are not the same statement, and a first
+deployment looks like nothing happened for a few minutes.
+
 **The set and the session registry must not diverge.** An address in
 `@authed` is forwarding; a session in the registry is what pirewall believes
 about it. `PortalService.reconcile()` revokes any grant with no live session,

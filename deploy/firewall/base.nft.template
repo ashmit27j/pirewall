@@ -25,6 +25,23 @@
 # traffic the adaptive chain doesn't terminally accept/drop falls through
 # to this file's broader allow/deny-by-default policy.
 
+# Reloading must be idempotent. `nft -f` *appends* to an existing chain
+# rather than replacing it, so without these flushes every re-run stacks
+# another copy of every rule: the chain grows without bound and each packet
+# is matched against the same rules repeatedly.
+#
+# Ensure the table and chains exist first, so the flushes cannot fail on a
+# first load; redeclaring them is a no-op when they are already there.
+table inet pirewall_base {
+	chain forward { type filter hook forward priority 10; policy drop; }
+	chain input { type filter hook input priority 0; policy drop; }
+	chain output { type filter hook output priority 0; policy accept; }
+}
+
+flush chain inet pirewall_base forward
+flush chain inet pirewall_base input
+flush chain inet pirewall_base output
+
 table inet pirewall_base {
 	chain forward {
 		type filter hook forward priority 10; policy drop;

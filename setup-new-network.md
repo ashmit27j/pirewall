@@ -24,11 +24,12 @@ Budget about an hour for a first run, most of it waiting on downloads.
 6. [Bring the stack up](#6-bring-the-stack-up)
 7. [Create LAN accounts](#7-create-lan-accounts)
 8. [Set up the Admin PC](#8-set-up-the-admin-pc)
-9. [Verify end to end](#9-verify-end-to-end)
-10. [Go live gradually](#10-go-live-gradually)
-11. [Moving an existing Pi to a different network](#11-moving-an-existing-pi-to-a-different-network)
-12. [Teardown and rollback](#12-teardown-and-rollback)
-13. [Quick reference](#quick-reference)
+9. [Dashboards and pages — what to open](#dashboards-and-pages--what-to-open-and-from-where)
+10. [Verify end to end](#9-verify-end-to-end)
+11. [Go live gradually](#10-go-live-gradually)
+12. [Moving an existing Pi to a different network](#11-moving-an-existing-pi-to-a-different-network)
+13. [Teardown and rollback](#12-teardown-and-rollback)
+14. [Quick reference](#quick-reference)
 
 ---
 
@@ -587,6 +588,56 @@ sudo systemctl restart pirewall-core
 
 ---
 
+## Dashboards and pages — what to open, and from where
+
+Five separate web surfaces, on three different machines. They are not
+interchangeable: each is reachable from one place, by one audience.
+
+| # | What | URL | Open it from | Credentials |
+|---|---|---|---|---|
+| 1 | **pirewall control panel** | `https://<pi-admin-ip>:8443/control-panel` | Admin PC only | admin username + password from `configure` |
+| 2 | **pirewall control panel** (same, from the Pi's own desktop) | `https://127.0.0.1:8443/control-panel` | The Pi, needs `admin.allow_local_console = true` | same |
+| 3 | **LAN sign-in portal** | `http://<pi-lan-ip>/portal` | Any device on the protected Wi-Fi | a portal account (`portal_users add`) |
+| 4 | **Wazuh dashboard** | `https://<admin-pc>` (Docker) or `https://<admin-pc>:443` | Admin PC | Wazuh's own admin user |
+| 5 | **Netdata dashboard** | `http://<admin-pc>:19999` | Admin PC | none by default |
+
+With the reference addressing:
+
+```
+Control panel (Admin PC)   https://192.168.101.1:8443/control-panel
+Control panel (on the Pi)  https://127.0.0.1:8443/control-panel
+LAN sign-in portal         http://192.168.100.1/portal
+Wazuh dashboard            https://192.168.101.2
+Netdata dashboard          http://192.168.101.2:19999
+```
+
+**Why each is where it is**
+
+* The **control panel** is HTTPS and refuses every source except
+  `admin.admin_pc_ip` — enforced twice, by the base nftables ruleset (which
+  only opens 8443 to that address) and by the API itself. Loopback is added
+  only when you opt in with `admin.allow_local_console`.
+* The **sign-in portal** is plain HTTP on the LAN side, because a
+  self-signed certificate breaks captive-portal detection and trains users
+  to click through warnings. It carries no admin function at all — it is a
+  different process, on a different socket, that cannot reach the firewall's
+  privileged operations. Clients normally never type the URL: their device
+  opens it by itself from the DHCP lease.
+* **Wazuh and Netdata** run on the Admin PC, not the Pi. The Pi pushes to
+  them (syslog on 514, StatsD on 8125) and never serves either dashboard.
+
+**First visit to the control panel** will warn about the self-signed
+certificate. Accept it once, or trust it properly:
+
+```sh
+scp pi@<pi-admin-ip>:/opt/pirewall/deploy/certificates/pirewall.crt .
+sudo cp pirewall.crt /usr/local/share/ca-certificates/pirewall.crt
+sudo update-ca-certificates
+```
+
+If the browser refuses outright instead of warning, the certificate has no
+SAN covering the address you typed — regenerate it per §5.2.
+
 ## 9. Verify end to end
 
 **On the Pi:**
@@ -607,13 +658,24 @@ nc -zvn -w5 192.168.101.1 8443
 Open the control panel and confirm: System shows `capture=up` and models
 loaded, Network shows packets climbing, Events is populating.
 
-**From a phone or laptop on the protected Wi-Fi:**
+**From a phone or laptop on the protected Wi-Fi** — this is the one test
+that cannot be faked from the Pi itself, because traffic the Pi originates
+never traverses the LAN interface's nat and forward chains:
 
-1. Join the SSID → it gets a lease in your subnet.
-2. If the portal is on, the sign-in page appears by itself. Confirm the
-   internet is refused *before* signing in.
-3. Sign in with an account from §7. Confirm the internet works.
-4. Watch the countdown on the keepalive page.
+1. Join the SSID → it gets a lease in your subnet (not `10.42.0.x`).
+2. The sign-in page appears by itself. If it does not, type
+   `http://<pi-lan-ip>/portal` — that plain port-80 URL is what DHCP option
+   114 advertises, and it must work.
+3. Confirm the internet is refused **before** signing in. A browser should
+   fail fast rather than hang; a hang means the gate is dropping instead of
+   rejecting.
+4. Sign in with an account from §7. Confirm the internet works.
+5. Watch the countdown on the keepalive page.
+6. Sign out, and confirm the internet stops.
+
+Any device should get through steps 1–2 with no prior setup, no client
+software, and no credentials — being *shown the login page* is unauthenticated
+by design. Only steps 4 onward need an account.
 
 **Confirm the kernel agrees**, on the Pi:
 

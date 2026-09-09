@@ -70,6 +70,43 @@ implementation was wrong:
   directory setting, so the server now *verifies* the group and refuses to
   serve on a mismatch instead.
 
+### First real-client session: five false-positive causes (2026-09-10)
+
+A phone browsing a shopping site was BLOCKed as "malicious activity" within
+minutes of connecting. Diagnosed from live daemon state rather than by
+reading code — the running system's own `list_threats`/`list_decisions`
+named every cause. Five independent faults, each alone sufficient to produce
+the outcome:
+
+| # | Fault | Severity | Effect |
+|---|-------|----------|--------|
+| 1 | `check_heartbleed` validated only `payload[0] == 24` before trusting a length comparison, and is fed raw mid-stream TCP payload — which on an established TLS connection is ciphertext, not a record boundary. Measured **761 false matches per 200,000 random segments (~1 in 262)**. | Critical | At `protocol_signature_weight=75`, one chance match plus any anomaly flag reached exactly `critical_threshold` (90) → CRITICAL → **BLOCK**. Every BLOCK observed had this cause. |
+| 2 | The B3 evidence-maturity gate accepted `known_evidence is not None` as mature evidence — true of a 99.99%-confident **BENIGN** verdict. | High | The gate designed to stop exactly this was a no-op for every scored flow. `pirewall.engine.scoring` already used `is_attack_label`; the two layers disagreed about what the same evidence meant. |
+| 3 | `REPEATED_FAILURES` counted any flow ending with `backward_packet_count == 0`, including UDP, ICMP, and one-packet flow-table fragments. **189 of 500 flows (38%)** of an ordinary browsing session counted as "unanswered connection attempts". | High | Contributed behaviour score and satisfied maturity path (b) for any active device. |
+| 4 | `SCANNING` counted distinct destination ports **globally**, which includes ephemeral ports belonging to reply-direction flows. One phone loading one page reached **71 ports across 91 hosts** against a threshold of 10. | High | Measured connection count, not port-scan breadth. Now counts ports-per-destination: many hosts on one port is a browser, many ports on one host is a scan. |
+| 5 | The captive portal revoked a session and showed "malicious activity detected" for any *restrictive* rule, RATE_LIMIT included. | High | A throttle on one flow disconnected the user from the whole network and accused their device. Only BLOCK ends a session now. |
+
+Also fixed, found while verifying the above: every ARP frame was reported as
+a `CAPTURE_ERROR` WARNING. ARP and EAPOL are constant on a Wi-Fi AP, and at
+`api.history_size = 500` that noise evicted real detections from the event
+history within minutes of a client associating. `UnsupportedProtocolError`
+now separates "a valid frame of a protocol we do not analyse" from
+"malformed".
+
+**Not a cause, but confirmed and still open:** LightGBM classified ordinary
+HTTPS to Cloudflare and Shopify as `Bot` at 99.9997% confidence, and to a
+Microsoft endpoint as `FTP-Patator` at 99.996%. This is the CICIDS2017
+generalisation gap the ML audit already records — the model's reported
+test-set precision (0.9927) does not transfer to this network. With defects
+1–4 fixed the surviving effect is bounded: a single attack classification
+plus an anomaly flag reaches 75 (`high_threshold`) → RATE_LIMIT, not BLOCK,
+and in `assisted` mode a high-confidence BLOCK still queues for approval.
+Genuinely fixing it needs retraining on traffic from this network (spec §34
+attack lab), which is Environment-dependent and not attempted here.
+
+25 regression tests, 14 of which were verified to fail against the pre-fix
+code.
+
 ### Audit pass (post-Phase 9)
 
 A full audit-and-fix pass over the completed repository, treating the
@@ -1275,6 +1312,43 @@ subsystems... report, don't improvise").
 - [x] Raspberry Pi hardening — Implemented (folded into `docs/SECURITY.md` rather than a separate file — spec §35 lists "Raspberry Pi hardening" as a documentation topic, not necessarily a separate filename, and `docs/SECURITY.md` §1 is entirely that topic).
 
 ## Known deviations from spec
+
+### First real-client session: five false-positive causes (2026-09-10)
+
+A phone browsing a shopping site was BLOCKed as "malicious activity" within
+minutes of connecting. Diagnosed from live daemon state rather than by
+reading code — the running system's own `list_threats`/`list_decisions`
+named every cause. Five independent faults, each alone sufficient to produce
+the outcome:
+
+| # | Fault | Severity | Effect |
+|---|-------|----------|--------|
+| 1 | `check_heartbleed` validated only `payload[0] == 24` before trusting a length comparison, and is fed raw mid-stream TCP payload — which on an established TLS connection is ciphertext, not a record boundary. Measured **761 false matches per 200,000 random segments (~1 in 262)**. | Critical | At `protocol_signature_weight=75`, one chance match plus any anomaly flag reached exactly `critical_threshold` (90) → CRITICAL → **BLOCK**. Every BLOCK observed had this cause. |
+| 2 | The B3 evidence-maturity gate accepted `known_evidence is not None` as mature evidence — true of a 99.99%-confident **BENIGN** verdict. | High | The gate designed to stop exactly this was a no-op for every scored flow. `pirewall.engine.scoring` already used `is_attack_label`; the two layers disagreed about what the same evidence meant. |
+| 3 | `REPEATED_FAILURES` counted any flow ending with `backward_packet_count == 0`, including UDP, ICMP, and one-packet flow-table fragments. **189 of 500 flows (38%)** of an ordinary browsing session counted as "unanswered connection attempts". | High | Contributed behaviour score and satisfied maturity path (b) for any active device. |
+| 4 | `SCANNING` counted distinct destination ports **globally**, which includes ephemeral ports belonging to reply-direction flows. One phone loading one page reached **71 ports across 91 hosts** against a threshold of 10. | High | Measured connection count, not port-scan breadth. Now counts ports-per-destination: many hosts on one port is a browser, many ports on one host is a scan. |
+| 5 | The captive portal revoked a session and showed "malicious activity detected" for any *restrictive* rule, RATE_LIMIT included. | High | A throttle on one flow disconnected the user from the whole network and accused their device. Only BLOCK ends a session now. |
+
+Also fixed, found while verifying the above: every ARP frame was reported as
+a `CAPTURE_ERROR` WARNING. ARP and EAPOL are constant on a Wi-Fi AP, and at
+`api.history_size = 500` that noise evicted real detections from the event
+history within minutes of a client associating. `UnsupportedProtocolError`
+now separates "a valid frame of a protocol we do not analyse" from
+"malformed".
+
+**Not a cause, but confirmed and still open:** LightGBM classified ordinary
+HTTPS to Cloudflare and Shopify as `Bot` at 99.9997% confidence, and to a
+Microsoft endpoint as `FTP-Patator` at 99.996%. This is the CICIDS2017
+generalisation gap the ML audit already records — the model's reported
+test-set precision (0.9927) does not transfer to this network. With defects
+1–4 fixed the surviving effect is bounded: a single attack classification
+plus an anomaly flag reaches 75 (`high_threshold`) → RATE_LIMIT, not BLOCK,
+and in `assisted` mode a high-confidence BLOCK still queues for approval.
+Genuinely fixing it needs retraining on traffic from this network (spec §34
+attack lab), which is Environment-dependent and not attempted here.
+
+25 regression tests, 14 of which were verified to fail against the pre-fix
+code.
 
 ### Audit pass (post-Phase 9) — behavior changes
 

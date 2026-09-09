@@ -112,8 +112,11 @@ class PortalService:
             raise PortalLoginError(f"Too many failed attempts. Try again in {wait} seconds.")
 
         # A device already blocked by the adaptive pipeline must not be able
-        # to log its way back onto the network (ADDENDUM_3.md C4).
-        if self._manager.restrictive_rules_matching(client_ip):
+        # to log its way back onto the network (ADDENDUM_3.md C4). Only a
+        # BLOCK counts: a RATE_LIMIT throttles a flow without disconnecting
+        # anyone, and refusing the login over one would lock a user out of a
+        # network they are still allowed on.
+        if self._manager.blocking_rules_matching(client_ip):
             raise PortalLoginError(_BLOCKED_MESSAGE + " " + self._config.portal.contact_message)
 
         if not self._store.verify(username, password):
@@ -161,13 +164,19 @@ class PortalService:
         """
         now = self._now_fn()
 
-        if self._manager.restrictive_rules_matching(client_ip):
+        if self._manager.blocking_rules_matching(client_ip):
             # Revoke immediately rather than waiting for the session to
             # lapse: the adaptive rule and the portal grant disagree, and
             # the restrictive one wins. The client can still reach this
             # endpoint because adaptive rules sit on the `forward` hook
             # while the portal sits on `input` — which is the whole reason
             # a blocked device can be told anything at all (C4).
+            #
+            # BLOCK only. A RATE_LIMIT slows one flow down; ending the
+            # session over it disconnects the user from the whole network
+            # and tells them their device is suspected of malicious
+            # activity, which is a wildly disproportionate response to a
+            # throttle — and was exactly what happened on first real use.
             self._revoke(client_ip, reason="blocked by an active firewall rule")
             return PortalClientState(
                 status=PortalClientStatus.BLOCKED,

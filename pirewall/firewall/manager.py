@@ -233,6 +233,12 @@ class FirewallManager:
         except FirewallError:
             return frozenset()
 
+    def blocking_rules_matching(self, client_ip: IPv4Address) -> list[FirewallRule]:
+        """Active BLOCK rules targeting `client_ip` — the ones that actually disconnect it."""
+        return blocking_rules_targeting(
+            self.active_rules(), client_ip, self._config.network.protected_network
+        )
+
     def restrictive_rules_matching(self, client_ip: IPv4Address) -> list[FirewallRule]:
         """Active BLOCK/RATE_LIMIT rules that actually target `client_ip`.
 
@@ -435,6 +441,25 @@ class FirewallManager:
         self, rule_id: str, from_status: RuleStatus | None, to_status: RuleStatus, at: datetime, reason: str
     ) -> None:
         self._transitions.append(RuleTransition(rule_id, from_status, to_status, at, reason))
+
+
+def blocking_rules_targeting(
+    rules: Iterable[FirewallRule], client_ip: IPv4Address, protected_network: IPv4Network
+) -> list[FirewallRule]:
+    """Only the rules that actually cut `client_ip` off — BLOCK, never RATE_LIMIT.
+
+    The captive portal uses this to decide whether to revoke a session and
+    tell someone their device is suspended. A RATE_LIMIT throttles a flow; it
+    does not disconnect anybody, and treating it as a disconnection took a
+    user off the network entirely over a rule that was meant to slow one
+    connection down. `rules_targeting` still reports both, for the control
+    panel and anything that wants the full picture.
+    """
+    return [
+        rule
+        for rule in rules_targeting(rules, client_ip, protected_network)
+        if rule.action is FirewallAction.BLOCK
+    ]
 
 
 def rules_targeting(

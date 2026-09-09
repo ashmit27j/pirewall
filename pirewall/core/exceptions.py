@@ -40,6 +40,18 @@ class PacketParseError(PirewallError):
     """
 
 
+class UnsupportedProtocolError(PacketParseError):
+    """A well-formed frame carrying a protocol pirewall does not analyse.
+
+    Distinct from a genuinely malformed packet. ARP, EAPOL and VLAN-tagged
+    frames are all normal, correct traffic — on a Wi-Fi AP they arrive
+    constantly — and reporting each one as a `CAPTURE_ERROR` buried real
+    security events in the bounded event history within minutes of a client
+    associating. A subclass of `PacketParseError` so every existing caller
+    keeps working; callers that care about the difference catch this first.
+    """
+
+
 class FlowError(PirewallError):
     """Raised on flow-table failures: key derivation, aggregation, or eviction errors."""
 

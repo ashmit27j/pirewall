@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pirewall.capture.interfaces import PacketCapture
 from pirewall.capture.parser import parse_packet
 from pirewall.core.enums import EventSeverity, Protocol, SecurityEventType
-from pirewall.core.exceptions import PacketParseError
+from pirewall.core.exceptions import PacketParseError, UnsupportedProtocolError
 from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.packet import PacketMetadata
 
@@ -57,6 +57,15 @@ def capture_packets(
     for captured in capture.read_packets():
         try:
             metadata = parse_packet(captured.raw, captured.captured_at)
+        except UnsupportedProtocolError as exc:
+            # Not an error: a valid frame of a protocol pirewall does not
+            # analyse (ARP, EAPOL, VLAN). These are constant on a Wi-Fi AP,
+            # and emitting a CAPTURE_ERROR for each one filled the bounded
+            # event history with noise and evicted real detections within
+            # minutes of a client associating. Counted, never reported.
+            capture.record_malformed()
+            _logger.debug("skipping unanalysed protocol: %s", exc)
+            continue
         except PacketParseError as exc:
             capture.record_malformed()
             _logger.warning("dropping malformed packet: %s", exc)

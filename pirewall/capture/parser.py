@@ -21,7 +21,7 @@ from datetime import datetime
 from ipaddress import IPv4Address, IPv6Address
 
 from pirewall.core.enums import AddressFamily, Protocol
-from pirewall.core.exceptions import PacketParseError
+from pirewall.core.exceptions import PacketParseError, UnsupportedProtocolError
 from pirewall.core.models.common import TcpFlags
 from pirewall.core.models.packet import PacketMetadata
 
@@ -94,7 +94,7 @@ def _parse_packet(raw: bytes, captured_at: datetime) -> PacketMetadata:
         return _parse_ipv4(raw, _ETH_HEADER_LEN, captured_at)
     if ethertype == _ETHERTYPE_IPV6:
         return _parse_ipv6(raw, _ETH_HEADER_LEN, captured_at)
-    raise PacketParseError(f"unsupported ethertype 0x{ethertype:04x}")
+    raise UnsupportedProtocolError(f"unsupported ethertype 0x{ethertype:04x}")
 
 
 def _parse_ipv4(raw: bytes, offset: int, captured_at: datetime) -> PacketMetadata:

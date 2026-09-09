@@ -103,6 +103,11 @@ def test_repeated_ssh_connections_flags_repeated_connections_and_failures() -> N
                 forward_byte_count=80,
                 backward_byte_count=0,
                 duration_seconds=0.1,
+                # A connection *attempt* carries a SYN. Without one this is
+                # not a refused connection but a flow record that merely
+                # ended with no reply — which ordinary traffic produces
+                # constantly, and which used to be counted as a failure.
+                tcp_flags={"syn": 1},
             )
         )
 

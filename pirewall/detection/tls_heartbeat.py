@@ -55,6 +55,32 @@ _RECORD_HEADER_LEN = 5
 _CONTENT_TYPE_HEARTBEAT = 24
 _HEARTBEAT_HEADER_LEN = 3  # 1 byte message type + 2 byte payload_length
 
+# Every other field in the record and heartbeat headers, validated before the
+# length comparison is trusted.
+#
+# This matters far more than it looks. `check_heartbleed` is handed raw TCP
+# payload bytes from anywhere in a stream, and a mid-stream segment does not
+# begin at a TLS record boundary — on an established connection those bytes
+# are ciphertext. Checking only `payload[0] == 24` therefore fires on roughly
+# one segment in 256 *by chance*, and ciphertext then yields a large random
+# "claimed_payload_length" that all but always exceeds the fragment, so the
+# mismatch test passes too. On a real deployment that produced a CRITICAL
+# BLOCK against ordinary HTTPS browsing within minutes.
+#
+# Constraining the surrounding fields removes that: a random 6-byte prefix
+# has to satisfy the content type (1/256), a legal protocol version (~5 of
+# 65536), a legal heartbeat message type (2/256) and a record length inside
+# TLS's own limit, which together is vanishingly unlikely to occur by chance.
+_LEGAL_VERSIONS = frozenset({0x0300, 0x0301, 0x0302, 0x0303, 0x0304})
+
+# RFC 8446 §5.1: TLSPlaintext.length must not exceed 2^14; TLSCiphertext adds
+# at most 256 bytes of expansion. Anything larger is not a TLS record.
+_MAX_RECORD_LENGTH = 2**14 + 256
+
+_HEARTBEAT_REQUEST = 1
+_HEARTBEAT_RESPONSE = 2
+_LEGAL_HEARTBEAT_TYPES = frozenset({_HEARTBEAT_REQUEST, _HEARTBEAT_RESPONSE})
+
 
 @dataclass(frozen=True, slots=True)
 class HeartbleedMatch:
@@ -88,13 +114,25 @@ def check_heartbleed(payload: bytes) -> HeartbleedMatch | None:
 def _check_heartbleed(payload: bytes) -> HeartbleedMatch | None:
     if len(payload) < _RECORD_HEADER_LEN:
         return None
-    content_type = payload[0]
-    if content_type != _CONTENT_TYPE_HEARTBEAT:
+    if payload[0] != _CONTENT_TYPE_HEARTBEAT:
+        return None
+
+    # Validate every other field of both headers before trusting the length
+    # comparison. Without this the check fires on ciphertext that merely
+    # happens to start with byte 24 — see `_LEGAL_VERSIONS` above.
+    version = struct.unpack("!H", payload[1:3])[0]
+    if version not in _LEGAL_VERSIONS:
         return None
 
     declared_length = struct.unpack("!H", payload[3:5])[0]
+    if declared_length < _HEARTBEAT_HEADER_LEN or declared_length > _MAX_RECORD_LENGTH:
+        return None
+
     fragment = payload[_RECORD_HEADER_LEN : _RECORD_HEADER_LEN + declared_length]
     if len(fragment) < _HEARTBEAT_HEADER_LEN:
+        return None
+
+    if fragment[0] not in _LEGAL_HEARTBEAT_TYPES:
         return None
 
     claimed_payload_length = struct.unpack("!H", fragment[1:3])[0]

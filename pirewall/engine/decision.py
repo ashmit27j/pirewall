@@ -16,9 +16,11 @@ weights/thresholds: no single, low-evidence observation may ever directly
 produce a `BLOCK` or `RATE_LIMIT` decision. "Sufficient evidence" is
 exactly one of:
 
-(a) a fully completed flow's known-attack classification
-    (`ThreatAssessment.known_evidence is not None`) — this is already
-    single-flow-conclusive by what it *is*, not by any threshold — or a
+(a) a fully completed flow's known-attack classification naming an actual
+    attack class at or above the known-attack confidence threshold — not
+    merely the *presence* of a classification, which is also true of a
+    confident `BENIGN` verdict and once made this gate a no-op for every
+    scored flow — or a
     positive protocol-structure match (`protocol_signature_evidence is not
     None`, ADDENDUM_2.md B4/B5: a Heartbleed length mismatch or a JA3
     fingerprint hit) — a deterministic pattern match, not a raw score,
@@ -57,6 +59,7 @@ from pirewall.config.models import ThreatConfig
 from pirewall.core.enums import FirewallAction, ThreatLevel
 from pirewall.core.models.decision import FirewallDecision
 from pirewall.core.models.threat import ThreatAssessment
+from pirewall.ml.labels import is_attack_label
 
 _ACTION_BY_LEVEL: dict[ThreatLevel, FirewallAction] = {
     ThreatLevel.LOW: FirewallAction.ALLOW,
@@ -70,6 +73,11 @@ _ACTION_BY_LEVEL: dict[ThreatLevel, FirewallAction] = {
 # gating; this is exactly the "restrictive" action set spec §24 already
 # names for the validator's allowlist/safety stages.
 _MATURITY_GATED_ACTIONS = frozenset({FirewallAction.RATE_LIMIT, FirewallAction.BLOCK})
+
+# Mirrors `DetectionConfig.known_attack_confidence_threshold`'s own default,
+# so a caller that does not thread config through still applies the same bar
+# the detection layer does rather than accepting any confidence at all.
+_DEFAULT_KNOWN_ATTACK_CONFIDENCE = 0.8
 
 
 class EvidenceMaturityTracker:
@@ -119,6 +127,7 @@ def decide(
     assessment: ThreatAssessment,
     decided_at: datetime,
     maturity_tracker: EvidenceMaturityTracker | None = None,
+    known_attack_confidence_threshold: float = _DEFAULT_KNOWN_ATTACK_CONFIDENCE,
 ) -> FirewallDecision:
     """Turn one `ThreatAssessment` into an explicit, auditable `FirewallDecision`.
 
@@ -128,7 +137,9 @@ def decide(
     `MONITOR`, which is the conservative default, never the permissive one.
     """
     action = _ACTION_BY_LEVEL[assessment.threat_level]
-    if action in _MATURITY_GATED_ACTIONS and not _has_mature_evidence(assessment, maturity_tracker):
+    if action in _MATURITY_GATED_ACTIONS and not _has_mature_evidence(
+        assessment, maturity_tracker, known_attack_confidence_threshold
+    ):
         action = FirewallAction.MONITOR
     return FirewallDecision(
         id=str(uuid4()),
@@ -143,9 +154,29 @@ def decide(
     )
 
 
-def _has_mature_evidence(assessment: ThreatAssessment, tracker: EvidenceMaturityTracker | None) -> bool:
-    """Paths (a)/(b)/(c) from the module docstring, in order."""
-    if assessment.known_evidence is not None:
+def _has_mature_evidence(
+    assessment: ThreatAssessment,
+    tracker: EvidenceMaturityTracker | None,
+    known_attack_confidence_threshold: float = _DEFAULT_KNOWN_ATTACK_CONFIDENCE,
+) -> bool:
+    """Paths (a)/(b)/(c) from the module docstring, in order.
+
+    Path (a) requires the classifier to have named an actual **attack**, at
+    or above the confidence threshold — not merely to have produced a
+    classification. `known_evidence is not None` is true for every scored
+    flow, including one confidently classified `BENIGN`, so the original
+    presence check made this gate a no-op for any flow the model had seen:
+    a benign verdict was accepted as mature evidence *of a threat*.
+    `pirewall.engine.scoring` already draws this distinction with
+    `is_attack_label`, and contributes 0 for BENIGN; the gate must agree
+    with it or the two layers disagree about what the same evidence means.
+    """
+    known = assessment.known_evidence
+    if (
+        known is not None
+        and is_attack_label(known.predicted_class)
+        and known.confidence >= known_attack_confidence_threshold
+    ):
         return True
     if assessment.protocol_signature_evidence is not None:
         return True

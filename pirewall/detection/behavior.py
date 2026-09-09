@@ -39,7 +39,7 @@ from ipaddress import IPv4Address
 from itertools import pairwise
 
 from pirewall.config.models import DetectionConfig
-from pirewall.core.enums import BehaviorPatternType
+from pirewall.core.enums import BehaviorPatternType, Protocol
 from pirewall.core.models.behavior import BehaviorAssessment
 from pirewall.core.models.flow import Flow
 
@@ -59,6 +59,7 @@ class SourceBehaviorState:
         "first_seen",
         "last_seen",
         "ports",
+        "ports_per_destination",
         "recent_connection_times",
         "slow_connection_counts",
     )
@@ -69,6 +70,10 @@ class SourceBehaviorState:
         self.connection_count = 0
         self.destinations: set[IPv4Address] = set()
         self.ports: set[int] = set()
+        # Ports grouped by destination, bounded the same way as `destinations`.
+        # `scanned_port_breadth` reads this; the flat `ports` set is kept for
+        # the reason string and for anything that wants the raw breadth.
+        self.ports_per_destination: dict[IPv4Address, set[int]] = {}
         self.connections_per_destination: dict[tuple[IPv4Address, int | None], int] = {}
         self.failure_count = 0
         self.recent_connection_times: deque[datetime] = deque(maxlen=max_recent)
@@ -91,6 +96,13 @@ class SourceBehaviorState:
             self.destinations.add(destination_ip)
         if destination_port is not None and len(self.ports) < self._max_ports:
             self.ports.add(destination_port)
+        if destination_port is not None:
+            ports_here = self.ports_per_destination.get(destination_ip)
+            if ports_here is not None:
+                if len(ports_here) < self._max_ports:
+                    ports_here.add(destination_port)
+            elif len(self.ports_per_destination) < self._max_destinations:
+                self.ports_per_destination[destination_ip] = {destination_port}
 
         destination_key = (destination_ip, destination_port)
         already_tracked = destination_key in self.connections_per_destination
@@ -110,8 +122,24 @@ class SourceBehaviorState:
         """
         if flow.last_seen > self.last_seen:
             self.last_seen = flow.last_seen
-        if flow.backward_packet_count == 0:
+        if is_failed_connection_attempt(flow):
             self.failure_count += 1
+
+    @property
+    def scanned_port_breadth(self) -> int:
+        """The most distinct ports this source contacted on any single destination.
+
+        The discriminator between a scan and a browser. A port scan hits many
+        ports on few hosts; a browser hits one or two ports (443, occasionally
+        80) on many hosts. Counting distinct ports *globally* — as this used
+        to — measures neither: a phone loading one shopping page reached 71
+        distinct ports across 91 hosts, almost all of them ephemeral ports
+        belonging to reply-direction flows, and tripped a "port scan" at a
+        threshold of 10.
+        """
+        if not self.ports_per_destination:
+            return 0
+        return max(len(ports) for ports in self.ports_per_destination.values())
 
     def observe(self, flow: Flow) -> None:
         """Fold one already-completed flow into the tracked state in one call.
@@ -289,9 +317,10 @@ def _assess_state(
         patterns.append(BehaviorPatternType.DESTINATION_DIVERSITY)
         reasons.append(f"{len(state.destinations)} distinct destinations")
 
-    if len(state.ports) >= config.scanning_port_threshold:
+    port_breadth = state.scanned_port_breadth
+    if port_breadth >= config.scanning_port_threshold:
         patterns.append(BehaviorPatternType.SCANNING)
-        reasons.append(f"{len(state.ports)} distinct destination ports")
+        reasons.append(f"{port_breadth} distinct ports on a single destination")
 
     if state.failure_count >= config.repeated_failures_threshold:
         patterns.append(BehaviorPatternType.REPEATED_FAILURES)
@@ -323,3 +352,25 @@ def _assess_state(
         window_start=state.first_seen,
         window_end=state.last_seen,
     )
+
+
+def is_failed_connection_attempt(flow: Flow) -> bool:
+    """Whether `flow` looks like a connection attempt that was never answered.
+
+    Narrower than "no packets came back", which is what this used to be and
+    which counted 38% of an ordinary browsing session as failures: a flow
+    record can end with no reply for reasons that say nothing about the
+    source — UDP and ICMP have no notion of an answered connection at all,
+    and a flow evicted from the table after one packet is a bookkeeping
+    artifact rather than a refused connection.
+
+    So a failure requires a TCP flow that actually attempted to open a
+    connection (at least one SYN) and received nothing at all in return.
+    That is the shape a scan or a SYN flood produces, and the shape ordinary
+    traffic does not.
+    """
+    if flow.protocol is not Protocol.TCP:
+        return False
+    if flow.backward_packet_count != 0:
+        return False
+    return flow.tcp_flags.syn >= 1

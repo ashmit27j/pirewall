@@ -235,6 +235,36 @@ def test_login_page_renders_without_error() -> None:
     assert "username" in html
 
 
+def test_dashboard_has_a_help_button_and_dialog() -> None:
+    html = render_dashboard(_status(), [], [], [], [], [], None, [])
+    assert 'id="help-dialog"' in html
+    assert "help-btn" in html
+    assert "Common scenarios" in html
+    assert "What each section shows" in html
+    # every section named in the spec-section test also gets a help row
+    for heading in ("System", "Network", "Detections", "Threats", "Firewall", "Shadow log", "Allowlist",
+                     "Events", "ML"):
+        assert heading in html
+
+
+def test_panels_have_collapse_and_export_controls() -> None:
+    html = render_dashboard(_status(), [], [], [], [], [], None, [])
+    for section_id in ("system", "network", "detections", "threats", "firewall", "shadow-log", "allowlist",
+                        "events", "ml"):
+        assert f'data-panel="{section_id}"' in html
+        assert f'data-toggle="{section_id}"' in html
+        assert f'data-export="{section_id}"' in html
+        assert f'id="panel-body-{section_id}"' in html
+
+
+def test_only_log_shaped_panels_get_a_clear_view_control() -> None:
+    html = render_dashboard(_status(), [], [], [], [], [], None, [])
+    for section_id in ("detections", "threats", "shadow-log", "events"):
+        assert f'data-clear="{section_id}"' in html
+    for section_id in ("system", "network", "firewall", "allowlist", "ml"):
+        assert f'data-clear="{section_id}"' not in html
+
+
 def test_render_module_cannot_invoke_any_rpc_action() -> None:
     """Structural proof, not just behavioral: `render.py` never even imports the RPC client.
 

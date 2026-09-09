@@ -36,7 +36,7 @@ from pirewall.core.models.threat import ThreatAssessment
 
 _STYLE = """<style>
 body { font-family: system-ui, sans-serif; margin: 2rem; background: #f7f7f8; color: #1a1a1a; }
-h1, h2 { margin-top: 2rem; }
+h1, h2, h3 { margin-top: 2rem; }
 table { border-collapse: collapse; width: 100%; margin-bottom: 1rem; background: #fff; }
 th, td { border: 1px solid #ddd; padding: 0.4rem 0.6rem; text-align: left; font-size: 0.9rem; }
 th { background: #eee; }
@@ -49,6 +49,22 @@ th { background: #eee; }
   border-radius: 0.3rem; cursor: pointer; }
 .error { color: #b02a37; }
 form.inline { display: inline; }
+.page-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
+.help-btn { background: #0d6efd; color: #fff; border: none; border-radius: 0.3rem; padding: 0.5rem 1rem;
+  font-size: 0.9rem; cursor: pointer; }
+.panel { margin-bottom: 1.5rem; }
+.panel-toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
+.panel-toolbar h2 { margin: 0; }
+.panel-controls button { background: #fff; border: 1px solid #ccc; border-radius: 0.3rem;
+  padding: 0.15rem 0.55rem; margin-left: 0.35rem; font-size: 0.8rem; cursor: pointer; }
+.panel-controls button:hover { background: #eee; }
+.panel-body[hidden] { display: none; }
+dialog { max-width: 46rem; width: 90%; border-radius: 0.5rem; border: 1px solid #ccc;
+  padding: 1.5rem 1.75rem; }
+dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+dialog table { font-size: 0.85rem; }
+.dialog-close { float: right; background: #adb5bd; color: #fff; border: none; border-radius: 0.3rem;
+  padding: 0.3rem 0.8rem; cursor: pointer; }
 </style>"""
 
 _SCRIPT = """<script>
@@ -75,6 +91,66 @@ function addAllowlistEntry(event) {
   if (form.protocol.value) body.protocol = form.protocol.value;
   pirewallCall("POST", "/api/v1/allowlist", body);
 }
+function togglePanel(id) {
+  const body = document.getElementById("panel-body-" + id);
+  const btn = document.querySelector('button[data-toggle="' + id + '"]');
+  if (!body) return;
+  body.hidden = !body.hidden;
+  if (btn) btn.textContent = body.hidden ? "\\u25b8 Expand" : "\\u25be Collapse";
+}
+function csvField(text) {
+  const value = (text || "").trim();
+  return /[",\\n]/.test(value) ? '"' + value.replace(/"/g, '""') + '"' : value;
+}
+function exportPanel(id) {
+  const body = document.getElementById("panel-body-" + id);
+  const table = body ? body.querySelector("table") : null;
+  if (!table) return;
+  const csv = Array.from(table.querySelectorAll("tr"))
+    .filter(function (row) { return !row.hidden; })
+    .map(function (row) {
+      return Array.from(row.children).map(function (cell) { return csvField(cell.textContent); }).join(",");
+    })
+    .join("\\n");
+  const blob = new Blob([csv], {type: "text/csv"});
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = "pirewall-" + id + "-" + new Date().toISOString().slice(0, 19).replace(/:/g, "-") + ".csv";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(link.href);
+}
+// "Clear view" never deletes anything on pirewall-core: it records a
+// per-browser cutoff timestamp in localStorage and hides rows at or before
+// it (compared against each row's first, Time, cell). Security event/audit
+// history must stay recoverable server-side even after an operator clears
+// their own view of it (spec-adjacent to A1's shadow-log audit trail).
+function clearedCutoffKey(id) {
+  return "pirewall-cleared-" + id;
+}
+function applyClearedCutoff(id) {
+  const cutoffRaw = localStorage.getItem(clearedCutoffKey(id));
+  if (!cutoffRaw) return;
+  const cutoff = Date.parse(cutoffRaw);
+  const body = document.getElementById("panel-body-" + id);
+  const table = body ? body.querySelector("table") : null;
+  if (!table) return;
+  Array.from(table.querySelectorAll("tr")).forEach(function (row) {
+    const firstCell = row.children[0];
+    if (!firstCell || firstCell.tagName === "TH") return;
+    const rowTime = Date.parse(firstCell.textContent.trim());
+    if (!isNaN(rowTime) && rowTime <= cutoff) row.hidden = true;
+  });
+}
+function clearPanelView(id) {
+  if (!confirm("Hide rows currently visible in this section? This only affects your browser " +
+    "\\u2014 nothing is deleted on pirewall-core, and reopening after new activity will show new rows.")) {
+    return;
+  }
+  localStorage.setItem(clearedCutoffKey(id), new Date().toISOString());
+  applyClearedCutoff(id);
+}
 // Rule/allowlist ids reach JS through data- attributes read at click time,
 // never interpolated into an inline handler's JS source. html.escape() is
 // correct for HTML attribute values but NOT for JS string literals: the
@@ -82,9 +158,17 @@ function addAllowlistEntry(event) {
 // so an id containing a quote would break out of the string and execute.
 // Delegated listener, so it also covers rows added by a future re-render.
 document.addEventListener("click", function (event) {
-  const button = event.target.closest("button[data-action]");
-  if (!button) return;
-  pirewallCall(button.dataset.method, button.dataset.action);
+  const actionButton = event.target.closest("button[data-action]");
+  if (actionButton) { pirewallCall(actionButton.dataset.method, actionButton.dataset.action); return; }
+  const toggleButton = event.target.closest("button[data-toggle]");
+  if (toggleButton) { togglePanel(toggleButton.dataset.toggle); return; }
+  const exportButton = event.target.closest("button[data-export]");
+  if (exportButton) { exportPanel(exportButton.dataset.export); return; }
+  const clearButton = event.target.closest("button[data-clear]");
+  if (clearButton) { clearPanelView(clearButton.dataset.clear); return; }
+});
+document.querySelectorAll("[data-panel]").forEach(function (panel) {
+  applyClearedCutoff(panel.dataset.panel);
 });
 </script>"""
 
@@ -94,7 +178,10 @@ def _e(value: object) -> str:
 
 
 def _page(title: str, body: str) -> str:
-    head = f"<title>{_e(title)}</title>{_STYLE}"
+    # Explicit charset, not left to `HTMLResponse`'s default header: the page emits raw
+    # non-ASCII characters (em dashes, arrows) that mojibake under any transport that
+    # doesn't send charset=utf-8 (e.g. a bare static file server) without this.
+    head = f'<meta charset="utf-8"><title>{_e(title)}</title>{_STYLE}'
     return f"<!doctype html><html><head>{head}</head><body>{body}{_SCRIPT}</body></html>"
 
 
@@ -175,7 +262,6 @@ def _status_badge(status: RuleStatus) -> str:
 
 def _render_system_section(status: StatusResult) -> str:
     return f"""
-    <h2>System</h2>
     <table>
       <tr><th>pirewall-core status</th><td>reachable, uptime {status.uptime_seconds:.0f}s</td></tr>
       <tr><th>Enforcement mode</th><td>{_e(status.enforcement_mode.value)}</td></tr>
@@ -197,7 +283,6 @@ def _render_threats_section(threats: Iterable[ThreatAssessment]) -> str:
         for t in threats
     )
     return f"""
-    <h2>Threats</h2>
     <table>
       <tr><th>Time</th><th>Source</th><th>Level</th><th>Score</th><th>Explanation</th></tr>
       {rows or '<tr><td colspan="5">No recent threat assessments.</td></tr>'}
@@ -214,7 +299,6 @@ def _render_network_section(capture_stats: CaptureStatistics | None) -> str:
             f"<td>{capture_stats.packets_dropped}</td><td>{capture_stats.packets_malformed}</td></tr>"
         )
     return f"""
-    <h2>Network</h2>
     <table>
       <tr><th>Interface</th><th>Packets seen</th><th>Packets dropped</th><th>Packets malformed</th></tr>
       {row}
@@ -239,7 +323,6 @@ def _render_detections_section(detections: Iterable[DetectionRecord]) -> str:
         for d in detections
     )
     return f"""
-    <h2>Detections</h2>
     <table>
       <tr><th>Time</th><th>Flow</th><th>Evidence</th></tr>
       {rows or '<tr><td colspan="3">No detections recorded yet.</td></tr>'}
@@ -256,7 +339,6 @@ def _render_firewall_section(rules: list[FirewallRule]) -> str:
         for rule in rules
     )
     return f"""
-    <h2>Firewall — active &amp; adaptive rules</h2>
     <table>
       <tr><th>ID</th><th>Action</th><th>Source -&gt; Destination</th><th>Status</th>
           <th>Expires</th><th>Reason</th><th>Actions</th></tr>
@@ -300,7 +382,6 @@ def _render_shadow_log_section(rules: list[FirewallRule]) -> str:
         for rule in shadowed
     )
     return f"""
-    <h2>Shadow log (ADDENDUM.md A1) — what would have happened</h2>
     <table>
       <tr><th>Time</th><th>Would-be action</th><th>Source -&gt; Destination</th><th>Reason</th></tr>
       {rows or '<tr><td colspan="4">Nothing shadowed yet.</td></tr>'}
@@ -321,7 +402,6 @@ def _allowlist_row(entry: AllowlistEntry) -> str:
 def _render_allowlist_section(allowlist: list[AllowlistEntry]) -> str:
     rows = "".join(_allowlist_row(entry) for entry in allowlist)
     return f"""
-    <h2>Allowlist (ADDENDUM.md A2) — never adaptively blocked</h2>
     <table>
       <tr><th>Target</th><th>Port</th><th>Protocol</th><th>Reason</th><th>Added by</th><th></th></tr>
       {rows or '<tr><td colspan="6">Allowlist is empty.</td></tr>'}
@@ -347,7 +427,6 @@ def _event_row(event: SecurityEvent) -> str:
 def _render_events_section(events: Iterable[SecurityEvent]) -> str:
     rows = "".join(_event_row(event) for event in events)
     return f"""
-    <h2>Events</h2>
     <table>
       <tr><th>Time</th><th>Severity</th><th>Type</th><th>Subsystem</th><th>Reason</th></tr>
       {rows or '<tr><td colspan="5">No events recorded yet.</td></tr>'}
@@ -362,11 +441,107 @@ def _render_ml_section(models: Iterable[ModelMetadata]) -> str:
         for m in models
     )
     return f"""
-    <h2>ML</h2>
     <table>
       <tr><th>Model</th><th>Version</th><th>Feature schema</th><th>Placeholder?</th></tr>
       {rows or '<tr><td colspan="4">No models loaded.</td></tr>'}
     </table>
+    """
+
+
+def _panel(section_id: str, title: str, html_block: str, *, loggy: bool) -> str:
+    """Wrap a rendered section in a collapsible panel with export/clear-view controls.
+
+    The heading lives in the toolbar, outside the collapsible body, so a
+    collapsed panel still shows which section it is rather than disappearing
+    into an unlabeled control strip.
+
+    `loggy` gates the "Clear view" control to sections that are genuinely
+    append-only logs with a Time-first column (Detections/Threats/Shadow
+    log/Events) — clearing a state table like Firewall/Allowlist wouldn't
+    mean anything, since those rows aren't chronological history.
+    """
+    controls = (
+        f'<button type="button" data-toggle="{_e(section_id)}">&#x25be; Collapse</button>'
+        f'<button type="button" data-export="{_e(section_id)}">Export CSV</button>'
+    )
+    if loggy:
+        controls += f'<button type="button" data-clear="{_e(section_id)}">Clear view</button>'
+    return (
+        f'<div class="panel" data-panel="{_e(section_id)}">'
+        f'<div class="panel-toolbar"><h2>{_e(title)}</h2><div class="panel-controls">{controls}</div></div>'
+        f'<div class="panel-body" id="panel-body-{_e(section_id)}">{html_block}</div>'
+        f"</div>"
+    )
+
+
+_HELP_SECTIONS: tuple[tuple[str, str], ...] = (
+    ("System", "Core process health: uptime, current enforcement/failure mode, active and pending-approval "
+     "rule counts, tracked flows, whether the ML models are loaded, and the emergency kill-switch."),
+    ("Network", "Live packet-capture counters for the configured interface: packets seen, dropped, and "
+     "malformed. Dropped/malformed rising steadily can mean capture is falling behind."),
+    ("Detections", "Raw per-flow evidence from the detectors (known-attack classification, anomaly score, "
+     "protocol signature) before it is combined into a threat assessment."),
+    ("Threats", "Detections combined into a per-flow threat score, level, and plain-language explanation."),
+    ("Firewall", "Every rule pirewall knows about, active or pending. Approve/Reject pending rules; "
+     "Disable/Remove active ones."),
+    ("Shadow log", "What pirewall would have enforced had it been in ACTIVE mode (ADDENDUM.md A1). Review "
+     "this before ever leaving SHADOW mode."),
+    ("Allowlist", "Targets that are never adaptively blocked, regardless of threat score (ADDENDUM.md A2). "
+     "Add your admin PC, printers, or other trusted devices here."),
+    ("Events", "The security event stream: warnings, blocks, and errors across every subsystem."),
+    ("ML", "Which model files are loaded, their versions, feature-schema version, and whether a model is a "
+     "placeholder rather than trained on real data."),
+)
+
+_HELP_SCENARIOS: tuple[tuple[str, str], ...] = (
+    ("A rule is waiting for approval", "Firewall section → find the row with an orange Pending badge → "
+     "Approve or Reject."),
+    ("You want to permanently trust a device (admin PC, printer, etc.)", "Allowlist section → fill in the "
+     "target IP/CIDR, optional port/protocol, and a reason → Add."),
+    ("You need to stop all adaptive enforcement immediately", "System section → red \"Emergency "
+     "kill-switch\" button. Reverts to SHADOW mode and removes every active adaptive rule (ADDENDUM.md A8)."),
+    ("You want to see what pirewall would block before turning enforcement on", "Shadow log section — "
+     "SHADOWED rows show what would have happened in ACTIVE mode."),
+    ("A deployed rule turns out to be wrong", "Firewall section → find the ACTIVE row → Disable "
+     "(temporary, reversible) or Remove (permanent)."),
+    ("A table is getting long and hard to scan", "Click ▾ Collapse on that section's toolbar to hide it, "
+     "or Clear view to hide the rows you've already reviewed (browser-only, nothing is deleted)."),
+    ("You want to save or share a table for later review", "Click Export CSV on that section's toolbar to "
+     "download its currently visible rows."),
+    ("The page shows \"pirewall-core is unreachable\"", "pirewall-core itself is down; the control panel "
+     "process is still up and reporting it (ADDENDUM.md A6). Check `systemctl status pirewall-core` on "
+     "the Pi."),
+)
+
+
+def _help_button() -> str:
+    onclick = "document.getElementById('help-dialog').showModal()"
+    return f'<button type="button" class="help-btn" onclick="{onclick}">ⓘ Help</button>'
+
+
+def _help_dialog() -> str:
+    section_rows = "".join(
+        f"<tr><td>{_e(name)}</td><td>{_e(desc)}</td></tr>" for name, desc in _HELP_SECTIONS
+    )
+    scenario_rows = "".join(
+        f"<tr><td>{_e(scenario)}</td><td>{_e(action)}</td></tr>" for scenario, action in _HELP_SCENARIOS
+    )
+    return f"""
+    <dialog id="help-dialog">
+      <button type="button" class="dialog-close" onclick="document.getElementById('help-dialog').close()">
+        Close</button>
+      <h2>Dashboard help</h2>
+      <h3>What each section shows</h3>
+      <table>
+        <tr><th>Section</th><th>What it shows</th></tr>
+        {section_rows}
+      </table>
+      <h3>Common scenarios</h3>
+      <table>
+        <tr><th>If you want to&hellip;</th><th>Do this</th></tr>
+        {scenario_rows}
+      </table>
+    </dialog>
     """
 
 
@@ -382,15 +557,28 @@ def render_dashboard(
 ) -> str:
     """Render the full control panel (spec §30's sections, plus the addendum additions)."""
     body = (
-        "<h1>pirewall control panel</h1>"
-        + _render_system_section(status)
-        + _render_network_section(capture_stats)
-        + _render_detections_section(detections)
-        + _render_threats_section(threats)
-        + _render_firewall_section(rules)
-        + _render_shadow_log_section(rules)
-        + _render_allowlist_section(allowlist)
-        + _render_events_section(events)
-        + _render_ml_section(models)
+        f'<div class="page-header"><h1>pirewall control panel</h1>{_help_button()}</div>'
+        + _panel("system", "System", _render_system_section(status), loggy=False)
+        + _panel("network", "Network", _render_network_section(capture_stats), loggy=False)
+        + _panel("detections", "Detections", _render_detections_section(detections), loggy=True)
+        + _panel("threats", "Threats", _render_threats_section(threats), loggy=True)
+        + _panel(
+            "firewall", "Firewall — active & adaptive rules", _render_firewall_section(rules), loggy=False
+        )
+        + _panel(
+            "shadow-log",
+            "Shadow log (ADDENDUM.md A1) — what would have happened",
+            _render_shadow_log_section(rules),
+            loggy=True,
+        )
+        + _panel(
+            "allowlist",
+            "Allowlist (ADDENDUM.md A2) — never adaptively blocked",
+            _render_allowlist_section(allowlist),
+            loggy=False,
+        )
+        + _panel("events", "Events", _render_events_section(events), loggy=True)
+        + _panel("ml", "ML", _render_ml_section(models), loggy=False)
+        + _help_dialog()
     )
     return _page("pirewall control panel", body)

@@ -2814,3 +2814,164 @@ passed rather than skipped here — independently confirmed to skip cleanly
 with a clear reason when that artifact is temporarily absent, per Part 2
 above). A genuine fresh clone with no locally-trained model present should
 now show **662 passed, 2 skipped, 0 failed**.
+
+## Dashboard UI, code-review sweep, and anomaly false-positive investigation (2026-09-09)
+
+Three-part session, run on Windows against a real `uv run` toolchain (ruff,
+pyright, pytest all executed directly, not assumed): a general code-review
+pass, a control-panel UI update, and an investigation into the operator's
+observation that pirewall was classifying benign traffic as anomalous.
+
+### 1. Code-review sweep — Tested, no defects found
+
+Fresh, independent look at current repo state rather than trusting prior
+session claims: `uv run ruff check .` clean, `uv run pyright` 0
+errors/0 warnings, `uv run pytest -q` **640 passed, 24 skipped, 0 failed**
+before this session's own changes. No `TODO`/`FIXME`/`XXX`/`HACK` comments
+found anywhere under `pirewall/`. Grepped `pirewall/api/` and `pirewall/web/`
+for any import of `firewall.backend`, `firewall.manager`, or `capture`
+(ADDENDUM.md A4) — none found. Grepped `pirewall/` for `shell=True`,
+`os.system`, and `subprocess.` usage — `subprocess` appears only in
+`pirewall/firewall/backend/nftables.py`, with `shell=False` (the default)
+and a list-argument call, matching the spec's no-string-interpolated-shell-
+commands rule. **The codebase remains clean; there was nothing to fix.**
+
+### 2. Anomaly false-positive investigation — Documented, not fixed
+
+The operator asked why pirewall might classify benign traffic as anomalous.
+Investigated by reading the actual inference/scoring code and shipped model
+metadata rather than speculating. Ranked, code-verified causes:
+
+1. **The Isolation Forest boundary was calibrated against CICIDS2017's own
+   training distribution, not the operator's live network, and even there
+   it has a measured ~7-10% false-positive rate.** The shipped artifact's
+   `isolation_forest_model.joblib.metadata.json` records
+   `evaluation_metrics.false_positive_rate: 0.0987` — roughly 1 in 10
+   flows from the *training* distribution itself score anomalous, before
+   any distribution shift to a different network is considered. No file
+   in the repository documents a live-Pi/live-home-network validation run;
+   every FPR/precision/recall number on record is against a held-out split
+   of the same training dataset (`docs/ML_DATA_AUDIT.md`,
+   `docs/ML_PIPELINE.md`).
+2. **`AnomalyEvidence.is_anomaly` is computed and visible in
+   Detections/Events regardless of whether it is ever enforced.**
+   `pirewall/detection/anomaly.py` sets `is_anomaly = score < threshold`
+   unconditionally; the B3 evidence-maturity gate (ADDENDUM_2.md B3) only
+   caps `BLOCK`/`RATE_LIMIT` *actions* for immature evidence, it does not
+   suppress the flag itself. An operator in the default `SHADOW` mode can
+   see "anomalous" flows logged even though nothing was ever blocked.
+   Separately, `_overall_confidence()` in `pirewall/engine/threat.py`
+   assigns a flat 0.7 confidence to *any* `is_anomaly=True` result,
+   regardless of how close the raw score was to the threshold — a
+   borderline false positive reads as equally "confident" as an extreme
+   outlier.
+3. **Anomaly evidence alone is weighted low (15/100,
+   `config/default_config.toml`'s `anomaly_weight`) and cannot reach even
+   `low_threshold` (25) by itself** — confirmed by a code comment in
+   `pirewall/engine/scoring.py` stating this explicitly. A benign flow
+   flagged `is_anomaly=True` cannot alone reach MEDIUM/HIGH threat level;
+   if elevated threat *levels* (not just the anomaly flag) are being
+   observed on benign traffic, `behavior_contribution`
+   (`config/default_config.toml`'s pattern thresholds, e.g.
+   `repeated_connections_threshold`) combining with the anomaly flag is
+   the more likely driver and worth checking separately.
+4. **`anomaly_score_threshold` (`config/default_config.toml`) is a single
+   static `0.0`, with no adaptive/self-tuning mechanism anywhere in
+   `pirewall/detection/` or `pirewall/ml/inference/`** — the only
+   operator-facing knob for reducing false positives on a specific
+   deployment, and it is not recalibrated against observed traffic
+   automatically.
+5. **Unverified, stated honestly rather than guessed**: which features
+   actually drive the Isolation Forest's boundary is not confirmed by any
+   feature-importance audit in this repository (`docs/ML_DATA_AUDIT.md`'s
+   §A4 audit covers LightGBM's gain importance only). Whether a home LAN's
+   timing/rate characteristics differ enough from CICIDS2017's 2017
+   campus-network capture to be the dominant driver is a plausible
+   inference from LightGBM's documented feature importance, not a
+   measurement taken against Isolation Forest specifically.
+
+**Not fixed in this session, deliberately**: no config default was changed
+(`anomaly_weight`, `anomaly_score_threshold`, `contamination`) — CLAUDE.md
+is explicit that safety-relevant defaults are not to be quietly changed,
+and recalibrating a model boundary without real traffic to validate against
+would be guessing, not fixing. **What a human should do**: run the
+SHADOW-mode observation window the Pi deployment go/no-go checklist above
+already calls for, specifically watching the Detections/Events sections'
+anomaly flags against known-benign traffic, and use that real data (not
+this session's synthetic/dataset-split numbers) to decide whether
+`anomaly_score_threshold` needs a deployment-specific override.
+
+### 3. Control-panel dashboard UI update — Tested
+
+`pirewall/web/render.py` and `tests/unit/test_web_render.py` only; no other
+module touched, no new API routes, no new RPC operations. `render.py`
+remains read-only per its own module docstring and the pinned
+`test_render_module_cannot_invoke_any_rpc_action` test (still passing
+unmodified).
+
+- **Help dialog.** A `ⓘ Help` button (`_help_button()`) opens a native
+  `<dialog>` (`_help_dialog()`) with two static tables built from new
+  `_HELP_SECTIONS`/`_HELP_SCENARIOS` constants: what each of the 9
+  dashboard sections shows, and a "if you want to&hellip; / do this"
+  scenario table covering rule approval, allowlisting, the kill-switch,
+  the shadow log, disabling/removing a bad rule, and the new
+  collapse/export/clear-view controls themselves. All content is static
+  (no operator/evidence data), so it does not need the `data-`-attribute
+  escaping discipline the rest of the file follows for dynamic values.
+- **Collapsible panels.** Every section is now wrapped by a new `_panel()`
+  helper into `<div class="panel">` with an always-visible toolbar
+  (`<h2>` + controls) and a collapsible `.panel-body`. The heading was
+  deliberately moved *out* of each `_render_*_section()` function and into
+  the toolbar — an earlier version of this change left the heading inside
+  the collapsible body, so a collapsed panel lost its own label; caught by
+  testing the actual rendered page in a browser (see below), not just unit
+  tests, and fixed by threading a `title` argument through `_panel()`
+  instead.
+- **Export CSV.** Every panel gets an `Export CSV` button
+  (`exportPanel()` in the client-side script): reads the panel's own
+  `<table>` DOM directly (respecting currently-hidden rows) and downloads
+  it as a CSV via a `Blob` + temporary `<a download>`. No backend
+  endpoint needed — the data is already in the rendered page.
+- **Clear view.** Only the four genuinely log-shaped, Time-first-column
+  sections (Detections, Threats, Shadow log, Events — gated by `_panel()`'s
+  `loggy` parameter) get a `Clear view` button. **Deliberately
+  non-destructive by design**: it records a per-browser cutoff timestamp in
+  `localStorage` and hides rows at or before it; it does **not** delete
+  anything server-side. This was a considered choice, not an oversight —
+  pirewall is a security product, and a "clear logs" button that actually
+  deleted `SecurityEvent`/`DetectionRecord`/`ThreatAssessment` history
+  server-side would need a new destructive RPC operation and would
+  undermine the audit trail A1's shadow-log design depends on. Confirmed
+  via `confirm()` (matching the existing kill-switch pattern) before
+  hiding anything.
+- **Incidental fix, found while browser-testing this exact change, not
+  otherwise in scope**: `_page()` never declared `<meta charset="utf-8">`.
+  `HTMLResponse` sets the header in production, so this was latent, not a
+  live bug — but the page already emitted raw non-ASCII characters (em
+  dashes in existing `<h2>` text) with nothing declaring the encoding if
+  served any other way. Found because a bare local file server (used to
+  browser-test this change) mojibake'd the new ⓘ/→ characters; fixed by
+  adding the meta tag to `_page()`'s `<head>`.
+
+**Tested**: 3 new tests in `tests/unit/test_web_render.py` —
+`test_dashboard_has_a_help_button_and_dialog`,
+`test_panels_have_collapse_and_export_controls`,
+`test_only_log_shaped_panels_get_a_clear_view_control` — plus all 12
+pre-existing tests re-run unmodified and still passing (heading-substring
+checks, XSS-escaping, the `data-action`-not-inline-JS pinned security
+property, the RPC-isolation structural check). **Also verified by hand**,
+not just unit-tested: rendered a real dashboard page with fixture data
+(active/pending/shadowed rules, events, threats, detections, allowlist,
+capture stats) and drove it in an actual Chrome tab — help dialog opens
+and renders both tables correctly with working arrows/em-dashes, every
+panel's Collapse/Expand toggles the table while keeping its heading
+visible, Export CSV triggers a real download with no console errors.
+Full suite after this section: **643 passed, 24 skipped, 0 failed**;
+`ruff check .` and `pyright --strict` clean.
+
+**Not built, deliberately**: no backend log-clearing/deletion endpoint (see
+"Clear view" above); no change to `anomaly_weight`/`anomaly_score_threshold`
+config defaults (see section 2). This session's dashboard work only touched
+`pirewall/web/render.py` and its test file — done in an isolated git
+worktree specifically to avoid colliding with a concurrently-running sibling
+session also working in this repository.

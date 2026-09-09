@@ -9,6 +9,7 @@ of its test coverage — lives here.
 
 from collections.abc import Callable
 from datetime import UTC, datetime
+from ipaddress import AddressValueError, IPv4Address
 from typing import Any, ClassVar
 
 from pydantic import BaseModel, ValidationError
@@ -19,6 +20,7 @@ from pirewall.core.models.allowlist import AllowlistEntry
 from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.status import StatusResult
 from pirewall.firewall.manager import FirewallManager
+from pirewall.ipc.portal_service import PortalService
 from pirewall.ipc.protocol import RpcOperation, RpcRequest, RpcResponse
 from pirewall.ipc.state import CoreStateStore
 
@@ -40,11 +42,15 @@ class CoreRpcDispatcher:
         manager: FirewallManager,
         config: PirewallConfig,
         now_fn: Callable[[], datetime] = lambda: datetime.now(UTC),
+        portal: PortalService | None = None,
     ) -> None:
         self._state = state
         self._manager = manager
         self._config = config
         self._now_fn = now_fn
+        # `None` when `portal.enabled` is false. The admin-side portal
+        # operations then report that plainly instead of half-working.
+        self._portal = portal
 
     def handle(self, request: RpcRequest) -> RpcResponse:
         try:
@@ -129,12 +135,39 @@ class CoreRpcDispatcher:
         return _dump_list(list(self._manager.allowlist))
 
     def _add_allowlist_entry(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Add an allowlist entry, optionally provisioning a portal account alongside it.
+
+        ADDENDUM_3.md C3: an allowlist entry is a CIDR and a portal account
+        is a credential, so the mapping is not one-to-one — a gateway or a
+        printer belongs on the allowlist and can never log in. The username
+        is therefore optional. When supplied, the account is created with a
+        generated password returned **once**, in this response, for the
+        control panel to show the admin; it is never stored in the clear
+        and never appears in an event or a log line.
+        """
+        # Copy rather than pop: the caller owns `params`, and
+        # `AllowlistEntry` forbids extra fields, so the username has to
+        # come out before validation.
+        portal_username = params.get("portal_username")
+        entry_fields = {key: value for key, value in params.items() if key != "portal_username"}
         try:
-            entry = AllowlistEntry.model_validate(params)
+            entry = AllowlistEntry.model_validate(entry_fields)
         except ValidationError as exc:
             raise _RpcError(f"invalid allowlist entry: {exc}") from exc
         self._manager.add_allowlist_entry(entry)
-        return _dump(entry)
+        payload = _dump(entry)
+        if isinstance(portal_username, str) and portal_username.strip():
+            if self._portal is None:
+                raise _RpcError("cannot provision a portal user: the captive portal is disabled")
+            _user, generated = self._portal.add_user(
+                username=portal_username.strip(),
+                password=None,
+                created_by=entry.created_by,
+                note=f"provisioned with allowlist entry {entry.target}",
+            )
+            payload["portal_username"] = portal_username.strip()
+            payload["portal_password"] = generated
+        return payload
 
     def _remove_allowlist_entry(self, params: dict[str, Any]) -> bool:
         return self._manager.remove_allowlist_entry(_require_str(params, "entry_id"))
@@ -142,6 +175,46 @@ class CoreRpcDispatcher:
     def _kill_switch(self, _params: dict[str, Any]) -> dict[str, Any]:
         event = self._manager.revert_to_base(self._now_fn())
         return _dump(event)
+
+    def _portal_list_users(self, _params: dict[str, Any]) -> list[dict[str, Any]]:
+        return _dump_list(list(self._require_portal().list_users()))
+
+    def _portal_add_user(self, params: dict[str, Any]) -> dict[str, Any]:
+        password = params.get("password")
+        user, generated = self._require_portal().add_user(
+            username=_require_str(params, "username"),
+            password=password if isinstance(password, str) and password else None,
+            created_by=_require_str(params, "created_by"),
+            note=_optional_str(params, "note"),
+        )
+        return {"user": _dump(user), "generated_password": generated}
+
+    def _portal_set_password(self, params: dict[str, Any]) -> dict[str, Any]:
+        password = params.get("password")
+        user, generated = self._require_portal().set_password(
+            _require_str(params, "username"),
+            password if isinstance(password, str) and password else None,
+        )
+        return {"user": _dump(user), "generated_password": generated}
+
+    def _portal_remove_user(self, params: dict[str, Any]) -> bool:
+        return self._require_portal().remove_user(_require_str(params, "username"))
+
+    def _portal_list_sessions(self, _params: dict[str, Any]) -> list[dict[str, Any]]:
+        return _dump_list(list(self._require_portal().list_sessions()))
+
+    def _portal_force_logout(self, params: dict[str, Any]) -> bool:
+        raw = _require_str(params, "client_ip")
+        try:
+            client_ip = IPv4Address(raw)
+        except (AddressValueError, ValueError) as exc:
+            raise _RpcError(f"invalid client_ip: {raw!r}") from exc
+        return self._require_portal().force_logout(client_ip)
+
+    def _require_portal(self) -> PortalService:
+        if self._portal is None:
+            raise _RpcError("the captive portal is disabled (set portal.enabled in the config)")
+        return self._portal
 
     def _record_event(self, params: dict[str, Any]) -> dict[str, Any]:
         """Let pirewall-api report events (e.g. AUTHENTICATION_FAILURE) into the shared audit trail.
@@ -176,11 +249,23 @@ class CoreRpcDispatcher:
         RpcOperation.REMOVE_ALLOWLIST_ENTRY: _remove_allowlist_entry,
         RpcOperation.KILL_SWITCH: _kill_switch,
         RpcOperation.RECORD_EVENT: _record_event,
+        RpcOperation.PORTAL_LIST_USERS: _portal_list_users,
+        RpcOperation.PORTAL_ADD_USER: _portal_add_user,
+        RpcOperation.PORTAL_SET_PASSWORD: _portal_set_password,
+        RpcOperation.PORTAL_REMOVE_USER: _portal_remove_user,
+        RpcOperation.PORTAL_LIST_SESSIONS: _portal_list_sessions,
+        RpcOperation.PORTAL_FORCE_LOGOUT: _portal_force_logout,
     }
 
 
 class _RpcError(Exception):
     """Raised by a handler for an expected, user-facing failure (bad params, not found)."""
+
+
+def _optional_str(params: dict[str, Any], key: str) -> str:
+    """A string parameter that may be absent, empty, or the wrong type — all read as empty."""
+    value = params.get(key)
+    return value if isinstance(value, str) else ""
 
 
 def _require_str(params: dict[str, Any], key: str) -> str:

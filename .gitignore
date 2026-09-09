@@ -64,3 +64,9 @@ config/local_config.toml
 # substituted from config/local_config.toml, never applied automatically
 # and never committed (spec §21).
 deploy/rendered/
+
+# Rollback snapshots taken during deployment. These hold a copy of
+# config/local_config.toml (which carries the admin password hash) and any
+# backed-up service config, so they are local-only by construction — the
+# same reason config/local_config.toml itself is ignored.
+deploy/rollback/

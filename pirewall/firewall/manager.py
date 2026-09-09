@@ -20,8 +20,10 @@ ACTIVE -> EXPIRED | DISABLED | REMOVED (incl. kill-switch, A8)
 """
 
 import contextlib
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from ipaddress import IPv4Address, IPv4Network
 
 from pirewall.config.models import PirewallConfig
 from pirewall.core.enums import (
@@ -186,6 +188,63 @@ class FirewallManager:
                 del self._allowlist[index]
                 return True
         return False
+
+    def authorize_portal_client(self, client_ip: IPv4Address, timeout_seconds: int) -> None:
+        """Authorize a logged-in captive-portal client for forwarding (ADDENDUM_3.md C2).
+
+        Routed through this manager for the same reason every rule is: it
+        holds the only reference to the backend (CLAUDE.md, "exactly one
+        authorized code path may deploy to the firewall backend"). The
+        portal process cannot reach the backend, and neither can the
+        dispatcher that serves it — both go through here.
+
+        This is deliberately *not* a `FirewallRule`. It creates no rule, has
+        no `RuleStatus`, runs no validation chain, and does not consume the
+        A3 rate cap: it authorizes an address the admin's own user store
+        already vouched for, which is the opposite of an ML-driven
+        restriction. The safety properties the validation chain exists to
+        guarantee (§24) are about restrictive rules being too broad; an
+        additive portal grant scoped to one /32 cannot lock anyone out.
+        """
+        if client_ip not in self._config.network.protected_network:
+            # A portal grant only ever means "this LAN client logged in".
+            # Refusing anything off the protected network keeps a confused
+            # or hostile caller from authorizing a WAN address.
+            raise FirewallError(
+                f"refusing to authorize {client_ip}: not inside the protected network "
+                f"{self._config.network.protected_network}"
+            )
+        self.__backend.authorize_portal_client(client_ip, timeout_seconds)
+
+    def deauthorize_portal_client(self, client_ip: IPv4Address) -> None:
+        """Revoke a portal client's forwarding authorization. Idempotent."""
+        self.__backend.deauthorize_portal_client(client_ip)
+
+    def authorized_portal_clients(self) -> frozenset[IPv4Address]:
+        """Addresses the kernel currently has authorized. Empty set if the backend is unreachable.
+
+        Swallows `FirewallError` for the same reason `backend_health` does:
+        the control panel asking "who is online" must always get an answer,
+        and fail-open (ADDENDUM.md A6) means a down backend is reported, not
+        raised into the caller.
+        """
+        try:
+            return self.__backend.list_portal_clients()
+        except FirewallError:
+            return frozenset()
+
+    def restrictive_rules_matching(self, client_ip: IPv4Address) -> list[FirewallRule]:
+        """Active BLOCK/RATE_LIMIT rules that actually target `client_ip`.
+
+        This is how a blocked LAN client gets told *why* their network died
+        (ADDENDUM_3.md C4). Scanning on demand rather than pushing an event
+        at the portal keeps the two sides uncoupled and cannot miss a
+        transition; it is an O(active rules) walk, bounded by
+        `firewall.max_active_rules`.
+        """
+        return rules_targeting(
+            self.active_rules(), client_ip, self._config.network.protected_network
+        )
 
     def register_decision(self, decision: FirewallDecision) -> None:
         """Record that `decision` came from the real decision engine (spec §24 authorization stage)."""
@@ -376,3 +435,39 @@ class FirewallManager:
         self, rule_id: str, from_status: RuleStatus | None, to_status: RuleStatus, at: datetime, reason: str
     ) -> None:
         self._transitions.append(RuleTransition(rule_id, from_status, to_status, at, reason))
+
+
+def rules_targeting(
+    rules: Iterable[FirewallRule], client_ip: IPv4Address, protected_network: IPv4Network
+) -> list[FirewallRule]:
+    """Which of `rules` restrict `client_ip` specifically (ADDENDUM_3.md C4).
+
+    A module-level function, not a method, because it is pure: it is the
+    predicate behind the portal's "am I blocked?" answer, and being able to
+    test it against an arbitrary rule list — including shapes the validation
+    chain currently prevents — is worth more than keeping it private.
+
+    "Targets" means a side of the rule *names LAN addresses* and covers this
+    client, not merely that some side's network contains it. A plain
+    containment check reads a rule like
+    `source=<some other client>/32 destination=0.0.0.0/0` as blocking
+    everybody, because every address is inside `0.0.0.0/0` — so one
+    misbehaving device would show the malicious-activity notice to every
+    client on the network. Spec §24's safety validation refuses `0.0.0.0/0`
+    today, so the adaptive pipeline cannot currently produce that shape; this
+    is deliberately defensive about it anyway, because the cost of being
+    wrong is telling innocent users they are infected.
+
+    An exactly-equal network still counts: a rule against the whole
+    protected LAN does target every client on it.
+    """
+    restrictive = {FirewallAction.BLOCK, FirewallAction.RATE_LIMIT}
+
+    def targets(network: IPv4Network) -> bool:
+        return client_ip in network and network.subnet_of(protected_network)
+
+    return [
+        rule
+        for rule in rules
+        if rule.action in restrictive and (targets(rule.source) or targets(rule.destination))
+    ]

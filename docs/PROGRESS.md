@@ -18,7 +18,46 @@ Environment-dependent / Not yet validated.
 | 8 | Raspberry Pi hardening, deployment & integrations (Wazuh/Netdata) | Complete | See detailed notes below. |
 | 9 | Security/integration testing, docs & final validation | Complete | See detailed notes below. |
 | — | Entry points & process runtime (`pirewall/main.py`, `pirewall/api/__main__.py`, `pirewall/runtime/`) | Complete | Not a numbered phase — the scoped follow-up the Phase 8 open question recommended. Tested: whole `CoreDaemon` end to end through every thread and the real `AF_UNIX` transport, the detection coordinator's ML-degradation paths, `sd_notify`, metrics, the event forwarder, rule expiry, both entry points' validation, `/config` redaction, the SSE stream (61 new tests, 472 total). Also verified by hand: both processes running together over real TLS and a real socket. Three defects found by running the code, each fixed with a regression test. Environment-dependent: `AF_PACKET`, `nft`, systemd supervision. See `docs/DEPLOYMENT_COMPLETE.md`. |
+| 10 | LAN captive portal, user accounts & local console (ADDENDUM_3.md C1–C6) | Complete | Tested: the portal privilege boundary (structural + behavioural + over the real `AF_UNIX` transport), the user store (round-trip, 0600, atomic replace, timing-equalised verification, corrupt-file refusal), session binding/expiry/bounding, the login throttle, the nft grant through `FirewallManager`, `rules_targeting`, both DHCP regressions in `base.nft.template`, the section-aware systemd check, and the whole sign-in→keepalive→countdown→block→auto-logout flow end to end (141 new tests, 812 total). Also **verified on the real Pi**: both sockets bound in their correct separate groups, a real sign-in adding a kernel-expiring `@authed` element, sign-out removing it, and the three-table `forward`-hook ordering. Environment-dependent: the blocked-client notice on real hardware needs a genuine detection event (spec §34 attack lab) — the path itself is covered end to end against the validated rule pipeline in `tests/integration/test_portal_flow.py`. Known limitation, not a defect: the portal serves plaintext HTTP (ADDENDUM_3.md C5). Three latent defects found and fixed — see below. |
 | — | Setup tooling (`scripts/deployment/configure.py`, `discovery.py`, `make_certs.sh`, `docs/SETUP.md`) | Complete | Network layout detected from `ip -j` instead of retyped; Admin PC and password asked for, never guessed. Tested: 35 tests over discovery parsing (captured `ip -j` fixtures), config generation and validate-then-write, the Admin-PC prompt, and `--set-admin-pc` as a targeted edit. Also run for real against a stubbed `ip` reproducing a Pi 4 gateway, end to end through both entry points and real TLS 1.3. Environment-dependent: `ip -j` output from a real Pi (fixtures are captured, not synthesized from imagination — but no Pi was available to confirm). |
+
+
+### Phase 10 defects found (2026-09-09)
+
+Three faults in code that predates this phase, all found by deploying it for
+real on the Pi rather than by reading. Each is fixed with a regression test.
+
+| # | Defect | Severity | How it surfaced |
+|---|--------|----------|-----------------|
+| 1 | `base.nft.template` accepted DHCP with `ip saddr ${PROTECTED_NETWORK} udp dport 67`, which cannot match a `DHCPDISCOVER` — that arrives from `0.0.0.0`. Under the chain's `policy drop`, **no new LAN client could ever get a lease**, while renewals from already-addressed clients kept working, so it would have read as intermittent. | High | Reading the template against this Pi's live setup before loading it. The ruleset had never been loaded on any deployment. |
+| 2 | The same chain had no `udp dport 68` accept, so the reply to the Pi's **own WAN lease renewal** could be dropped and the upstream address silently lost — hours or days after a deploy that looked fine. | High | Same review. |
+| 3 | `StartLimitIntervalSec=`/`StartLimitBurst=` sat under `[Service]` in all three unit templates. systemd reads them only in `[Unit]` and ignores them elsewhere, so **A6's crash-loop bound was never armed** — every unit looked like it bounded its own restart loop while restarting forever. | Medium | `systemd-analyze verify` on the new portal unit warned about it, and the same warning appeared for the two existing units. Confirmed by the limiter then actually firing during bring-up. |
+
+Also found **on the deployment rather than in the repository**: a
+hand-written `/etc/logrotate.d/pirewall` used `create 0640 pirewall pirewall`
+— a user neither service runs as — so after the first rotation both daemons
+lost file logging and fell back to stderr. pirewall already rotates its own
+logs via `RotatingFileHandler` bounded by `logging.max_bytes`/`backup_count`,
+so the drop-in was redundant as well as harmful. Removed (backed up to
+`deploy/rollback/`), ownership repaired, and
+`deploy/systemd/pirewall-tmpfiles.conf` now documents why not to add one.
+
+Two design decisions worth recording, both made because the obvious
+implementation was wrong:
+
+- **The portal socket needed its own directory, not just its own group.** A
+  directory at mode `0750` gates traversal by *its* group whatever the
+  socket's permissions say, so a second socket inside `/run/pirewall` would
+  have forced either `pirewall-portal` into `pirewall-ipc` (handing the
+  LAN-facing process the kill switch, defeating the split) or the directory
+  to `0751`. Solved with a separate **setgid** directory via `tmpfiles`, so
+  the socket inherits the right group on `bind()`.
+- **pirewall-core cannot `chown`.** Its own `SystemCallFilter=~@privileged`
+  includes the chown family — correctly. The first implementation chgrp-ed
+  the socket and failed at startup with `EPERM`. Relaxing the filter on the
+  most privileged process on the box would have been a poor trade for one
+  directory setting, so the server now *verifies* the group and refuses to
+  serve on a mismatch instead.
 
 ### Audit pass (post-Phase 9)
 

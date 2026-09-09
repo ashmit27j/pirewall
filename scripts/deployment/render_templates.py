@@ -39,6 +39,8 @@ def substitution_mapping(config: PirewallConfig) -> dict[str, str]:
         "UPSTREAM_GATEWAY": str(config.network.upstream_gateway),
         "ADMIN_PC_IP": str(config.admin.admin_pc_ip),
         "API_PORT": str(config.api.port),
+        "PIREWALL_LAN_IP": str(config.network.pirewall_lan_ip),
+        "PORTAL_PORT": str(config.portal.listen_port),
     }
 
 

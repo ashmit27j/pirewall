@@ -54,7 +54,12 @@ def require_admin_pc(request: Request, config: ConfigDep) -> None:
     """Spec §29: restrict administrative access to the configured Admin PC IP."""
     client_host = request.client.host if request.client else None
     try:
-        enforce_admin_pc_ip(client_host, str(config.admin.admin_pc_ip), config.security.restrict_to_admin_pc)
+        enforce_admin_pc_ip(
+            client_host,
+            str(config.admin.admin_pc_ip),
+            config.security.restrict_to_admin_pc,
+            config.admin.allow_local_console,
+        )
     except AuthenticationError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
@@ -110,7 +115,7 @@ def create_app(
     """
     # Import routers lazily to keep any accidental heavy/forbidden import
     # (ADDENDUM.md A4) local to this one function, easy to spot in review.
-    from pirewall.api.routes import allowlist, events_stream, firewall, health, read, rules
+    from pirewall.api.routes import allowlist, events_stream, firewall, health, portal, read, rules
     from pirewall.api.routes import auth as auth_routes
     from pirewall.api.routes import config as config_routes
     from pirewall.web import routes as web_routes
@@ -147,6 +152,7 @@ def create_app(
     app.include_router(rules.router, dependencies=protected)
     app.include_router(allowlist.router, dependencies=protected)
     app.include_router(firewall.router, dependencies=protected)
+    app.include_router(portal.router, dependencies=protected)
     app.include_router(web_routes.public_router, dependencies=admin_pc_only)
     app.include_router(web_routes.protected_router, dependencies=protected)
 

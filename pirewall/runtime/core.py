@@ -100,9 +100,12 @@ from pirewall.flow.key import FlowKey, compute_flow_key
 from pirewall.integration.netdata import NetdataExporter, StatsdNetdataTransport
 from pirewall.integration.wazuh import SyslogWazuhTransport, WazuhForwarder
 from pirewall.ipc.dispatcher import CoreRpcDispatcher
+from pirewall.ipc.portal_dispatcher import PortalRpcDispatcher
+from pirewall.ipc.portal_service import PortalService
 from pirewall.ipc.protocol import RpcRequest, RpcResponse
 from pirewall.ipc.server import UnixSocketRpcServer
 from pirewall.ipc.state import CoreStateStore
+from pirewall.portal.store import PortalUserStore
 from pirewall.runtime.forwarder import EventForwarder
 from pirewall.runtime.metrics import MetricsCollector, RuntimeCounters
 from pirewall.runtime.pipeline import FlowPipeline, PendingAnomalyScoring
@@ -188,8 +191,29 @@ class _SynchronizedDispatcher(CoreRpcDispatcher):
         state: CoreStateStore,
         manager: FirewallManager,
         config: PirewallConfig,
+        portal: PortalService | None = None,
     ) -> None:
-        super().__init__(state, manager, config)
+        super().__init__(state, manager, config, portal=portal)
+        self._lock = lock
+
+    def handle(self, request: RpcRequest) -> RpcResponse:
+        with self._lock:
+            return super().handle(request)
+
+
+class _SynchronizedPortalDispatcher(PortalRpcDispatcher):
+    """`PortalRpcDispatcher` under the same daemon lock, for the same reason.
+
+    Portal operations write `FirewallManager` (they add and remove nft set
+    elements) and read its rule table, both of which the detection thread is
+    also touching. Serializing on the daemon's one lock keeps a login atomic
+    with respect to a rule being deployed against the same address — which
+    matters, because those two racing is exactly the case where a blocked
+    device could otherwise be handed a working session.
+    """
+
+    def __init__(self, lock: AbstractContextManager[bool], service: PortalService) -> None:
+        super().__init__(service)
         self._lock = lock
 
     def handle(self, request: RpcRequest) -> RpcResponse:
@@ -314,9 +338,32 @@ class CoreDaemon:
             ),
         )
         self._flow_queue: queue.Queue[Flow] = queue.Queue(maxsize=flow_queue_max)
+        # Captive portal (ADDENDUM_3.md C1). `None` when disabled, so a
+        # deployment that does not want a portal pays nothing for it: no
+        # user store is opened, no second socket is bound, no thread runs.
+        self._portal: PortalService | None = None
+        self._portal_rpc_server: UnixSocketRpcServer | None = None
+        if config.portal.enabled:
+            self._portal = PortalService(
+                config=config,
+                manager=self._manager,
+                store=PortalUserStore(config.portal.user_store_path),
+                on_event=self._forwarder.emit,
+            )
+            # A *second* socket, in its own group, serving a dispatcher with
+            # four operations. pirewall-portal is a member of only this
+            # socket's group, so a compromise of the LAN-facing process
+            # cannot reach the kill switch or mutate a rule — the structural
+            # reason this is two sockets and not one.
+            self._portal_rpc_server = UnixSocketRpcServer(
+                config.portal.rpc_socket_path,
+                _SynchronizedPortalDispatcher(self._lock, self._portal),
+                socket_group=config.portal.rpc_socket_group,
+            )
+
         self._rpc_server = UnixSocketRpcServer(
             config.api.rpc_socket_path,
-            _SynchronizedDispatcher(self._lock, self._state, self._manager, config),
+            _SynchronizedDispatcher(self._lock, self._state, self._manager, config, self._portal),
         )
         self._notifier = notifier or SystemdNotifier()
         self._metrics = MetricsCollector(
@@ -379,6 +426,12 @@ class CoreDaemon:
         self._rpc_server.start()
         _logger.info("RPC socket listening at %s", self._config.api.rpc_socket_path)
 
+        if self._portal_rpc_server is not None:
+            self._portal_rpc_server.start()
+            _logger.info(
+                "portal RPC socket listening at %s", self._config.portal.rpc_socket_path
+            )
+
         try:
             self._capture.start()
             self._capture_started = True
@@ -407,12 +460,22 @@ class CoreDaemon:
             )
 
         self._spawn("pirewall-rpc", lambda: self._rpc_server.serve_until_stopped(self._stop))
+        if self._portal_rpc_server is not None:
+            portal_server = self._portal_rpc_server
+            self._spawn(
+                "pirewall-portal-rpc", lambda: portal_server.serve_until_stopped(self._stop)
+            )
         self._spawn("pirewall-detection", self._detection_loop)
         self._spawn("pirewall-sweep", self._sweep_loop)
         if self._coordinator.models.isolation_forest is not None:
             self._spawn("pirewall-anomaly-inference", self._anomaly_inference_loop)
         if self._capture_started:
             self._spawn("pirewall-capture", self._capture_loop)
+
+        if self._portal is not None:
+            # Emitted at startup, every startup, for as long as the
+            # documented demo credentials still work (ADDENDUM_3.md C3).
+            self._portal.warn_about_demo_accounts()
 
         self._notifier.notify_ready(self._status_line())
         _logger.info(
@@ -512,6 +575,8 @@ class CoreDaemon:
 
         self._revert_ruleset_if_failing_open()
         self._rpc_server.stop()
+        if self._portal_rpc_server is not None:
+            self._portal_rpc_server.stop()
         _logger.info("pirewall-core stopped")
 
     def _revert_ruleset_if_failing_open(self) -> None:
@@ -953,6 +1018,7 @@ class CoreDaemon:
                 self._enqueue(completed)
                 self._enqueue_slow_clusters(clusters)
                 self._expire_rules(now)
+                self._expire_portal_sessions()
             except PirewallError as exc:
                 _logger.warning("sweep pass failed: %s", exc)
             except Exception:
@@ -973,6 +1039,22 @@ class CoreDaemon:
                         "slow-connection cluster queue full, dropped %d so far",
                         self._slow_clusters_dropped,
                     )
+
+    def _expire_portal_sessions(self) -> None:
+        """Retire lapsed portal sessions on the existing sweep cadence (ADDENDUM_3.md C2).
+
+        The kernel has already dropped each one's nft set element by the
+        time this runs — the element carries its own timeout, which is what
+        makes portal auto-logout cost nothing. This only keeps pirewall's
+        *view* honest, so the control panel does not list a session that
+        stopped forwarding minutes ago. No thread of its own, deliberately.
+        """
+        if self._portal is None:
+            return
+        with self._lock:
+            retired = self._portal.sweep()
+        if retired:
+            _logger.info("retired %d expired portal session(s)", retired)
 
     def _expire_rules(self, now: datetime) -> None:
         with self._lock:

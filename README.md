@@ -48,6 +48,8 @@ Full detail in `docs/ADDENDUM.md`.
 |---|---|
 | `docs/MASTER_SPEC.md` | The original, frozen specification. |
 | `docs/ADDENDUM.md` | Safety-oriented additions on top of the spec (wins on conflict). |
+| `docs/ADDENDUM_2.md` | Detection-timing additions: creation-time behaviour counters, slow-rate DoS, the evidence-maturity gate, Heartbleed, JA3. |
+| `docs/ADDENDUM_3.md` | The LAN captive portal: a third process behind a restricted second RPC socket, sessions as kernel-expiring nftables set elements, the LAN user store, and how a blocked client is told why. Newest — wins over all of the above. |
 | `docs/PROGRESS.md` | Phase-by-phase implementation status, with honest Implemented/Tested/Mocked/Environment-dependent/Not-yet-validated labels. |
 | `docs/ARCHITECTURE.md` | Pipeline diagram, module boundaries, dependency decisions. |
 | `docs/FEATURE_SCHEMA.md` | The canonical 29-feature schema, feature by feature. |
@@ -56,7 +58,7 @@ Full detail in `docs/ADDENDUM.md`.
 | `docs/API.md` | Every API endpoint, the auth model, the control panel. |
 | `docs/TESTING.md` | How to run each test tier, the Protocol+Fake pattern, what's Fake vs. real-hardware-verified. |
 | `docs/SECURITY.md` | Hardening, the two-process privilege split, threat model, resource-exhaustion protections. |
-| `docs/SETUP.md` | The ordered, copy-paste setup path, plus how to change the Admin PC or the password afterwards. Start here. |
+| `docs/SETUP.md` | The ordered, copy-paste setup path: install, configure, go live, turn on the captive portal, and start Wazuh/Netdata on the Admin PC (with and without Docker). Start here. |
 | `docs/DEPLOYMENT.md` | The reasoning behind each setup step: OS choices, hardening, network templates, Wazuh/Netdata, updates. |
 | `docs/DEPLOYMENT_COMPLETE.md` | What the two service entry points do, what was verified and how, and what a human still has to check on the Pi. |
 | `docs/DEVELOPMENT_WORKFLOW.md` | The per-subsystem development loop this project follows. |
@@ -68,7 +70,7 @@ Three machines are involved, with different requirements:
 | Role | Platform | Notes |
 |---|---|---|
 | **Enforcement box** | Raspberry Pi 4, **64-bit** Raspberry Pi OS | 4 GB is comfortable — a full flow table measures ~93 MiB against a 768 MiB unit cap. arm64 is required: `numpy`/`scipy`/`scikit-learn`/`lightgbm` ship `aarch64` wheels but not 32-bit `armv7l`. |
-| **Admin PC** | Any Linux (Arch/Omarchy, Debian, Fedora…) | Runs Wazuh and Netdata and views the control panel. Both integrations are plain network protocols (TCP syslog, UDP StatsD), so nothing is distro-specific — see `docs/DEPLOYMENT.md` §8, which includes Arch notes since Wazuh has no official Arch package. |
+| **Admin PC** | Any Linux (Arch/Omarchy, Debian, Fedora, Kali…) | Runs Wazuh and Netdata and views the control panel. **Kali needs Docker** — Wazuh publishes no Kali packages; see `docs/SETUP.md`. Both integrations are plain network protocols (TCP syslog, UDP StatsD), so nothing is distro-specific — see `docs/DEPLOYMENT.md` §8, which includes Arch notes since Wazuh has no official Arch package. |
 | **Development** | Linux or macOS | The full suite runs on both. The Linux-only modules (`AFPacketCapture`, `NftablesBackend`) import cleanly everywhere and are exercised through their `Fake` counterparts; the `AF_UNIX` RPC transport is genuinely tested on any POSIX host. Windows can run most of the suite but skips the socket tests. |
 
 **Python 3.12+ is required**, and on the Pi it must come from `uv`, not

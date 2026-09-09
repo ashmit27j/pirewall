@@ -38,6 +38,25 @@ class RpcOperation(StrEnum):
     KILL_SWITCH = "kill_switch"
     RECORD_EVENT = "record_event"
 
+    # Captive portal (ADDENDUM_3.md C1). Split across two dispatchers, not
+    # two enums: `PortalRpcDispatcher` (served on `portal.rpc_socket_path`,
+    # reachable by the LAN-facing pirewall-portal process) implements only
+    # the four client-facing operations below. The admin-side operations
+    # after them are implemented by `CoreRpcDispatcher` alone, on
+    # `api.rpc_socket_path`, and are unreachable from the portal process
+    # because its dispatcher has no handler for them at all.
+    PORTAL_STATUS = "portal_status"
+    PORTAL_LOGIN = "portal_login"
+    PORTAL_KEEPALIVE = "portal_keepalive"
+    PORTAL_LOGOUT = "portal_logout"
+
+    PORTAL_LIST_USERS = "portal_list_users"
+    PORTAL_ADD_USER = "portal_add_user"
+    PORTAL_SET_PASSWORD = "portal_set_password"
+    PORTAL_REMOVE_USER = "portal_remove_user"
+    PORTAL_LIST_SESSIONS = "portal_list_sessions"
+    PORTAL_FORCE_LOGOUT = "portal_force_logout"
+
 
 class RpcRequest(BaseModel):
     """One RPC call: a closed-set operation name plus its (operation-specific) parameters."""

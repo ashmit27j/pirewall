@@ -21,7 +21,7 @@ human needs to do to verify it.
 import json
 import subprocess
 from collections.abc import Mapping
-from ipaddress import IPv4Network
+from ipaddress import IPv4Address, IPv4Network
 from typing import cast
 
 from pirewall.core.enums import FirewallAction, Protocol
@@ -33,6 +33,15 @@ _FAMILY = "inet"
 _TABLE = "pirewall"
 _CHAIN = "adaptive"
 _COMMENT_PREFIX = "pirewall-rule:"
+
+# The captive portal's authorized-client set (ADDENDUM_3.md C2). A separate
+# table from `pirewall` (adaptive rules) and `pirewall_base` (static posture)
+# so a portal bug cannot corrupt either, and so `nft delete table` on any one
+# of the three leaves the others standing. The table and set are declared in
+# `deploy/firewall/portal.nft.template`; this backend only adds and removes
+# *elements*, never the chains that reference them.
+_PORTAL_TABLE = "pirewall_portal"
+_PORTAL_SET = "authed"
 
 _PROTOCOL_PAYLOAD_NAME = {Protocol.TCP: "tcp", Protocol.UDP: "udp"}
 
@@ -117,6 +126,95 @@ class NftablesBackend:
             return True
         except FirewallError:
             return False
+
+    def authorize_portal_client(self, client_ip: IPv4Address, timeout_seconds: int) -> None:
+        """Add `client_ip` to `pirewall_portal`'s `authed` set with a kernel-side timeout.
+
+        `timeout` is expressed in nft's own units ("1800s"); the kernel
+        removes the element when it lapses, which is what makes portal
+        auto-logout cost nothing at runtime. Re-adding an address that is
+        already present refreshes its timeout, so a re-login extends a
+        session rather than failing.
+        """
+        if timeout_seconds <= 0:
+            raise FirewallError(f"portal session timeout must be positive, got {timeout_seconds}")
+        element: dict[str, object] = {
+            "elem": {"val": str(client_ip), "timeout": timeout_seconds},
+        }
+        payload = {
+            "nftables": [
+                {
+                    "add": {
+                        "element": {
+                            "family": _FAMILY,
+                            "table": _PORTAL_TABLE,
+                            "name": _PORTAL_SET,
+                            "elem": [element],
+                        }
+                    }
+                }
+            ]
+        }
+        try:
+            self._run_json(payload)
+        except FirewallError:
+            raise
+        except Exception as exc:  # never let an unexpected error look like success
+            raise FirewallError(f"failed to authorize portal client {client_ip}: {exc}") from exc
+
+    def deauthorize_portal_client(self, client_ip: IPv4Address) -> None:
+        """Remove `client_ip` from the portal set. Idempotent: an absent element is not an error."""
+        payload = {
+            "nftables": [
+                {
+                    "delete": {
+                        "element": {
+                            "family": _FAMILY,
+                            "table": _PORTAL_TABLE,
+                            "name": _PORTAL_SET,
+                            "elem": [str(client_ip)],
+                        }
+                    }
+                }
+            ]
+        }
+        try:
+            self._run_json(payload)
+        except FirewallError as exc:
+            # nft exits non-zero deleting an element that is not there. The
+            # contract is idempotent, and the element genuinely being gone
+            # (expired by the kernel a moment ago) is the common case, not
+            # an error worth propagating.
+            if "No such file or directory" in str(exc) or "does not exist" in str(exc):
+                return
+            raise
+
+    def list_portal_clients(self) -> frozenset[IPv4Address]:
+        """Addresses currently in the portal set, as the kernel sees them."""
+        result = self._run_command(["-j", "list", "set", _FAMILY, _PORTAL_TABLE, _PORTAL_SET])
+        try:
+            parsed: object = json.loads(result)
+        except json.JSONDecodeError as exc:
+            raise FirewallError(f"nft returned invalid JSON listing the portal set: {exc}") from exc
+        parsed_dict = _as_dict(parsed)
+        if parsed_dict is None:
+            return frozenset()
+        items = parsed_dict.get("nftables")
+        if not isinstance(items, list):
+            return frozenset()
+        addresses: set[IPv4Address] = set()
+        for entry in cast("list[object]", items):
+            entry_dict = _as_dict(entry)
+            if entry_dict is None:
+                continue
+            set_dict = _as_dict(entry_dict.get("set"))
+            if set_dict is None:
+                continue
+            for element in _as_list(set_dict.get("elem")):
+                address = _portal_element_address(element)
+                if address is not None:
+                    addresses.add(address)
+        return frozenset(addresses)
 
     def _find_handles_by_comment(self, comment: str) -> list[int]:
         handles: list[int] = []
@@ -269,3 +367,35 @@ def _build_add_commands(
             }
         )
     return commands
+
+
+def _as_list(value: object) -> list[object]:
+    """Narrow a JSON-decoded value to `list[object]`, or an empty list if it isn't one."""
+    return cast("list[object]", value) if isinstance(value, list) else []
+
+
+def _portal_element_address(element: object) -> IPv4Address | None:
+    """Pull the address out of one set element, in either shape nft emits.
+
+    A timeout-less element is a bare string (`"192.168.100.50"`); one with a
+    timeout is `{"elem": {"val": "192.168.100.50", "timeout": 1800, ...}}`.
+    Portal elements always carry a timeout, but reading both shapes means a
+    hand-added element does not make this return nonsense.
+    """
+    if isinstance(element, str):
+        return _parse_address(element)
+    element_dict = _as_dict(element)
+    if element_dict is None:
+        return None
+    inner = _as_dict(element_dict.get("elem"))
+    if inner is None:
+        return None
+    value = inner.get("val")
+    return _parse_address(value) if isinstance(value, str) else None
+
+
+def _parse_address(value: str) -> IPv4Address | None:
+    try:
+        return IPv4Address(value)
+    except ValueError:
+        return None

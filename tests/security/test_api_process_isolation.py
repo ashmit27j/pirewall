@@ -66,6 +66,52 @@ def test_web_package_never_imports_capture_or_firewall_internals() -> None:
     assert violations == [], f"forbidden imports under pirewall/web/: {violations}"
 
 
+def test_portal_package_never_imports_capture_or_firewall_internals() -> None:
+    """ADDENDUM_3.md C1: the same rule as `pirewall/api/`, for a stronger reason.
+
+    pirewall-portal is the process untrusted LAN clients actually talk to.
+    Everything under `pirewall/portal/` therefore imports only
+    `pirewall.core` and the RPC client; the core-side portal logic that
+    *does* need `FirewallManager` lives in `pirewall/ipc/portal_service.py`,
+    outside this tree, precisely so this assertion can hold.
+    """
+    package_root = Path(pirewall.__file__).resolve().parent
+    repo_root = package_root.parent
+    violations = _scan(package_root / "portal", repo_root)
+    assert violations == [], f"forbidden imports under pirewall/portal/: {violations}"
+
+
+def test_forbidden_modules_are_not_even_transitively_loaded_in_the_portal_process() -> None:
+    """The LAN-facing process must not have the privileged modules resident at all.
+
+    Same reasoning as the pirewall-api probe below, applied to the process
+    with the widest exposure: `pirewall.portal.app` is what
+    `python -m pirewall.portal` builds, so whatever it drags in is what a
+    compromise of the portal would find in memory.
+    """
+    probe = (
+        "import sys\n"
+        "import pirewall.portal.app\n"
+        "import pirewall.portal.routes\n"
+        f"forbidden = {_FORBIDDEN_PREFIXES!r}\n"
+        "leaked = sorted(m for m in sys.modules"
+        " if any(m == p or m.startswith(p + '.') for p in forbidden))\n"
+        "print(';'.join(leaked))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=Path(pirewall.__file__).resolve().parent.parent,
+    )
+    leaked = [name for name in result.stdout.strip().split(";") if name]
+    assert leaked == [], (
+        "pirewall-portal process transitively loaded forbidden modules "
+        f"{leaked} — see ADDENDUM_3.md C1"
+    )
+
+
 def test_forbidden_modules_are_not_even_transitively_loaded_in_the_api_process() -> None:
     """The AST checks above only see *direct* imports; this sees what actually gets loaded.
 

@@ -78,23 +78,83 @@ def test_management_access_restricted_to_admin_pc_placeholder() -> None:
         assert "${ADMIN_PC_IP}" in line, f"management access rule not scoped to Admin PC: {line!r}"
 
 
-def test_dns_and_dhcp_are_scoped_to_the_protected_network_not_the_admin_pc() -> None:
-    """DNS (port 53) and DHCP (port 67) are ordinary LAN services, not "management access".
+def test_dns_and_dhcp_are_scoped_to_the_lan_not_the_admin_pc() -> None:
+    """DNS (53) and DHCP (67/68) are ordinary LAN services, not "management access".
 
-    The Pi answers these for every client on the protected network, so
-    they are deliberately scoped to `${PROTECTED_NETWORK}` rather than
-    narrowed to the Admin PC — narrowing them to the Admin PC alone would
-    be a regression that breaks every other LAN client's DNS/DHCP, exactly
-    the failure mode this test guards against, in the opposite direction
-    from the management-access test above.
+    The Pi answers these for every client on the protected network, so they
+    are scoped to the LAN — by `${PROTECTED_NETWORK}` where a source address
+    is meaningful, or by `${LAN_INTERFACE}` where it is not (see the DHCP
+    test below). Narrowing them to the Admin PC would break every other LAN
+    client's DNS and DHCP, which is the failure mode this guards against,
+    in the opposite direction from the management-access test above.
     """
     text = _TEMPLATE_PATH.read_text(encoding="utf-8")
     body = _chain_body(text, "input")
-    service_lines = [line for line in _dport_accept_lines(body) if "53" in line or "67" in line]
+    service_lines = [
+        line for line in _dport_accept_lines(body) if "53" in line or "67" in line or "68" in line
+    ]
     assert service_lines, "expected explicit DNS/DHCP accept rules in the input chain"
     for line in service_lines:
-        assert "${PROTECTED_NETWORK}" in line, f"DNS/DHCP rule not scoped to the protected network: {line!r}"
+        assert "${PROTECTED_NETWORK}" in line or "${LAN_INTERFACE}" in line or "${WAN_INTERFACE}" in line, (
+            f"DNS/DHCP rule is not scoped to an interface or the protected network: {line!r}"
+        )
         assert "${ADMIN_PC_IP}" not in line, f"DNS/DHCP rule should not be Admin-PC-scoped: {line!r}"
+
+
+def test_dhcp_server_rule_is_interface_scoped_not_source_scoped() -> None:
+    """A DHCPDISCOVER comes from 0.0.0.0, so a source-scoped rule never matches it.
+
+    Regression test for a real fault in this template: it accepted DHCP with
+    `ip saddr ${PROTECTED_NETWORK} udp dport 67`, which cannot match a
+    client that does not yet have an address. Under the input chain's
+    `policy drop`, every *new* LAN client would have silently failed to get
+    a lease — while renewals from already-addressed clients kept working,
+    making it look intermittent rather than broken.
+    """
+    text = _TEMPLATE_PATH.read_text(encoding="utf-8")
+    body = _chain_body(text, "input")
+    dhcp_server_lines = [line for line in _dport_accept_lines(body) if "dport 67" in line]
+    assert dhcp_server_lines, "expected an explicit DHCP server accept rule in the input chain"
+    for line in dhcp_server_lines:
+        assert "${LAN_INTERFACE}" in line, f"DHCP server rule must be interface-scoped: {line!r}"
+        assert "saddr" not in line, (
+            f"DHCP server rule must not be source-scoped — DISCOVER comes from 0.0.0.0: {line!r}"
+        )
+
+
+def test_wan_dhcp_client_replies_are_accepted() -> None:
+    """Without a `udp dport 68` accept the Pi silently loses its WAN lease on renewal.
+
+    Regression test: the input chain's `policy drop` would discard the
+    DHCP reply to the Pi's own lease renewal on the WAN interface. The
+    failure appears hours or days after a deploy that looked fine, which is
+    exactly why it is worth pinning.
+    """
+    text = _TEMPLATE_PATH.read_text(encoding="utf-8")
+    body = _chain_body(text, "input")
+    lines = [line for line in _dport_accept_lines(body) if "dport 68" in line]
+    assert lines, "expected a `udp dport 68` accept so WAN DHCP renewals are not dropped"
+    assert any("${WAN_INTERFACE}" in line for line in lines), (
+        "the DHCP client rule should be scoped to the WAN interface"
+    )
+
+
+def test_captive_portal_is_reachable_by_every_lan_client() -> None:
+    """The portal must be reachable by LAN clients, including blocked ones (ADDENDUM_3.md C4).
+
+    A blocked device is told *why* over this path. Adaptive BLOCK rules live
+    on the `forward` hook, so they never affect it — but the input chain's
+    `policy drop` would, if the portal port were not explicitly accepted.
+    """
+    text = _TEMPLATE_PATH.read_text(encoding="utf-8")
+    body = _chain_body(text, "input")
+    lines = [line for line in _dport_accept_lines(body) if "${PORTAL_PORT}" in line]
+    assert lines, "expected an accept for ${PORTAL_PORT} in the input chain"
+    for line in lines:
+        assert "${LAN_INTERFACE}" in line, f"portal rule should be LAN-scoped: {line!r}"
+        assert "${ADMIN_PC_IP}" not in line, (
+            f"the portal is for LAN clients, not the Admin PC: {line!r}"
+        )
 
 
 def test_forward_chain_does_not_blanket_accept_wan_to_lan() -> None:

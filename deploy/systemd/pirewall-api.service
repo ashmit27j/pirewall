@@ -12,6 +12,12 @@ Documentation=file:///opt/pirewall/docs/DEPLOYMENT.md
 After=network-online.target pirewall-core.service
 Wants=network-online.target
 
+# StartLimit* live in [Unit], not [Service]: systemd reads them only here and
+# silently ignores them under [Service], so a misplaced pair means the
+# crash-loop bound ADDENDUM.md A6 asks for is never actually armed.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 # `pirewall.api` loads config, refuses to start on placeholder credentials
@@ -27,8 +33,6 @@ WorkingDirectory=/opt/pirewall
 
 Restart=on-failure
 RestartSec=5s
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 # --- Least privilege (spec §27, §45, ADDENDUM.md A4) ------------------------
 # A *different*, more restricted non-root user from pirewall-core. Its

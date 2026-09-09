@@ -60,8 +60,30 @@ table inet pirewall_base {
 		# panel/API must not be reachable from the WAN or from other
 		# LAN clients, only from admin.admin_pc_ip).
 		ip saddr ${ADMIN_PC_IP} tcp dport { 22, ${API_PORT} } accept
-		ip saddr ${PROTECTED_NETWORK} udp dport { 53, 67 } accept
+
+		# DNS for LAN clients. Safe to match on source address: a
+		# resolver query always comes from a leased address.
+		ip saddr ${PROTECTED_NETWORK} udp dport 53 accept
 		ip saddr ${PROTECTED_NETWORK} tcp dport 53 accept
+
+		# DHCP *server* side, matched on interface rather than source
+		# address. A DHCPDISCOVER is sent from 0.0.0.0 before the client
+		# has a lease, so `ip saddr ${PROTECTED_NETWORK} udp dport 67`
+		# never matches it and every new client would silently fail to
+		# get an address under this chain's `policy drop`.
+		iifname "${LAN_INTERFACE}" udp dport 67 accept
+
+		# DHCP *client* side on the WAN. Without this the reply to a
+		# lease renewal can be dropped and the Pi silently loses its
+		# upstream address when the lease expires.
+		iifname "${WAN_INTERFACE}" udp dport 68 accept
+
+		# The captive portal (ADDENDUM_3.md C1), reachable by every LAN
+		# client including ones an adaptive rule has blocked — that is
+		# the channel a blocked device is told *why* on (C4). Adaptive
+		# BLOCK rules live on the `forward` hook, so they never affect
+		# this.
+		iifname "${LAN_INTERFACE}" tcp dport ${PORTAL_PORT} accept
 		# Diagnostic ICMP to the Pi itself.
 		ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } accept
 	}

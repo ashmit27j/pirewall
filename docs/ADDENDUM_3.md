@@ -118,6 +118,23 @@ Established flows `return` before the set is consulted, so a session
 expiring mid-download stops the *next* new connection rather than severing
 the current one.
 
+**The set and the session registry must not diverge.** An address in
+`@authed` is forwarding; a session in the registry is what pirewall believes
+about it. `PortalService.reconcile()` revokes any grant with no live session,
+and runs at startup and on every sweep. Two divergences were observed on real
+hardware, both leaving a client forwarding while being shown a login page:
+
+* **pirewall-core restarts.** Sessions are in memory, grants are in the
+  kernel, so every surviving element outlives its session — for up to a full
+  session length. A restart means nobody is signed in, so every element goes.
+* **A login round-trip times out.** Core authorizes the client and records
+  the success; the portal has already given up and told the user their
+  credentials were wrong. Core and the kernel agree; the user has no session.
+  The portal's RPC timeout is 20s rather than the generic 5s default for this
+  reason — a login includes deliberately-slow scrypt under the single lock
+  core serializes every RPC behind — but reconciliation is what makes the
+  outcome safe rather than merely unlikely.
+
 **Discovery** uses two mechanisms, neither of which hijacks DNS. DHCP option
 114 (RFC 8910) hands modern clients the portal URL in their lease, and a
 single nat `prerouting` rule redirects port 80 for everything older. Port

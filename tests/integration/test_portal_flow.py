@@ -53,15 +53,24 @@ class _DirectRpcClient(BaseRpcClient):
 class Harness:
     """Everything a portal test needs, with a clock it can move."""
 
-    def __init__(self) -> None:
-        self.now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    def __init__(
+        self,
+        backend: FakeFirewallBackend | None = None,
+        store: PortalUserStore | None = None,
+        now: datetime | None = None,
+        client_ip: IPv4Address | None = None,
+    ) -> None:
+        self.now = now or datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
         self.config = _portal_config()
-        self.client_ip = list(self.config.network.protected_network.hosts())[9]
-        self.backend = FakeFirewallBackend()
+        self.client_ip = client_ip or list(self.config.network.protected_network.hosts())[9]
+        # Injectable so `restart_core` can carry the kernel set and the user
+        # store across a simulated restart while everything in memory is lost.
+        self.backend = backend or FakeFirewallBackend()
         self.backend.set_clock(self.now)
         self.manager = FirewallManager(self.config, self.backend)
-        self.store = PortalUserStore(Path(tempfile.mkdtemp()) / "users.json")
-        self.store.add("alice", PASSWORD, self.now, "admin")
+        self.store = store or PortalUserStore(Path(tempfile.mkdtemp()) / "users.json")
+        if self.store.get("alice") is None:
+            self.store.add("alice", PASSWORD, self.now, "admin")
         self.events: list[SecurityEvent] = []
         self.service = PortalService(
             self.config,
@@ -87,6 +96,19 @@ class Harness:
 
     def headers_of(self, response: Response) -> dict[str, str]:
         return response.headers
+
+    def restart_core(self) -> "Harness":
+        """Rebuild the core-side service exactly as a pirewall-core restart would.
+
+        Sessions are in-memory so they are lost; the backend (standing in for
+        the kernel) keeps its set, because nftables outlives the process.
+        That asymmetry is the whole point of the test.
+        """
+        restarted = Harness(
+            backend=self.backend, store=self.store, now=self.now, client_ip=self.client_ip
+        )
+        restarted.service.reconcile()  # what CoreDaemon.start() does
+        return restarted
 
     def advance(self, seconds: int) -> None:
         self.now += timedelta(seconds=seconds)
@@ -360,3 +382,68 @@ def test_a_failed_grant_does_not_report_a_successful_login(harness: Harness) -> 
     assert response.status_code == 401
     assert "Could not grant network access" in response.text
     assert harness.get("/portal/api/keepalive").json()["status"] == "unauthenticated"
+
+
+# ------------------------------------------- kernel set / session reconciliation
+#
+# Regression tests for two divergences observed on real hardware. Both leave
+# an address forwarding that nothing in pirewall believes is signed in, which
+# is the one direction of drift that matters: the client keeps network access
+# while being shown a login page.
+
+
+def test_a_restart_does_not_leave_a_client_authorized(harness: Harness) -> None:
+    """pirewall-core restarting must revoke every grant, not orphan it.
+
+    Sessions live in memory and grants live in the kernel. After a restart
+    the registry is empty and the set is not, so every surviving element
+    would forward for up to a full session length with nothing behind it —
+    observed on this Pi, triggered by the bring-up script's own core restart.
+    """
+    harness.sign_in()
+    assert harness.authorized() == frozenset({harness.client_ip})
+
+    restarted = harness.restart_core()
+
+    assert restarted.authorized() == frozenset(), (
+        "a grant survived a restart with no session behind it"
+    )
+    assert restarted.get("/portal/api/keepalive").json()["status"] == "unauthenticated"
+
+
+def test_reconcile_revokes_a_grant_with_no_session(harness: Harness) -> None:
+    """The invariant, asserted directly: an address in `@authed` has a live session.
+
+    Reproduces the other observed divergence — a login round-trip that timed
+    out *after* core authorized the client, so core and the kernel agreed
+    while the user was told their password was wrong and held no session.
+    """
+    harness.manager.authorize_portal_client(harness.client_ip, 1800)
+    assert harness.authorized() == frozenset({harness.client_ip})
+
+    assert harness.service.reconcile() == 1
+    assert harness.authorized() == frozenset()
+
+
+def test_reconcile_leaves_a_legitimate_session_alone(harness: Harness) -> None:
+    """It must not log out the people who are actually signed in."""
+    harness.sign_in()
+    assert harness.service.reconcile() == 0
+    assert harness.authorized() == frozenset({harness.client_ip})
+    assert harness.get("/portal/api/keepalive").json()["status"] == "authenticated"
+
+
+def test_reconcile_reports_the_revocation(harness: Harness) -> None:
+    """Silently revoking would make a confusing failure impossible to diagnose."""
+    harness.manager.authorize_portal_client(harness.client_ip, 1800)
+    harness.events.clear()
+    harness.service.reconcile()
+    reasons = [event.reason or "" for event in harness.events]
+    assert any("orphaned portal authorization" in reason for reason in reasons)
+
+
+def test_the_sweep_reconciles_too(harness: Harness) -> None:
+    """So the orphan window is bounded by the sweep interval, not the session length."""
+    harness.manager.authorize_portal_client(harness.client_ip, 1800)
+    assert harness.service.sweep() >= 1
+    assert harness.authorized() == frozenset()

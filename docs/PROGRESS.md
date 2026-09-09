@@ -24,14 +24,25 @@ Environment-dependent / Not yet validated.
 
 ### Phase 10 defects found (2026-09-09)
 
-Three faults in code that predates this phase, all found by deploying it for
-real on the Pi rather than by reading. Each is fixed with a regression test.
+Four faults, all found by deploying and running this for real on the Pi
+rather than by reading. Each is fixed with a regression test.
 
 | # | Defect | Severity | How it surfaced |
 |---|--------|----------|-----------------|
 | 1 | `base.nft.template` accepted DHCP with `ip saddr ${PROTECTED_NETWORK} udp dport 67`, which cannot match a `DHCPDISCOVER` — that arrives from `0.0.0.0`. Under the chain's `policy drop`, **no new LAN client could ever get a lease**, while renewals from already-addressed clients kept working, so it would have read as intermittent. | High | Reading the template against this Pi's live setup before loading it. The ruleset had never been loaded on any deployment. |
 | 2 | The same chain had no `udp dport 68` accept, so the reply to the Pi's **own WAN lease renewal** could be dropped and the upstream address silently lost — hours or days after a deploy that looked fine. | High | Same review. |
 | 3 | `StartLimitIntervalSec=`/`StartLimitBurst=` sat under `[Service]` in all three unit templates. systemd reads them only in `[Unit]` and ignores them elsewhere, so **A6's crash-loop bound was never armed** — every unit looked like it bounded its own restart loop while restarting forever. | Medium | `systemd-analyze verify` on the new portal unit warned about it, and the same warning appeared for the two existing units. Confirmed by the limiter then actually firing during bring-up. |
+
+| 4 | The captive portal's nftables set and its session registry could diverge, leaving an address **forwarding with no session behind it** — silently, until the element's own timeout lapsed up to a session length later. Two paths: a `pirewall-core` restart (sessions are in memory, grants are in the kernel), and a login round-trip that timed out *after* core had authorized the client. In both cases the client kept network access while the portal showed them a login page. | High | Writing `pirewall-start`, whose own core restart triggered it. Caught because a login reported HTTP 401 while `nft list set` showed a freshly-added element. |
+
+Defect 4 is fixed by `PortalService.reconcile()`, which asserts the
+invariant "an address in `@authed` has a live session" at startup and on
+every sweep, so the orphan window is bounded by `flow.cleanup_interval_seconds`
+rather than by the session length. The portal's RPC timeout also went from
+the generic 5s default to 20s, since a login includes deliberately-slow
+scrypt under the single lock core serializes every RPC behind — but the
+reconciliation is what makes the outcome *safe* rather than merely unlikely.
+Both paths have regression tests verified to fail against the pre-fix code.
 
 Also found **on the deployment rather than in the repository**: a
 hand-written `/etc/logrotate.d/pirewall` used `create 0640 pirewall pirewall`

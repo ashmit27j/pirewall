@@ -148,7 +148,15 @@ def main(argv: list[str] | None = None) -> int:
         config.portal.session_timeout_seconds,
     )
 
-    rpc_client = UnixSocketRpcClient(config.portal.rpc_socket_path)
+    # Longer than the 5s default. A login round-trip includes scrypt
+    # verification, which is deliberately slow, executed under the single
+    # lock pirewall-core serializes every RPC behind — so it contends with
+    # the detection pipeline and with model loading at startup. At 5s that
+    # was observed timing out *after* core had already authorized the
+    # client, leaving the user told their password was wrong while their
+    # address was forwarding. `PortalService.reconcile` now cleans up such
+    # an orphan, but not tripping the timeout in the first place is better.
+    rpc_client = UnixSocketRpcClient(config.portal.rpc_socket_path, timeout_seconds=20.0)
     app = create_app(config, rpc_client)
     server = uvicorn.Server(
         uvicorn.Config(

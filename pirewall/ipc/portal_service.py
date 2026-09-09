@@ -274,17 +274,58 @@ class PortalService:
     # -------------------------------------------------------------- internals
 
     def sweep(self) -> int:
-        """Retire sessions the clock has passed. Returns how many were retired.
+        """Retire lapsed sessions and reconcile the kernel set. Returns how many were retired.
 
-        The kernel drops the nft element on its own, so this exists to keep
-        pirewall's *view* honest — the control panel should not list a
+        The kernel drops an expired nft element on its own, so the first half
+        keeps pirewall's *view* honest — the control panel should not list a
         session that stopped forwarding minutes ago. Called from the core
         daemon's existing sweep loop, not a thread of its own.
         """
         expired = self._sessions.purge_expired(self._now_fn())
         for session in expired:
             self._deauthorize(session.client_ip)
-        return len(expired)
+        return len(expired) + self.reconcile()
+
+    def reconcile(self) -> int:
+        """Drop kernel grants with no live session behind them. Returns how many.
+
+        **The invariant: an address in `@authed` must have a live session.**
+        The set and the session registry are two pieces of state that can
+        diverge, and a divergence in this direction means an address is
+        being forwarded that nothing in pirewall believes is signed in —
+        silently, until the element's own timeout lapses up to a session
+        length later.
+
+        Two ways it happens, both observed on real hardware:
+
+        * **pirewall-core restarts.** Sessions are in memory and the set is
+          in the kernel, so every surviving element outlives its session.
+          A restart means nobody is signed in, so every element must go —
+          otherwise previously-authorized clients keep forwarding while the
+          portal shows them a login page.
+        * **A login round-trip times out.** Core authorizes the client and
+          logs the success; the portal has already given up and told the
+          user their credentials failed. Core's view and the kernel's agree,
+          but the user has no session — the grant is orphaned.
+
+        Called at startup and from every sweep, so the window is bounded by
+        `flow.cleanup_interval_seconds` rather than by the session length.
+        """
+        now = self._now_fn()
+        orphans = [
+            client_ip
+            for client_ip in self._manager.authorized_portal_clients()
+            if self._sessions.get_by_ip(client_ip, now) is None
+        ]
+        for client_ip in orphans:
+            self._deauthorize(client_ip)
+            self._emit(
+                EventSeverity.WARNING,
+                SecurityEventType.SYSTEM_WARNING,
+                f"revoked orphaned portal authorization for {client_ip}: "
+                "no active session (pirewall-core restart, or a login that did not complete)",
+            )
+        return len(orphans)
 
     def warn_about_demo_accounts(self) -> None:
         """Emit a startup warning while the documented demo credentials still exist."""

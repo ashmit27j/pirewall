@@ -213,6 +213,40 @@ sudo chown pirewall-api:pirewall-api deploy/certificates/pirewall.{crt,key}
 sudo chmod 600 deploy/certificates/pirewall.key
 ```
 
+## 5–10 in one command: `pirewall-start`
+
+Once steps 0–4 are done (config generated, TLS certificate created), the
+remaining bring-up is scripted. It is idempotent — safe to re-run any time,
+including after a failed attempt:
+
+```sh
+sudo scripts/deployment/pirewall-start --check    # preflight only, changes nothing
+scripts/deployment/pirewall-start --dry-run       # print every command, run none
+sudo scripts/deployment/pirewall-start            # do it
+```
+
+It snapshots the current ruleset to `deploy/rollback/` before touching
+anything, creates the service accounts and directories, renders and
+syntax-checks every ruleset before loading it, installs and starts the three
+units in dependency order, and verifies the result. It prints the rollback
+commands when it finishes.
+
+It deliberately never generates configuration or TLS material: both need
+answers it cannot invent, and `configure.py` refuses to guess the Admin PC
+address or the admin password on purpose.
+
+Two ordering constraints it enforces, both of which cost real debugging to
+find: `pirewall-core` starts before `pirewall-portal` because core creates
+the portal's RPC socket, and the captive-portal nft table loads only after
+the sign-in page is confirmed serving — loading it earlier gates the whole
+protected network with nowhere to sign in.
+
+`--no-portal` brings up core and api only. `--skip-nft` leaves the ruleset
+alone.
+
+The rest of this section documents what the script does, for when you want
+to run a step by hand or understand a failure.
+
 ## 5. Render and apply the network/firewall templates
 
 ```sh

@@ -473,6 +473,17 @@ class CoreDaemon:
             self._spawn("pirewall-capture", self._capture_loop)
 
         if self._portal is not None:
+            # Sessions live in memory and portal grants live in the kernel,
+            # so a restart leaves every previously-authorized address in
+            # `@authed` with nothing behind it — still forwarding, while the
+            # portal shows its owner a login page. Nobody is signed in after
+            # a restart, so every surviving grant is revoked here.
+            revoked = self._portal.reconcile()
+            if revoked:
+                _logger.warning(
+                    "revoked %d orphaned portal authorization(s) left over from a previous run",
+                    revoked,
+                )
             # Emitted at startup, every startup, for as long as the
             # documented demo credentials still work (ADDENDUM_3.md C3).
             self._portal.warn_about_demo_accounts()

@@ -1,0 +1,609 @@
+#!/usr/bin/env bash
+# pirewall-start — bring the whole pirewall stack up on the Pi, in order.
+#
+# Encodes the sequence in docs/SETUP.md §5–§10 as one idempotent, re-runnable
+# script. Safe to run repeatedly: every step checks whether it has already
+# been done and says so rather than redoing it.
+#
+# WHAT IT DOES NOT DO, on purpose:
+#
+#   * It never generates configuration. `configure.py` asks for the Admin PC
+#     address and the admin password and deliberately refuses to guess
+#     either; a script that ran it unattended would have to. If the config
+#     is missing or still holds a CHANGE_ME placeholder, this stops and says
+#     which command to run.
+#   * It never generates TLS material. Same reason — `make_certs.sh` needs
+#     to know which address the certificate is for.
+#   * It never loads deploy/rendered/nat-masquerade.nft when NetworkManager's
+#     `shared` mode is already masquerading the LAN. Loading both leaves two
+#     masquerade rules where one is wanted.
+#
+# ORDERING IS THE POINT. Two steps are sequenced for reasons that are not
+# obvious and that cost real debugging to find:
+#
+#   1. The captive-portal nft table is loaded only *after* pirewall-portal is
+#      confirmed serving. That table rejects forwarding for unauthenticated
+#      LAN clients; loading it while the sign-in page is down gates the whole
+#      protected network with nowhere to sign in.
+#   2. pirewall-core is started and confirmed *before* pirewall-portal,
+#      because core is what creates the portal's RPC socket.
+#
+# Usage:
+#   sudo scripts/deployment/pirewall-start              # bring everything up
+#   sudo scripts/deployment/pirewall-start --check      # preflight only, change nothing
+#   scripts/deployment/pirewall-start --dry-run         # print every command, run none
+#   sudo scripts/deployment/pirewall-start --no-portal  # core + api only
+#
+# Exit codes: 0 all good, 1 a step failed, 2 preflight refused to start.
+
+set -euo pipefail
+
+readonly REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+readonly VENV_PY="${REPO_ROOT}/.venv/bin/python"
+readonly TMPFILES_SRC="${REPO_ROOT}/deploy/systemd/pirewall-tmpfiles.conf"
+readonly ROLLBACK_DIR="${REPO_ROOT}/deploy/rollback"
+readonly UNIT_DIR="/etc/systemd/system"
+readonly DNSMASQ_DROPIN="/etc/NetworkManager/dnsmasq-shared.d/pirewall-portal.conf"
+
+# How long to wait for a service to actually become useful (socket bound,
+# port listening) rather than merely "active". systemd reports a Type=simple
+# unit active the moment it forks, which tells us nothing.
+readonly READY_TIMEOUT_SECONDS=30
+
+DRY_RUN=0
+CHECK_ONLY=0
+WANT_PORTAL=1
+SKIP_NFT=0
+
+EXIT_OK=0
+EXIT_FAILED=1
+EXIT_REFUSED=2
+
+# ----------------------------------------------------------------- output
+
+if [[ -t 1 ]]; then
+  readonly C_RESET=$'\033[0m' C_BOLD=$'\033[1m' C_DIM=$'\033[2m'
+  readonly C_RED=$'\033[31m' C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m' C_BLUE=$'\033[34m'
+else
+  readonly C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_BLUE=''
+fi
+
+step()  { printf '\n%s==>%s %s%s%s\n' "$C_BLUE" "$C_RESET" "$C_BOLD" "$*" "$C_RESET"; }
+ok()    { printf '    %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+skip()  { printf '    %s·%s %s\n' "$C_DIM" "$C_RESET" "$*"; }
+warn()  { printf '    %s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+fail()  { printf '\n%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+
+die() { fail "$*"; exit "$EXIT_FAILED"; }
+
+refuse() {
+  fail "$1"
+  shift
+  [[ $# -gt 0 ]] && printf '\n%s\n' "$*" >&2
+  exit "$EXIT_REFUSED"
+}
+
+# Run a command, or print it under --dry-run. Every mutating action in this
+# script goes through this, so --dry-run is genuinely complete rather than
+# best-effort.
+run() {
+  if (( DRY_RUN )); then
+    printf '    %s$ %s%s\n' "$C_DIM" "$*" "$C_RESET"
+    return 0
+  fi
+  "$@"
+}
+
+# ------------------------------------------------------------- arguments
+
+usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; $d'; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)    DRY_RUN=1 ;;
+    --check)      CHECK_ONLY=1 ;;
+    --no-portal)  WANT_PORTAL=0 ;;
+    --skip-nft)   SKIP_NFT=1 ;;
+    -h|--help)    usage; exit "$EXIT_OK" ;;
+    *)            fail "unknown option: $1"; echo; usage >&2; exit "$EXIT_REFUSED" ;;
+  esac
+  shift
+done
+
+# ------------------------------------------------------------- preflight
+
+need_root() {
+  if (( DRY_RUN || CHECK_ONLY )); then return 0; fi
+  [[ $EUID -eq 0 ]] || refuse "this script must run as root (it loads nftables rules and manages services)" \
+    "Try: sudo ${BASH_SOURCE[0]} $*"
+}
+
+require_binary() {
+  command -v "$1" >/dev/null 2>&1 || refuse "required command not found: $1" "$2"
+}
+
+preflight() {
+  step "Preflight"
+
+  cd "$REPO_ROOT"
+  ok "repository root: $REPO_ROOT"
+
+  [[ -x "$VENV_PY" ]] || refuse "no virtualenv at ${VENV_PY}" \
+    "Create it first:  cd ${REPO_ROOT} && uv sync"
+  ok "virtualenv: $("$VENV_PY" --version)"
+
+  require_binary nft        "Install it:  sudo apt install nftables"
+  require_binary systemctl  "This script targets a systemd host."
+  require_binary systemd-tmpfiles "This script targets a systemd host."
+  ok "nft, systemctl, systemd-tmpfiles present"
+
+  local config_file="${REPO_ROOT}/config/local_config.toml"
+  [[ -f "$config_file" ]] || refuse "no config/local_config.toml" \
+    "Generate it first — it asks for the Admin PC address and the admin
+password, and deliberately refuses to guess either:
+
+    cd ${REPO_ROOT} && uv run python -m scripts.deployment.configure"
+  ok "config: config/local_config.toml"
+
+  if grep -q 'CHANGE_ME' "$config_file"; then
+    refuse "config/local_config.toml still contains CHANGE_ME placeholders" \
+      "Fix them, or re-run:  uv run python -m scripts.deployment.configure"
+  fi
+
+  # Load the config through the real Pydantic models, so anything this
+  # script reads has already been validated the same way the daemons
+  # validate it. Values are shell-quoted by python, never interpolated raw.
+  local config_env
+  if ! config_env="$("$VENV_PY" - <<'PY'
+import shlex
+import sys
+
+from pirewall.config.loader import load_config
+
+try:
+    c = load_config("config/local_config.toml")
+except Exception as exc:  # any validation failure, reported not raised
+    print(f"CONFIG_ERROR={shlex.quote(str(exc))}")
+    sys.exit(0)
+
+pairs = {
+    "WAN_IF": c.network.wan_interface,
+    "LAN_IF": c.network.lan_interface,
+    "LAN_IP": str(c.network.pirewall_lan_ip),
+    "PROTECTED": str(c.network.protected_network),
+    "GATEWAY": str(c.network.upstream_gateway),
+    "ADMIN_PC": str(c.admin.admin_pc_ip),
+    "API_PORT": str(c.api.port),
+    "CORE_SOCK": c.api.rpc_socket_path,
+    "PORTAL_ENABLED": "1" if c.portal.enabled else "0",
+    "PORTAL_HOST": str(c.portal.listen_host),
+    "PORTAL_PORT": str(c.portal.listen_port),
+    "PORTAL_SOCK": c.portal.rpc_socket_path,
+    "PORTAL_GROUP": c.portal.rpc_socket_group,
+    "USER_STORE": c.portal.user_store_path,
+    "ENFORCEMENT": c.firewall.enforcement_mode.value,
+}
+for key, value in pairs.items():
+    print(f"{key}={shlex.quote(value)}")
+PY
+  )"; then
+    refuse "could not load config/local_config.toml" "Run: uv run python -m pirewall.main --check-config"
+  fi
+  eval "$config_env"
+
+  if [[ -n "${CONFIG_ERROR:-}" ]]; then
+    refuse "config/local_config.toml is invalid: ${CONFIG_ERROR}" \
+      "Run: uv run python -m pirewall.main --check-config"
+  fi
+  ok "config valid — enforcement=${ENFORCEMENT}, LAN ${PROTECTED} on ${LAN_IF}, WAN ${WAN_IF}"
+
+  # Interfaces have to exist before rules referencing them are loaded, or nft
+  # accepts the ruleset and it silently matches nothing.
+  local missing=()
+  for iface in "$WAN_IF" "$LAN_IF"; do
+    ip link show "$iface" >/dev/null 2>&1 || missing+=("$iface")
+  done
+  if (( ${#missing[@]} )); then
+    refuse "configured interface(s) not present: ${missing[*]}" \
+      "Bring them up first (docs/SETUP.md §0), or re-run:
+    uv run python -m scripts.deployment.configure --detect"
+  fi
+  ok "interfaces present: ${WAN_IF} (WAN), ${LAN_IF} (LAN)"
+
+  # The configured gateway is the address §24 safety validation protects from
+  # ever being blocked. A stale value means the real gateway is unprotected,
+  # which is silent and dangerous.
+  local live_gateway
+  live_gateway="$(ip -4 route show default | awk '{print $3; exit}')"
+  if [[ -n "$live_gateway" && "$live_gateway" != "$GATEWAY" ]]; then
+    warn "network.upstream_gateway is ${GATEWAY} but the live default route is ${live_gateway}"
+    warn "  that address is what safety validation protects — fix it before going live:"
+    warn "  uv run python -m scripts.deployment.configure --detect"
+  else
+    ok "upstream gateway matches the live default route: ${GATEWAY}"
+  fi
+
+  if [[ -f "${REPO_ROOT}/deploy/certificates/pirewall.crt" ]]; then
+    ok "TLS certificate present"
+  else
+    refuse "no TLS certificate at deploy/certificates/pirewall.crt" \
+      "Generate it first:  scripts/deployment/make_certs.sh ${LAN_IP}"
+  fi
+
+  if (( WANT_PORTAL )) && [[ "$PORTAL_ENABLED" != "1" ]]; then
+    warn "portal.enabled is false in the config — skipping every portal step"
+    warn "  set it to true in config/local_config.toml to enable the captive portal"
+    WANT_PORTAL=0
+  fi
+}
+
+# --------------------------------------------------------------- helpers
+
+# systemd calls a Type=simple unit "active" the instant it forks, which is
+# not the same as ready. Wait for the thing that actually matters instead.
+wait_for() {
+  local what="$1" test_cmd="$2" waited=0
+  if (( DRY_RUN )); then skip "would wait for ${what}"; return 0; fi
+  while (( waited < READY_TIMEOUT_SECONDS )); do
+    if eval "$test_cmd" >/dev/null 2>&1; then
+      ok "${what} ready (${waited}s)"
+      return 0
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  return 1
+}
+
+start_unit() {
+  local unit="$1" what="$2" ready_test="$3"
+  # The crash-loop limiter is armed (ADDENDUM_3.md), so a unit that failed
+  # earlier refuses to start again until its counter is cleared. Clearing it
+  # here is what makes this script re-runnable after a failed attempt.
+  run systemctl reset-failed "$unit" 2>/dev/null || true
+  run systemctl restart "$unit"
+  if ! wait_for "$what" "$ready_test"; then
+    fail "${unit} did not become ready within ${READY_TIMEOUT_SECONDS}s"
+    printf '\n%s\n' "Last 20 log lines:" >&2
+    journalctl -u "$unit" -n 20 --no-pager >&2 || true
+    exit "$EXIT_FAILED"
+  fi
+}
+
+# ----------------------------------------------------------------- steps
+
+snapshot_ruleset() {
+  step "Snapshot the current nftables ruleset"
+  local stamp file
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  file="${ROLLBACK_DIR}/ruleset-${stamp}.nft"
+
+  if (( DRY_RUN )); then skip "would write ${file}"; return 0; fi
+
+  mkdir -p "$ROLLBACK_DIR"
+  {
+    echo "#!/usr/sbin/nft -f"
+    echo "# pirewall rollback snapshot taken $(date -Is) by pirewall-start"
+    echo "# Restore with:"
+    echo "#   sudo nft flush ruleset && sudo nft -f ${file}"
+    echo "#   sudo systemctl restart NetworkManager"
+    echo "#"
+    ip -br addr | sed 's/^/#   /'
+    echo "#"
+    nft list ruleset
+  } > "$file"
+  echo "$stamp" > "${ROLLBACK_DIR}/.latest"
+  ok "saved ${file#"$REPO_ROOT"/}"
+}
+
+ensure_accounts() {
+  step "Service accounts and groups"
+
+  local -a groups=(pirewall-ipc pirewall-core pirewall-api)
+  (( WANT_PORTAL )) && groups+=(pirewall-portal-ipc pirewall-portal)
+
+  for group in "${groups[@]}"; do
+    if getent group "$group" >/dev/null; then
+      skip "group ${group} exists"
+    else
+      run groupadd --system "$group"
+      ok "created group ${group}"
+    fi
+  done
+
+  _ensure_user pirewall-core pirewall-core pirewall-ipc
+  _ensure_user pirewall-api  pirewall-api  pirewall-ipc
+  if (( WANT_PORTAL )); then
+    _ensure_user pirewall-portal pirewall-portal pirewall-portal-ipc
+    # pirewall-core serves BOTH RPC sockets, so it needs to be in the
+    # portal's group as well as its own.
+    if id -nG pirewall-core 2>/dev/null | tr ' ' '\n' | grep -qx pirewall-portal-ipc; then
+      skip "pirewall-core already in pirewall-portal-ipc"
+    else
+      run usermod -a -G pirewall-portal-ipc pirewall-core
+      ok "added pirewall-core to pirewall-portal-ipc"
+    fi
+  fi
+
+  # The privilege boundary, asserted rather than assumed (ADDENDUM_3.md C1).
+  if (( WANT_PORTAL && ! DRY_RUN )); then
+    if id -nG pirewall-portal | tr ' ' '\n' | grep -qx pirewall-ipc; then
+      die "pirewall-portal is in pirewall-ipc — that group reaches the privileged
+       RPC socket carrying the kill switch and every rule mutation. Remove it:
+           sudo gpasswd -d pirewall-portal pirewall-ipc"
+    fi
+    ok "pirewall-portal is NOT in pirewall-ipc (privilege boundary intact)"
+  fi
+}
+
+_ensure_user() {
+  local user="$1" primary="$2" supplementary="$3"
+  if id -u "$user" >/dev/null 2>&1; then
+    skip "user ${user} exists"
+    return 0
+  fi
+  run useradd --system --no-create-home --shell /usr/sbin/nologin \
+      -g "$primary" -G "$supplementary" "$user"
+  ok "created user ${user}"
+}
+
+ensure_directories() {
+  step "Runtime, state and log directories"
+  [[ -f "$TMPFILES_SRC" ]] || die "missing ${TMPFILES_SRC}"
+  run install -m 0644 "$TMPFILES_SRC" /etc/tmpfiles.d/pirewall.conf
+  run systemd-tmpfiles --create /etc/tmpfiles.d/pirewall.conf
+  ok "applied /etc/tmpfiles.d/pirewall.conf"
+
+  if (( WANT_PORTAL && ! DRY_RUN )); then
+    # The setgid bit is what gives the portal socket its group without
+    # pirewall-core calling chown, which its own SystemCallFilter forbids.
+    local dir; dir="$(dirname "$PORTAL_SOCK")"
+    local mode; mode="$(stat -c '%a' "$dir" 2>/dev/null || echo missing)"
+    local group; group="$(stat -c '%G' "$dir" 2>/dev/null || echo missing)"
+    if [[ "$mode" == "2750" && "$group" == "$PORTAL_GROUP" ]]; then
+      ok "${dir} is setgid ${PORTAL_GROUP}"
+    else
+      die "${dir} is mode ${mode} group ${group}, expected 2750 ${PORTAL_GROUP}.
+       Without the setgid bit the portal socket lands in the wrong group and
+       pirewall-portal can never reach it. Check ${TMPFILES_SRC}."
+    fi
+  fi
+
+  # ML artifacts must be readable by the core user.
+  local artifacts="${REPO_ROOT}/pirewall/ml/artifacts"
+  if compgen -G "${artifacts}/*.txt" >/dev/null || compgen -G "${artifacts}/*.joblib" >/dev/null; then
+    run chown pirewall-core:pirewall-ipc "${artifacts}"/*.txt "${artifacts}"/*.joblib \
+        "${artifacts}"/*.json 2>/dev/null || true
+    ok "ML artifacts owned by pirewall-core"
+  else
+    warn "no ML model artifacts found — pirewall runs behaviour-only detection"
+  fi
+}
+
+render_templates() {
+  step "Render deployment templates"
+  run "$VENV_PY" -m scripts.deployment.render_templates --config config/local_config.toml
+  ok "rendered into deploy/rendered/"
+}
+
+load_base_ruleset() {
+  step "Load the base nftables ruleset"
+  if (( SKIP_NFT )); then skip "--skip-nft given"; return 0; fi
+
+  local base="${REPO_ROOT}/deploy/rendered/base.nft"
+  [[ -f "$base" ]] || die "missing ${base} — did render_templates fail?"
+
+  # Check before load, always. A syntactically bad ruleset applied to a live
+  # box is how you lose a network you are connected over.
+  run nft -c -f "$base" || die "base.nft failed its syntax check — nothing was loaded"
+  ok "base.nft passes nft -c"
+
+  run nft -f "$base"
+  ok "loaded table inet pirewall_base"
+
+  # NetworkManager's shared mode already masquerades the LAN. Loading ours on
+  # top leaves two masquerade rules where one is wanted.
+  local nat="${REPO_ROOT}/deploy/rendered/nat-masquerade.nft"
+  case "$(nm_shared_nat_state)" in
+    present)
+      skip "NetworkManager already masquerades ${PROTECTED} (nm-shared-${LAN_IF}) — not loading nat-masquerade.nft"
+      ;;
+    absent)
+      if [[ -f "$nat" ]]; then
+        run nft -c -f "$nat" || die "nat-masquerade.nft failed its syntax check"
+        run nft -f "$nat"
+        ok "loaded table ip pirewall_nat"
+      fi
+      ;;
+    unknown)
+      # Only reachable under --dry-run, which does not run as root. Saying
+      # "would load it" here would be a guess presented as a plan, and the
+      # wrong guess adds a duplicate masquerade rule.
+      warn "cannot read the ruleset without root — whether NetworkManager already"
+      warn "  masquerades ${PROTECTED} is undecided, so nat-masquerade.nft may or may"
+      warn "  not be loaded on a real run. Check with: sudo nft list tables"
+      ;;
+  esac
+}
+
+# present | absent | unknown. Distinguishing "no such table" from "could not
+# look" matters: treating an unreadable ruleset as "absent" is how you end up
+# loading a second masquerade rule on top of NetworkManager's.
+nm_shared_nat_state() {
+  local output
+  if ! output="$(nft list tables 2>/dev/null)"; then
+    echo unknown
+    return 0
+  fi
+  if grep -q "nm-shared-${LAN_IF}" <<<"$output"; then
+    echo present
+  else
+    echo absent
+  fi
+}
+
+install_units() {
+  step "Install systemd units"
+  local -a units=(pirewall-core.service pirewall-api.service)
+  (( WANT_PORTAL )) && units+=(pirewall-portal.service)
+
+  for unit in "${units[@]}"; do
+    run install -m 0644 "${REPO_ROOT}/deploy/systemd/${unit}" "${UNIT_DIR}/${unit}"
+    ok "installed ${unit}"
+  done
+  run systemctl daemon-reload
+}
+
+start_core_and_api() {
+  step "Start pirewall-core"
+  start_unit pirewall-core.service "core RPC socket" "test -S '${CORE_SOCK}'"
+  if (( WANT_PORTAL )); then
+    wait_for "portal RPC socket" "test -S '${PORTAL_SOCK}'" \
+      || die "pirewall-core did not create ${PORTAL_SOCK} — is portal.enabled true?"
+  fi
+
+  step "Start pirewall-api"
+  start_unit pirewall-api.service "control panel on :${API_PORT}" \
+    "ss -ltn | grep -q ':${API_PORT} '"
+}
+
+start_portal() {
+  (( WANT_PORTAL )) || return 0
+  step "Start pirewall-portal"
+  start_unit pirewall-portal.service "sign-in page on ${PORTAL_HOST}:${PORTAL_PORT}" \
+    "curl -sf -o /dev/null 'http://${PORTAL_HOST}:${PORTAL_PORT}/portal/health'"
+
+  if (( ! DRY_RUN )); then
+    local count
+    count="$("$VENV_PY" - <<PY 2>/dev/null || echo 0
+from pirewall.portal.store import PortalUserStore
+print(len(PortalUserStore("${USER_STORE}").list_users()))
+PY
+)"
+    if [[ "$count" == "0" ]]; then
+      warn "no portal accounts exist yet — nobody can sign in. Create one:"
+      warn "  sudo -u pirewall-core uv run python -m scripts.deployment.portal_users add <name>"
+    else
+      ok "${count} portal account(s) in the store"
+    fi
+  fi
+}
+
+load_portal_gate() {
+  (( WANT_PORTAL )) || return 0
+  step "Load the captive-portal gate"
+  if (( SKIP_NFT )); then skip "--skip-nft given"; return 0; fi
+
+  # Deliberately last. This table rejects forwarding for unauthenticated LAN
+  # clients; loading it while the sign-in page is down gates the protected
+  # network with nowhere to sign in.
+  local portal="${REPO_ROOT}/deploy/rendered/portal.nft"
+  [[ -f "$portal" ]] || die "missing ${portal}"
+  run nft -c -f "$portal" || die "portal.nft failed its syntax check — nothing was loaded"
+  run nft -f "$portal"
+  ok "loaded table inet pirewall_portal (LAN forwarding now requires sign-in)"
+}
+
+install_dnsmasq_dropin() {
+  (( WANT_PORTAL )) || return 0
+  step "Captive-portal discovery (DHCP option 114)"
+
+  if ! pgrep -af dnsmasq 2>/dev/null | grep -q 'dnsmasq-shared.d'; then
+    warn "NetworkManager's shared-mode dnsmasq is not running — skipping option 114"
+    warn "  clients will still reach the portal via the port-80 redirect"
+    return 0
+  fi
+
+  local src="${REPO_ROOT}/deploy/rendered/dnsmasq-portal.conf"
+  [[ -f "$src" ]] || die "missing ${src}"
+
+  if [[ -f "$DNSMASQ_DROPIN" ]] && cmp -s "$src" "$DNSMASQ_DROPIN"; then
+    skip "drop-in already current"
+    return 0
+  fi
+
+  run install -D -m 0644 "$src" "$DNSMASQ_DROPIN"
+  ok "installed ${DNSMASQ_DROPIN}"
+  warn "restart the AP for clients to pick it up:"
+  warn "  sudo nmcli connection down <ap-connection> && sudo nmcli connection up <ap-connection>"
+}
+
+verify() {
+  step "Verify"
+  if (( DRY_RUN )); then skip "nothing to verify in a dry run"; return 0; fi
+
+  local -a units=(pirewall-core pirewall-api)
+  (( WANT_PORTAL )) && units+=(pirewall-portal)
+  for unit in "${units[@]}"; do
+    if [[ "$(systemctl is-active "$unit")" == "active" ]]; then
+      ok "${unit} active"
+    else
+      fail "${unit} is $(systemctl is-active "$unit")"
+      return 1
+    fi
+  done
+
+  nft list tables | sed 's/^/    /'
+
+  if (( WANT_PORTAL )); then
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' "http://${PORTAL_HOST}:${PORTAL_PORT}/portal" || echo 000)"
+    [[ "$code" == "200" ]] && ok "sign-in page responds 200" || warn "sign-in page returned ${code}"
+  fi
+
+  # Losing the Pi's own upstream is the loudest possible failure of a
+  # ruleset change, so check it explicitly rather than assuming.
+  if ping -c1 -W2 "$GATEWAY" >/dev/null 2>&1; then
+    ok "upstream gateway ${GATEWAY} reachable"
+  else
+    warn "cannot reach upstream gateway ${GATEWAY} — check the ruleset"
+  fi
+}
+
+summary() {
+  local latest=""
+  [[ -f "${ROLLBACK_DIR}/.latest" ]] && latest="$(cat "${ROLLBACK_DIR}/.latest")"
+
+  printf '\n%s%s%s\n' "$C_BOLD" "pirewall is up." "$C_RESET"
+  printf '  Control panel   https://%s:%s/control-panel  (from the Admin PC)\n' "$ADMIN_PC" "$API_PORT"
+  printf '                  https://127.0.0.1:%s/control-panel  (on the Pi, needs admin.allow_local_console)\n' "$API_PORT"
+  if (( WANT_PORTAL )); then
+    printf '  Sign-in page    http://%s:%s/portal\n' "$PORTAL_HOST" "$PORTAL_PORT"
+    printf '  Signed-in now   sudo nft list set inet pirewall_portal authed\n'
+  fi
+  printf '  Enforcement     %s\n' "$ENFORCEMENT"
+  printf '\n%sRollback%s\n' "$C_BOLD" "$C_RESET"
+  if (( WANT_PORTAL )); then
+    printf '  Ungate the LAN immediately   sudo nft delete table inet pirewall_portal\n'
+  fi
+  [[ -n "$latest" ]] && \
+    printf '  Restore the whole ruleset    sudo nft flush ruleset && sudo nft -f deploy/rollback/ruleset-%s.nft\n' "$latest"
+  printf '  Stop everything              sudo systemctl stop pirewall-portal pirewall-api pirewall-core\n'
+}
+
+# ------------------------------------------------------------------ main
+
+main() {
+  need_root "$@"
+  preflight
+
+  if (( CHECK_ONLY )); then
+    printf '\n%spreflight passed — nothing was changed (--check)%s\n' "$C_GREEN" "$C_RESET"
+    exit "$EXIT_OK"
+  fi
+
+  snapshot_ruleset
+  ensure_accounts
+  ensure_directories
+  render_templates
+  load_base_ruleset
+  install_units
+  start_core_and_api
+  start_portal
+  load_portal_gate
+  install_dnsmasq_dropin
+  verify
+  summary
+}
+
+main "$@"

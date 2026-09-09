@@ -33,6 +33,7 @@
 #   sudo scripts/deployment/pirewall-start --check      # preflight only, change nothing
 #   scripts/deployment/pirewall-start --dry-run         # print every command, run none
 #   sudo scripts/deployment/pirewall-start --no-portal  # core + api only
+#   sudo scripts/deployment/pirewall-start --skip-nft   # leave the ruleset alone
 #
 # Exit codes: 0 all good, 1 a step failed, 2 preflight refused to start.
 

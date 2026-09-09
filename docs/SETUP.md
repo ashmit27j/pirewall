@@ -19,6 +19,13 @@ you run deliberately.
 
 ---
 
+> **Setting up on a new network for the first time?** `setup-new-network.md`
+> in the repository root is the same path as a pure command runbook — every
+> command in order, plus the Admin PC side (Wazuh and Netdata, with and
+> without Docker) and how to move an existing Pi to a different network.
+> This file is that path with the reasoning attached; read it when something
+> here fails or you want to know why a step exists.
+
 ## 0. Before you start
 
 * **64-bit Raspberry Pi OS Lite** (arm64). Not optional: `numpy`, `scipy`,

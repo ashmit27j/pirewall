@@ -58,7 +58,8 @@ Full detail in `docs/ADDENDUM.md`.
 | `docs/API.md` | Every API endpoint, the auth model, the control panel. |
 | `docs/TESTING.md` | How to run each test tier, the Protocol+Fake pattern, what's Fake vs. real-hardware-verified. |
 | `docs/SECURITY.md` | Hardening, the two-process privilege split, threat model, resource-exhaustion protections. |
-| `docs/SETUP.md` | The ordered, copy-paste setup path: install, configure, go live, turn on the captive portal, and start Wazuh/Netdata on the Admin PC (with and without Docker). Start here. |
+| `setup-new-network.md` | **Start here for a new deployment.** Every command in order, from bare hardware to enforcing, including the Admin PC side (Wazuh and Netdata, with and without Docker) and how to move an existing Pi to a different network. |
+| `docs/SETUP.md` | The same path with the reasoning attached: install, configure, go live, turn on the captive portal, and start Wazuh/Netdata on the Admin PC (with and without Docker). Start here. |
 | `docs/DEPLOYMENT.md` | The reasoning behind each setup step: OS choices, hardening, network templates, Wazuh/Netdata, updates. |
 | `docs/DEPLOYMENT_COMPLETE.md` | What the two service entry points do, what was verified and how, and what a human still has to check on the Pi. |
 | `docs/DEVELOPMENT_WORKFLOW.md` | The per-subsystem development loop this project follows. |

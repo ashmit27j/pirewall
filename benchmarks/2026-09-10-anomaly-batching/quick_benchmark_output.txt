@@ -1,0 +1,8 @@
+host: Linux-6.18.39+rpt-rpi-v8-aarch64-with-glibc2.41 / aarch64
+model_version=0.2.0 n_features=29
+batch_size    ms_per_call    ms_per_flow  flows_per_sec
+         1        63.7119        63.7119           15.7
+        10        55.7325         5.5732          179.4
+        25        57.9431         2.3177          431.5
+        50        60.7222         1.2144          823.4
+       100        60.4916         0.6049         1653.1

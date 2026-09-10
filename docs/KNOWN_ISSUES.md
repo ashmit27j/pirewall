@@ -158,20 +158,46 @@ against ADDENDUM.md A1's recommended soak period.
 
 ## 6. Wazuh and Netdata integrations were never verified end to end
 
-**Status: Observed.** Both are enabled in config and pointed at the Admin PC,
-and neither is listening:
+**Status: Observed, partially improved (2026-09-10).** Both are enabled in
+config and pointed at the Admin PC. Original baseline:
 
 ```
 nc -zv 192.168.101.2 514    -> timeout
 nc -zuv 192.168.101.2 8125  -> timeout
 ```
 
-`pirewall-core` logs a forwarding failure for every event it tries to send.
-The forwarder degrades correctly — it counts failures and re-reports
-periodically rather than blocking the pipeline — so this is a missing
-dependency, not a fault. But it means **no security event pirewall has ever
-generated has reached a SIEM**, and the whole §32/§33 integration path is
-unexercised outside its unit tests.
+**Netdata (dashboard, TCP 19999): now reachable from the Pi** — a native
+Netdata install was already present on the Admin PC (Kali), just not
+exposed; confirmed `nc -zv 192.168.101.2 19999` succeeds. **StatsD (UDP
+8125, what `pirewall-core` actually forwards metrics to) is still not
+reachable**: `/opt/netdata/etc/netdata/netdata.conf`'s `[statsd]` section
+binds `udp:localhost` only. The fix is a one-line config change
+(`bind to = udp:0.0.0.0:8125`) plus `systemctl restart netdata`, both of
+which need `sudo` on that box — not completed this session because the
+account used for automated access there has no sudo rights yet being
+extended, and remote `sudo`-invoking commands that mutate system config are
+blocked by this environment's own permission classifier regardless.
+Left for a human to run directly on the Admin PC.
+
+**Wazuh: not attempted this session, timeboxed.**
+`setup-new-network.md` §8.3 budgets 6 GB RAM + 4 CPU cores for the Docker
+manager+indexer+dashboard stack (Kali has no native packages). The Admin PC
+had **3.7 GB free** (7.2 GB total, 3.5 GB already in use) at the time of
+this check — under budget, and this is the user's daily laptop, not a
+dedicated server, so pushing a heavy three-container stack onto it without
+headroom risked visible slowdown or worse while it's in active use. Per
+this session's own instruction to timebox infrastructure rabbit holes
+rather than force them, this was left for a deliberate decision rather than
+attempted: either free up RAM first, accept the swap-backed slowdown, or
+defer Wazuh to a machine with more headroom.
+
+`pirewall-core` still logs a forwarding failure for every Wazuh event it
+tries to send. The forwarder degrades correctly — it counts failures and
+re-reports periodically rather than blocking the pipeline — so this
+remains a missing dependency, not a fault. **No security event pirewall
+has ever generated has reached a SIEM**, and the §32/§33 Wazuh integration
+path is still unexercised outside its unit tests; Netdata's metrics path is
+now one config change away from being exercised for the first time.
 
 `setup-new-network.md` §8.3–8.4 has the install procedure for both, with and
 without Docker.

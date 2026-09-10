@@ -76,3 +76,28 @@ def test_declared_length_exceeding_captured_bytes_does_not_crash_or_falsely_matc
 def test_garbage_after_a_valid_looking_header_does_not_crash() -> None:
     packet = bytes([_HEARTBEAT]) + _TLS_1_2 + b"\xff\xff" + b"\x01\x02"
     check_heartbleed(packet)  # must not raise
+
+
+def test_record_split_across_tcp_segments_is_not_falsely_matched() -> None:
+    """Regression: a large, ordinary TLS record spanning multiple TCP segments must not match.
+
+    `check_heartbleed` sees one captured segment at a time, not a
+    reassembled stream. A record whose *declared* length is a legitimate
+    size (well under `_MAX_RECORD_LENGTH`) but whose bytes are split across
+    segments used to be judged against only the bytes present in this one
+    segment: slicing `payload[5:5+declared_length]` silently truncates
+    instead of raising, so `available_bytes` came out far smaller than the
+    record's real capacity — and on an established connection those
+    trailing bytes are ciphertext, so `claimed_payload_length` read from
+    them is effectively random and can exceed that shrunken figure purely
+    by chance. The fix requires the full declared record to be present in
+    this segment before judging it at all.
+    """
+    declared_length = 100  # an ordinary record size, nowhere near attacker-huge
+    # Only 20 bytes of the declared 100-byte fragment are actually in this
+    # segment — the rest arrives in a later one. The two bytes read as
+    # "claimed_payload_length" are ciphertext that happens to look huge.
+    truncated_fragment = b"\x01" + b"\xff\xff" + b"\x00" * 17
+    packet = _record(_HEARTBEAT, truncated_fragment, declared_length=declared_length)
+
+    assert check_heartbleed(packet) is None

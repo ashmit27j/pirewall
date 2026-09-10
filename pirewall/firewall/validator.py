@@ -23,6 +23,24 @@ is the *client* end of that connection, so a rule targeting the Pi's own
 address (the *server* end, and every LAN client's default gateway) passed
 every check. `pirewall_lan_ip` and `upstream_gateway` now get their own
 checks; see docs/PROGRESS.md "Known deviations from spec".
+
+A later field session found the same gap once more, from the other
+direction: configuration names *some* of the Pi's addresses, never all of
+them. A Pi routing between a LAN AP, a WAN uplink and a wired admin link
+holds three, and the WAN one is a DHCP lease nobody writes down — six
+`BLOCK` rules against the Pi's own WAN address reached the approval queue.
+The safety stage therefore also consults
+`pirewall.firewall.local_addresses`, the kernel's own view of which
+addresses this host holds, and rejects any candidate naming one of them or
+a local broadcast address. That source degrades to empty (leaving the
+configured checks exactly as they were) rather than failing.
+
+The same stage rejects candidates naming an address no host can own —
+`0.0.0.0`, `255.255.255.255`, multicast, loopback, link-local. Such a rule
+is never enforceable and never evidence-backed;
+`pirewall.flow.aggregator` already keeps that traffic out of the pipeline,
+but safety validation is not permitted to assume an upstream layer was
+careful.
 """
 
 from collections.abc import Callable, Sequence
@@ -34,6 +52,7 @@ from pirewall.config.models import PirewallConfig
 from pirewall.core.enums import FirewallAction, RuleRejectionReason, RuleStatus
 from pirewall.core.models.allowlist import AllowlistEntry
 from pirewall.core.models.rule import CandidateRule, FirewallRule
+from pirewall.firewall.local_addresses import LocalAddresses, cached_local_addresses
 from pirewall.firewall.rate_limiter import RuleCreationRateLimiter
 
 _WHOLE_INTERNET = IPv4Network("0.0.0.0/0")
@@ -66,8 +85,14 @@ def validate_candidate_rule(
     allowlist: Sequence[AllowlistEntry],
     rate_limiter: RuleCreationRateLimiter,
     now: datetime,
+    local_addresses: LocalAddresses | None = None,
 ) -> ValidationOutcome:
     """Run the full validation chain against `candidate`, in order.
+
+    `local_addresses` overrides the safety stage's view of which addresses
+    this host holds; when omitted it is read from the kernel (see
+    `pirewall.firewall.local_addresses`). Tests pass it explicitly so their
+    result does not depend on the addressing of the machine they run on.
 
     Each stage is only *called* once it's actually its turn — building an
     eagerly-evaluated tuple of call results here would run every stage
@@ -79,7 +104,7 @@ def validate_candidate_rule(
         ("schema", lambda: _validate_schema(candidate)),
         ("network", lambda: _validate_network(candidate)),
         ("allowlist", lambda: _validate_allowlist(candidate, allowlist)),
-        ("safety", lambda: _validate_safety(candidate, config)),
+        ("safety", lambda: _validate_safety(candidate, config, local_addresses)),
         ("conflict", lambda: _validate_conflict(candidate, active_rules)),
         ("duplicate", lambda: _validate_duplicate(candidate, active_rules)),
         ("rate_cap", lambda: _validate_rate_cap(rate_limiter, now)),
@@ -141,9 +166,30 @@ def _matches_allowlist(candidate: CandidateRule, entry: AllowlistEntry) -> bool:
     return source_match or destination_match
 
 
-def _validate_safety(candidate: CandidateRule, config: PirewallConfig) -> RuleRejectionReason | None:
+def _validate_safety(
+    candidate: CandidateRule,
+    config: PirewallConfig,
+    local_addresses: LocalAddresses | None = None,
+) -> RuleRejectionReason | None:
     if candidate.action not in _RESTRICTIVE_ACTIONS:
         return None
+
+    # No rule may ever name an address that is not a routable unicast host
+    # address: the unspecified address, the limited broadcast address,
+    # multicast, loopback, link-local. Such a rule cannot be backed by
+    # single-host evidence and cannot describe a real peer.
+    for network in (candidate.source, candidate.destination):
+        if not _is_targetable_network(network):
+            return RuleRejectionReason.UNSAFE
+
+    # spec §24 "blocking pirewall itself": every address this host actually
+    # holds, as the kernel reports it — not just the ones configuration
+    # happens to name. Empty when unavailable, which changes nothing.
+    resolved_local = cached_local_addresses() if local_addresses is None else local_addresses
+    for address in (*resolved_local.host, *resolved_local.broadcast):
+        own = IPv4Network(f"{address}/32")
+        if candidate.source.overlaps(own) or candidate.destination.overlaps(own):
+            return RuleRejectionReason.UNSAFE
 
     admin_pc = IPv4Network(f"{config.admin.admin_pc_ip}/32")
     if candidate.source.overlaps(admin_pc) or candidate.destination.overlaps(admin_pc):
@@ -179,6 +225,25 @@ def _validate_safety(candidate: CandidateRule, config: PirewallConfig) -> RuleRe
         return RuleRejectionReason.UNSAFE
 
     return None
+
+
+def _is_targetable_network(network: IPv4Network) -> bool:
+    """True if every address in `network` could be a real host a rule may name.
+
+    A `/32` is judged on its single address. A wider prefix is judged on
+    both ends, which is enough to catch a candidate that reaches into
+    multicast, loopback or link-local space from either side.
+    """
+    for address in (network.network_address, network.broadcast_address):
+        if (
+            address.is_unspecified
+            or address.is_loopback
+            or address.is_multicast
+            or address.is_link_local
+            or address.is_reserved
+        ):
+            return False
+    return True
 
 
 def _covers(candidate_network: IPv4Network, target: IPv4Network) -> bool:

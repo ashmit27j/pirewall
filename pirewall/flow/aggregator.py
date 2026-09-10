@@ -7,6 +7,21 @@ still be counted upstream in capture statistics (Phase 2); this module just
 never emits an IPv6 `Flow` because `pirewall.core.models.Flow` structurally
 cannot represent one.
 
+**Non-unicast addresses never become flows.** DHCP (`0.0.0.0` ->
+`255.255.255.255`), mDNS/SSDP (`224.0.0.0/4`), APIPA (`169.254.0.0/16`) and
+loopback traffic are ordinary link-level infrastructure, not connections
+between hosts, and the adaptive pipeline has no meaningful way to reason
+about them: they have no single owner to attribute behavior to and no
+address a firewall rule could sensibly target. Left in, every device
+joining the AP contributed a burst of `0.0.0.0` DHCP flows that the
+behavior analyser scored as one very busy "source" — the origin of the
+`slow_rate_dos` / `repeated_connections` findings reported against
+`0.0.0.0`. They are filtered here, at the single entry point to the
+pipeline, for the same reason IPv6 is (A5): a shape the rest of the
+pipeline should never have to special-case. `pirewall.firewall.validator`
+rejects them again independently, because safety validation may not depend
+on an upstream layer having already been careful.
+
 **`on_new_flow` (ADDENDUM_2.md B1).** Fires once per flow, at creation —
 the only point volumetric behavioral signals (scanning, destination
 diversity, burst rate) actually need, since they're derived from connection
@@ -20,7 +35,7 @@ flow one direction"). Whatever wires the two together at runtime
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from ipaddress import IPv4Address
+from ipaddress import IPv4Address, IPv4Network
 from uuid import uuid4
 
 from pirewall.config.models import FlowConfig
@@ -73,6 +88,40 @@ class NewFlowSignal:
 type NewFlowSink = Callable[[NewFlowSignal], None]
 
 
+def is_routable_unicast(address: IPv4Address, protected_network: IPv4Network | None = None) -> bool:
+    """True if `address` is a host address a flow (and therefore a rule) could sensibly name.
+
+    False for the unspecified address (`0.0.0.0`), the limited broadcast
+    address (`255.255.255.255`), multicast (`224.0.0.0/4`), loopback
+    (`127.0.0.0/8`), link-local/APIPA (`169.254.0.0/16`) and the reserved
+    `240.0.0.0/4` block. When `protected_network` is given, its own
+    subnet-directed broadcast address (e.g. `192.168.100.255` for a /24) is
+    excluded too — intrinsically it looks like an ordinary host address, so
+    only the local prefix can identify it.
+
+    Deliberately *not* a "is this a public address" check: RFC 1918 space is
+    exactly what the protected LAN uses, and blocking a misbehaving LAN
+    client is a core use case.
+    """
+    if (
+        address.is_unspecified
+        or address.is_loopback
+        or address.is_multicast
+        or address.is_link_local
+        or address.is_reserved
+        or address == _LIMITED_BROADCAST
+    ):
+        return False
+    return not (
+        protected_network is not None
+        and protected_network.prefixlen < 31
+        and address == protected_network.broadcast_address
+    )
+
+
+_LIMITED_BROADCAST = IPv4Address("255.255.255.255")
+
+
 class FlowAggregator:
     """Routes packets into a bounded flow table and emits completed/expired flows."""
 
@@ -80,11 +129,13 @@ class FlowAggregator:
         self,
         config: FlowConfig,
         on_new_flow: NewFlowSink | None = None,
+        protected_network: IPv4Network | None = None,
     ) -> None:
         self._table = FlowTable(max_flows=config.max_flows)
         self._active_timeout_seconds = float(config.active_timeout_seconds)
         self._inactive_timeout_seconds = float(config.inactive_timeout_seconds)
         self._on_new_flow = on_new_flow
+        self._protected_network = protected_network
 
     def __len__(self) -> int:
         """Number of flows currently open in the table."""
@@ -97,11 +148,18 @@ class FlowAggregator:
         effect of processing this packet: an evicted flow (table was at
         capacity), a flow this packet just completed (TCP FIN/RST), or both.
         IPv6 packets are silently ignored (ADDENDUM.md A5, see module
-        docstring) and always return an empty list.
+        docstring) and always return an empty list, as is any packet whose
+        source or destination is not a routable unicast address (see
+        `is_routable_unicast` and the module docstring).
         """
         if not isinstance(packet.source_ip, IPv4Address) or not isinstance(
             packet.destination_ip, IPv4Address
         ):
+            return []
+
+        if not is_routable_unicast(
+            packet.source_ip, self._protected_network
+        ) or not is_routable_unicast(packet.destination_ip, self._protected_network):
             return []
 
         key = compute_flow_key(

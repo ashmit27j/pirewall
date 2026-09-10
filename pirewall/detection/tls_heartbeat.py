@@ -128,6 +128,15 @@ def _check_heartbleed(payload: bytes) -> HeartbleedMatch | None:
     if declared_length < _HEARTBEAT_HEADER_LEN or declared_length > _MAX_RECORD_LENGTH:
         return None
 
+    # The record must be *complete* in this buffer. `payload` is one TCP
+    # segment, not a reassembled stream, so a record that runs past the end
+    # of the segment is simply split across segments — the missing bytes
+    # are in the next one, not evidence of anything. Judging such a record
+    # against only its captured (truncated) bytes is what let a large,
+    # ordinary TLS record be reported as Heartbleed.
+    if len(payload) < _RECORD_HEADER_LEN + declared_length:
+        return None
+
     fragment = payload[_RECORD_HEADER_LEN : _RECORD_HEADER_LEN + declared_length]
     if len(fragment) < _HEARTBEAT_HEADER_LEN:
         return None
@@ -136,7 +145,10 @@ def _check_heartbleed(payload: bytes) -> HeartbleedMatch | None:
         return None
 
     claimed_payload_length = struct.unpack("!H", fragment[1:3])[0]
-    available_bytes = len(fragment) - _HEARTBEAT_HEADER_LEN
+    # Capacity per the record's own declared length, not `len(fragment)` —
+    # identical now thanks to the completeness guard above, but stating it
+    # this way keeps the comparison anchored to the record's own claim.
+    available_bytes = declared_length - _HEARTBEAT_HEADER_LEN
     if claimed_payload_length > available_bytes:
         return HeartbleedMatch(
             claimed_payload_length=claimed_payload_length, available_bytes=available_bytes

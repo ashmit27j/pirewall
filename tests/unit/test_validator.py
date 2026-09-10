@@ -8,12 +8,17 @@ from pirewall.config.models import PirewallConfig
 from pirewall.core.enums import FirewallAction, Protocol, RuleRejectionReason
 from pirewall.core.models.allowlist import AllowlistEntry
 from pirewall.core.models.rule import CandidateRule, FirewallRule
+from pirewall.firewall.local_addresses import LocalAddresses
 from pirewall.firewall.rate_limiter import RuleCreationRateLimiter
 from pirewall.firewall.validator import ValidationOutcome, validate_candidate_rule
 from tests.helpers.config import make_config
 from tests.helpers.rules import make_candidate, make_firewall_rule
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+# Pinned so these tests never depend on the addressing of the machine they
+# run on; the safety stage reads the real host's addresses by default.
+NO_LOCAL_ADDRESSES = LocalAddresses(host=frozenset(), broadcast=frozenset())
 
 
 def _validate(
@@ -24,6 +29,7 @@ def _validate(
     active_rules: Sequence[FirewallRule] = (),
     allowlist: Sequence[AllowlistEntry] = (),
     rate_limiter: RuleCreationRateLimiter | None = None,
+    local_addresses: LocalAddresses = NO_LOCAL_ADDRESSES,
 ) -> ValidationOutcome:
     return validate_candidate_rule(
         candidate,
@@ -33,6 +39,7 @@ def _validate(
         allowlist=allowlist,
         rate_limiter=rate_limiter or RuleCreationRateLimiter(max_per_window=100, window_seconds=60),
         now=NOW,
+        local_addresses=local_addresses,
     )
 
 
@@ -214,3 +221,54 @@ def test_protocol_none_in_allowlist_entry_matches_any_protocol() -> None:
     )
     outcome = _validate(candidate, allowlist=(entry,))
     _assert_rejected(outcome, "allowlist", RuleRejectionReason.ALLOWLISTED)
+
+
+def test_safety_stage_rejects_a_rule_naming_one_of_this_hosts_own_addresses() -> None:
+    """Regression: a self-lockout configuration alone could not see.
+
+    A Pi routing between a LAN AP, a WAN uplink and a wired admin link
+    holds several addresses; only `pirewall_lan_ip` is in the config, and
+    the WAN one is a DHCP lease. Six `BLOCK` rules against the Pi's own WAN
+    address reached the approval queue in the field.
+    """
+    wan_address = IPv4Network("10.253.156.107/32")
+    local = LocalAddresses(host=frozenset({wan_address.network_address}), broadcast=frozenset())
+
+    outcome = _validate(make_candidate(source=wan_address), local_addresses=local)
+
+    _assert_rejected(outcome, "safety", RuleRejectionReason.UNSAFE)
+
+
+def test_safety_stage_rejects_a_rule_naming_a_local_broadcast_address() -> None:
+    broadcast = IPv4Network("192.168.100.255/32")
+    local = LocalAddresses(host=frozenset(), broadcast=frozenset({broadcast.network_address}))
+
+    outcome = _validate(make_candidate(destination=broadcast), local_addresses=local)
+
+    _assert_rejected(outcome, "safety", RuleRejectionReason.UNSAFE)
+
+
+def test_safety_stage_rejects_the_unspecified_address() -> None:
+    """`0.0.0.0` is not a host: no rule naming it is enforceable or evidence-backed."""
+    outcome = _validate(make_candidate(source=IPv4Network("0.0.0.0/32")))
+
+    _assert_rejected(outcome, "safety", RuleRejectionReason.UNSAFE)
+
+
+def test_safety_stage_rejects_the_limited_broadcast_address() -> None:
+    outcome = _validate(make_candidate(destination=IPv4Network("255.255.255.255/32")))
+
+    _assert_rejected(outcome, "safety", RuleRejectionReason.UNSAFE)
+
+
+def test_safety_stage_rejects_multicast_loopback_and_link_local() -> None:
+    for target in ("224.0.0.251/32", "127.0.0.1/32", "169.254.10.4/32"):
+        outcome = _validate(make_candidate(source=IPv4Network(target)))
+        _assert_rejected(outcome, "safety", RuleRejectionReason.UNSAFE)
+
+
+def test_safety_stage_still_permits_an_ordinary_lan_client() -> None:
+    """The new checks must not make blocking a misbehaving LAN host impossible."""
+    outcome = _validate(make_candidate(source=IPv4Network("192.168.100.57/32")))
+
+    assert outcome.approved is True

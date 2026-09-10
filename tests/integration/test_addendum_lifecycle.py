@@ -123,8 +123,13 @@ def test_assisted_mode_monitor_always_auto_deploys() -> None:
 
 def test_kill_switch_removes_active_rules_and_sets_shadow_mode() -> None:
     manager, backend = _manager(firewall={"enforcement_mode": "active"})
+    # RFC 5737 TEST-NET-3 (203.0.113.0/24, reserved for documentation) —
+    # never a real host's own address, unlike a private-range address such
+    # as 192.168.1.x, which the safety stage's local-address check
+    # (pirewall.firewall.local_addresses) could coincidentally match on
+    # whatever machine the suite happens to run on.
     candidates = [
-        make_candidate(decision_id=f"decision-{i}", destination=f"192.168.1.{20 + i}/32")
+        make_candidate(decision_id=f"decision-{i}", destination=f"203.0.113.{20 + i}/32")
         for i in range(3)
     ]
     for candidate in candidates:

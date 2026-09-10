@@ -288,7 +288,11 @@ class CoreDaemon:
             maxsize=_SLOW_CLUSTER_QUEUE_MAX
         )
         self._slow_clusters_dropped = 0
-        self._aggregator = FlowAggregator(config.flow, on_new_flow=self._handle_new_flow)
+        self._aggregator = FlowAggregator(
+            config.flow,
+            on_new_flow=self._handle_new_flow,
+            protected_network=config.network.protected_network,
+        )
         # ADDENDUM_2.md B4/B5 — written by the capture thread
         # (`_handle_tcp_payload`), read/popped by the detection thread
         # (`_pop_tls_evidence`) once the flow it belongs to completes.

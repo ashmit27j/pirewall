@@ -1,18 +1,28 @@
 """`FlowAggregator`: end-to-end packet -> Flow behavior (spec §8, ADDENDUM.md A5)."""
 
 from datetime import UTC, datetime, timedelta
+from ipaddress import IPv4Address, IPv4Network
 
 from pirewall.config.models import FlowConfig
 from pirewall.core.enums import AddressFamily, Protocol
 from pirewall.core.models.common import TcpFlags
 from pirewall.core.models.flow import Flow
-from pirewall.flow.aggregator import FlowAggregator, NewFlowSignal, NewFlowSink
+from pirewall.flow.aggregator import (
+    FlowAggregator,
+    NewFlowSignal,
+    NewFlowSink,
+    is_routable_unicast,
+)
 from tests.helpers.flows import make_packet
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
 
-def _aggregator(on_new_flow: NewFlowSink | None = None, **overrides: object) -> FlowAggregator:
+def _aggregator(
+    on_new_flow: NewFlowSink | None = None,
+    protected_network: IPv4Network | None = None,
+    **overrides: object,
+) -> FlowAggregator:
     defaults: dict[str, object] = {
         "active_timeout_seconds": 1800,
         "inactive_timeout_seconds": 60,
@@ -20,7 +30,11 @@ def _aggregator(on_new_flow: NewFlowSink | None = None, **overrides: object) -> 
         "cleanup_interval_seconds": 30,
     }
     defaults.update(overrides)
-    return FlowAggregator(FlowConfig.model_validate(defaults), on_new_flow=on_new_flow)
+    return FlowAggregator(
+        FlowConfig.model_validate(defaults),
+        on_new_flow=on_new_flow,
+        protected_network=protected_network,
+    )
 
 
 def test_syn_then_ack_stays_open_until_completion() -> None:
@@ -276,3 +290,99 @@ def test_udp_flow_produces_expected_protocol_on_finalization() -> None:
     emitted = aggregator.sweep_timeouts(T0 + timedelta(seconds=11))
     assert len(emitted) == 1
     assert emitted[0].protocol is Protocol.UDP
+
+
+def test_dhcp_discover_never_becomes_a_flow() -> None:
+    """Regression: `0.0.0.0` reported as an attacking source.
+
+    Every device joining the AP sends DHCP DISCOVER/REQUEST from `0.0.0.0`
+    to `255.255.255.255`. Those packets used to open flows, all keyed to
+    the same non-existent "source", which the behavior analyser then scored
+    as one host making many repeated connections.
+    """
+    signals: list[NewFlowSignal] = []
+    aggregator = _aggregator(on_new_flow=signals.append)
+
+    emitted = aggregator.process_packet(
+        make_packet(
+            source_ip="0.0.0.0",
+            destination_ip="255.255.255.255",
+            source_port=68,
+            destination_port=67,
+            protocol=Protocol.UDP,
+            timestamp=T0,
+        )
+    )
+
+    assert emitted == []
+    assert len(aggregator) == 0
+    assert signals == []
+
+
+def test_multicast_and_link_local_traffic_never_becomes_a_flow() -> None:
+    """mDNS, SSDP and APIPA are link infrastructure, not host-to-host connections."""
+    aggregator = _aggregator()
+    for source, destination in (
+        ("192.168.100.57", "224.0.0.251"),  # mDNS
+        ("192.168.100.57", "239.255.255.250"),  # SSDP
+        ("169.254.10.4", "192.168.100.57"),  # APIPA
+        ("127.0.0.1", "127.0.0.1"),  # loopback
+    ):
+        assert (
+            aggregator.process_packet(
+                make_packet(
+                    source_ip=source,
+                    destination_ip=destination,
+                    protocol=Protocol.UDP,
+                    timestamp=T0,
+                )
+            )
+            == []
+        )
+    assert len(aggregator) == 0
+
+
+def test_subnet_directed_broadcast_is_filtered_when_the_protected_network_is_known() -> None:
+    """`192.168.100.255` looks like a host address; only the local prefix identifies it."""
+    aggregator = _aggregator(protected_network=IPv4Network("192.168.100.0/24"))
+
+    emitted = aggregator.process_packet(
+        make_packet(
+            source_ip="192.168.100.57",
+            destination_ip="192.168.100.255",
+            protocol=Protocol.UDP,
+            timestamp=T0,
+        )
+    )
+
+    assert emitted == []
+    assert len(aggregator) == 0
+
+
+def test_ordinary_lan_traffic_is_unaffected_by_the_filter() -> None:
+    aggregator = _aggregator(protected_network=IPv4Network("192.168.100.0/24"))
+
+    aggregator.process_packet(
+        make_packet(
+            source_ip="192.168.100.57",
+            destination_ip="1.1.1.1",
+            protocol=Protocol.UDP,
+            timestamp=T0,
+        )
+    )
+
+    assert len(aggregator) == 1
+
+
+def test_is_routable_unicast_classification() -> None:
+    assert is_routable_unicast(IPv4Address("192.168.100.57")) is True
+    assert is_routable_unicast(IPv4Address("8.8.8.8")) is True
+    assert is_routable_unicast(IPv4Address("0.0.0.0")) is False
+    assert is_routable_unicast(IPv4Address("255.255.255.255")) is False
+    assert is_routable_unicast(IPv4Address("224.0.0.251")) is False
+    assert is_routable_unicast(IPv4Address("169.254.1.1")) is False
+    assert is_routable_unicast(IPv4Address("127.0.0.1")) is False
+    # Only identifiable with the local prefix in hand.
+    lan = IPv4Network("192.168.100.0/24")
+    assert is_routable_unicast(IPv4Address("192.168.100.255")) is True
+    assert is_routable_unicast(IPv4Address("192.168.100.255"), lan) is False

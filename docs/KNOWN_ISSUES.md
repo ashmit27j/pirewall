@@ -31,12 +31,13 @@ move to a new uplink network.
 | 10 | Runtime allowlist additions are not persisted | Medium | Reasoned |
 | 11 | `AF_PACKET`, `nft` and systemd paths remain partly unverified | Medium | Deferred |
 | 12 | Dashboard JS is checked by a scanner, not a parser | Low | Deferred |
-| 13 | An unmerged branch predates this work | Low | Observed |
+| 13 | An unmerged branch predates this work | Low | Fixed |
 | 14 | `capture_stats.packets_seen` did not move during a live check | Low | Observed |
 | 15 | `pirewall-api` cannot write its own log file | Low | Observed |
 | 16 | Moving the Pi to a new network silently staleness-rots the config | Medium | Fixed |
 | 17 | `security.session_timeout_seconds` is read by nothing | Low | Observed |
 | 18 | A TLS-only port answers plaintext HTTP with a bare teardown | Low | Observed |
+| 19 | Some tests depend on the host's real network addressing | Low | Observed |
 
 ---
 
@@ -264,11 +265,56 @@ better and should replace the scanner.
 
 ## 13. An unmerged branch predates this work
 
-**Status: Observed.** `fix/ap-uplink-and-detection-false-positives` at
-`d32a6b2` — "four false-positive/self-lockout defects from the first AP
-deployment". It has never been merged and its subject overlaps directly with
-items 1–3. Review it before doing further false-positive work; some of it may
-already be fixed, and some may still be needed.
+**Status: Fixed (2026-09-10).** `fix/ap-uplink-and-detection-false-positives`
+at `d32a6b2` — "four false-positive/self-lockout defects from the first AP
+deployment" — reviewed this session against `main` and against `c88f724`
+(which landed after the branch and independently fixed one of its four
+issues). Outcome per defect:
+
+1. **Heartbleed false-positive on ordinary HTTPS** — `c88f724` already
+   fixed the "checks only `payload[0]==24`" root cause on `main`, but
+   neither `main` nor the branch's *own* fix caught a second, distinct bug:
+   the length comparison was judged against `len(fragment)` (whatever bytes
+   happened to be captured in *this* TCP segment) rather than the record's
+   own declared length, so a large, entirely ordinary TLS record split
+   across segments could still false-match. Cherry-picked just that guard
+   (record must be complete within the segment before being judged at all)
+   onto `main`'s current detector, keeping `main`'s existing
+   `_LEGAL_HEARTBEAT_TYPES` check that the branch's version had dropped.
+   New regression test confirmed to fail against the pre-fix code first.
+2. **Rules naming the Pi's own address passed safety validation** — not
+   covered by `c88f724` at all. Cherry-picked whole:
+   `pirewall/firewall/local_addresses.py` (reads `/proc/net/fib_trie` for
+   every address the host actually holds, stdlib-only, TTL-cached,
+   degrades to empty on any error) plus `validator.py`'s safety-stage
+   changes (rejects a candidate naming one of the host's own addresses,
+   and rejects any candidate touching a non-unicast address at all —
+   unspecified, broadcast, multicast, loopback, link-local, reserved).
+   Both files' branch tests (`test_local_addresses.py`,
+   `test_validator.py`'s six new cases) applied unchanged and pass.
+3. **DHCP `0.0.0.0`/broadcast traffic became flows** — not covered by
+   `c88f724`. Cherry-picked whole: `is_routable_unicast()` in
+   `pirewall/flow/aggregator.py`, filtering non-unicast source/destination
+   addresses at the pipeline's single entry point, plus its
+   `protected_network`-aware subnet-broadcast check, wired into
+   `CoreDaemon`'s `FlowAggregator` construction. Branch's
+   `test_flow_aggregator.py` additions applied unchanged and pass.
+4. **ARP reported as a malformed `CAPTURE_ERROR`** — already fixed on
+   `main` by `c88f724`'s `UnsupportedProtocolError` (the branch's version
+   is the same fix under the name `UnsupportedFrameError`, dropping the
+   "counted, never reported" behavior `c88f724` chose to keep). Discarded;
+   `main`'s version stands.
+
+`docs/FIELD_FIXES.md` (branch-only) was reviewed and not imported — it
+documents host NetworkManager/nftables changes made by hand on a network
+topology this deployment has since moved off twice (see item 16), so it is
+historical record rather than actionable content; `setup-new-network.md`
+and this document already carry the current state.
+
+Applying items 2–3 surfaced one test that depended on this machine's real
+address (item 19), fixed at the point of failure. Branch deleted
+(`git branch -D fix/ap-uplink-and-detection-false-positives`) — everything
+useful in it is on `main` now, or was superseded.
 
 ## 14. `capture_stats.packets_seen` did not move during a live check
 
@@ -424,6 +470,44 @@ and this symptom belongs in a troubleshooting section so the next person
 recognises it in one step instead of thirty.
 
 ---
+
+## 19. Tests that submit a candidate rule without pinning `local_addresses` depend on the host's real addressing
+
+**Status: Observed (2026-09-10), one instance fixed.**
+`pirewall/firewall/local_addresses.py` (cherry-picked this session from
+`fix/ap-uplink-and-detection-false-positives`, see item 13) made the safety
+validation stage consult the *real* kernel's own address table by default
+(`cached_local_addresses()`) whenever a caller doesn't inject
+`local_addresses` explicitly — which is exactly right for
+`pirewall-core` in production, but means any test that calls
+`FirewallManager.submit_candidate` (which does not expose a way to inject
+`local_addresses`) without choosing addresses known to be unclaimed
+anywhere is silently host-dependent.
+
+Hit immediately:
+`tests/integration/test_addendum_lifecycle.py::test_kill_switch_removes_active_rules_and_sets_shadow_mode`
+used destinations `192.168.1.20`–`192.168.1.22/32`; on this Pi, `wlan1`
+(the WAN interface) currently holds `192.168.1.22` as its live DHCP lease,
+so the safety stage correctly rejected that one candidate as unsafe and the
+test failed — not a bug in the check, but a test that happened to name the
+machine's own address. Fixed by moving the test to `203.0.113.0/24` (RFC
+5737 TEST-NET-3, reserved for documentation and never a real host's
+address).
+
+**Cost.** Low today (one test, one obvious fix), but the same shape can
+recur in any future test that exercises the real validation path with a
+private-range address, and it will only surface on whichever machine
+happens to hold that address at the time — a classic "passes in CI, fails
+on the Pi" (or vice versa) flake.
+
+**Fixing it properly** would mean giving `FirewallManager`/
+`submit_candidate` an explicit (optional) `local_addresses` parameter the
+way `validate_candidate_rule` already has, so tests can pin
+`LocalAddresses(host=frozenset(), broadcast=frozenset())` the same way
+`tests/unit/test_validator.py` does — not attempted this session, since it
+touches `FirewallManager`'s public signature and the only concrete failure
+found was one test, fixed at the point of failure. Worth doing before this
+bites again.
 
 ## Not issues
 

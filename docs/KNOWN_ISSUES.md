@@ -38,6 +38,8 @@ move to a new uplink network.
 | 17 | `security.session_timeout_seconds` is read by nothing | Low | Observed |
 | 18 | A TLS-only port answers plaintext HTTP with a bare teardown | Low | Observed |
 | 19 | Some tests depend on the host's real network addressing | Low | Observed |
+| 20 | Real floods/scans are detected but never scored above LOW | High | Observed |
+| 21 | A flood evicts the bounded history buffers within seconds | Medium | Observed |
 
 ---
 
@@ -334,15 +336,28 @@ the single-writer pattern to copy.
 
 ## 11. `AF_PACKET`, `nft` and systemd paths remain partly unverified
 
-**Status: Deferred**, and partly resolved. As of this deployment the
-following *are* exercised for real on the Pi: `nft` rule loading, the
-adaptive backend creating and populating its table, both `AF_UNIX` RPC
-sockets with their group ownership, systemd supervision of all three units,
-and the crash-loop limiter actually firing.
+**Status: Deferred**, and partly resolved further this session. As of this
+deployment the following *are* exercised for real on the Pi: `nft` rule
+loading, the adaptive backend creating and populating its table, both
+`AF_UNIX` RPC sockets with their group ownership, systemd supervision of
+all three units, and the crash-loop limiter actually firing.
 
-Still unverified: `AFPacketCapture` under sustained load (drop counters,
-promiscuous mode, kernel drop statistics), `NftablesBackend` rule *removal*
-under contention, and the watchdog actually reaping a hung process.
+**`AFPacketCapture` under sustained load: now Observed (2026-09-10)**, via
+the attack-lab benchmark (`benchmarks/2026-09-10-attack-lab/REPORT.md`). A
+~10,000 pkt/s `hping3` SYN flood for 15s produced `packets_seen=19,695`
+against `packets_dropped=297,595` — **roughly 94% of the flood dropped** at
+the kernel/ring-buffer level before reaching pirewall's own pipeline. A
+~8,900 pkt/s UDP flood showed the same shape (~77% dropped). The Pi's
+hardware is the bottleneck, confirmed real rather than assumed; what
+survived capture was still enough for the behavioral layer to flag every
+attack (see #20 for what happened to the score once flagged).
+`pirewall-core`/`pirewall-api`/`pirewall-portal` stayed `active` throughout
+both floods — no crash, no watchdog intervention, load average recovered.
+
+Still unverified: `NftablesBackend` rule *removal* under contention, and
+the watchdog actually reaping a hung process — nothing in this session's
+traffic exercised either (enforcement stayed in `shadow`, and the daemon
+never hung).
 
 `docs/PROGRESS.md` carries the per-phase labels.
 
@@ -415,17 +430,22 @@ useful in it is on `main` now, or was superseded.
 
 ## 14. `capture_stats.packets_seen` did not move during a live check
 
-**Status: Observed, cause not established.** After a restart,
+**Status: Confirmed (2026-09-10).** After a restart,
 `get_capture_stats()` reported `packets_seen=0` while the daemon was
 demonstrably parsing packets — the log showed it processing ARP frames from
 traffic generated seconds earlier.
 
-Most likely the counter is only sampled on the metrics tick and the read
-raced it, in which case nothing is wrong except that a operator reading the
-control panel's Network panel right after a restart sees a zero that is not
-true. Worth confirming: if the counter is genuinely not incremented for
-frames that fail to parse, the Network panel under-reports traffic, and
-"packets seen" would not mean what an operator assumes.
+The metrics-tick-lag hypothesis is now confirmed rather than assumed: during
+the attack-lab benchmark (`benchmarks/2026-09-10-attack-lab/`), querying
+`get_capture_stats()` immediately after a burst of traffic showed no
+change in `packets_seen`; re-querying 3 seconds later showed it had
+advanced by 2,138. The counter is genuinely only sampled on the metrics
+tick, not incremented and read live — a real operator reading the control
+panel's Network panel right after a burst (or a restart) will see a stale
+number for up to one tick interval, which is cosmetic rather than a
+capture fault. Whether frames that fail to parse are excluded from the
+counter (this document's second open question) was not specifically
+isolated this session.
 
 ---
 
@@ -605,6 +625,83 @@ way `validate_candidate_rule` already has, so tests can pin
 touches `FirewallManager`'s public signature and the only concrete failure
 found was one test, fixed at the point of failure. Worth doing before this
 bites again.
+
+## 20. Real floods/scans are detected but never scored above LOW
+
+**Status: Observed (2026-09-10)**, from the attack-lab benchmark
+(`benchmarks/2026-09-10-attack-lab/REPORT.md`). Five attack types were run
+against the Pi's own LAN address in `shadow` mode: a `nmap -sS` port scan,
+a `hping3` SYN flood (~10,000 pkt/s), a `hping3` UDP flood (~8,900 pkt/s),
+a slow brute-force login, and 200 concurrent small HTTP requests. **The
+behavioral layer correctly flagged every one of the first, second, fourth
+and fifth as anomalous** (`scanning`, `high_frequency`, `burst`,
+`repeated_failures`, `slow_rate_dos` all fired appropriately), and the
+third was caught by the portal's own independent login throttle. But
+**none of them ever reached a `threat_score` above 33.3/100 —
+`ThreatLevel.LOW` throughout, never MEDIUM, HIGH, or CRITICAL.**
+
+**Cost.** This is the mirror image of items 1–3 (false positives on benign
+traffic): here the pipeline correctly identifies genuinely malicious
+volumetric traffic as anomalous and then **fails to act on its own
+finding**. In `active` enforcement mode, none of these four attack types
+would have been rate-limited or blocked — only logged. A real, sustained
+SYN flood or port scan against this deployment today would pass through
+enforcement entirely unaffected.
+
+**Why.** `known_evidence` never corroborated any of these — LightGBM's
+`predicted_class` stayed `BENIGN` even for the port scan at 99.99%
+confidence (the same CICIDS2017 generalization gap items 1–2 already
+document, just in the opposite direction: here the model *should* have
+flagged an attack and didn't). `pirewall/engine/scoring.py`'s current
+weighting depends on `known_evidence` corroboration to reach a score high
+enough to act; a behavior-only signal, however many patterns it fires,
+tops out well below the levels current default thresholds would act on.
+
+**Not fixed this session** — out of scope for Step 2's false-positive
+investigation, and a real threshold/weight change here needs the same
+measured-baseline discipline items 1–3 already established, this time
+using attack-lab data (which now exists, in this benchmark's raw output)
+rather than production browsing data. **What fixing it involves**: either
+retraining/extending the ML model on labeled scan/flood traffic so
+`known_evidence` can corroborate a real attack (the same spec §34
+attack-lab exercise items 1–2 call for, now with real captured attack
+traffic to use), or deliberately reweighting `pirewall/engine/scoring.py`
+so a behavior-only signal with multiple concurrent patterns (as observed
+here — up to six firing at once) can reach RATE_LIMIT on its own, with the
+evidence-maturity gate (ADDENDUM_2.md B3) still guarding against a single
+weak signal doing so alone.
+
+## 21. A flood evicts the bounded history buffers within seconds
+
+**Status: Observed (2026-09-10)**, from the same attack-lab benchmark.
+`pirewall-core`'s in-memory history (`list_flows`/`list_detections`/
+`list_threats`, each capped at 500 entries — the same bounded-state
+discipline as the event history item 12 already describes) exists so the
+control panel and any RPC client can see recent activity without unbounded
+memory growth. Under the SYN flood (~10,000 pkt/s for 15s), **all 500
+entries in every one of those three lists were flood traffic within
+seconds** — the port-scan detection records captured moments earlier
+(saved to this benchmark's `1-nmap-scan-state.json` before the flood, for
+comparison) were completely gone from live state by the time the flood
+ended, evicted by the flood's own volume.
+
+**Cost.** With Wazuh forwarding still broken this session (item 6), there
+is no external copy of anything evicted this way — **a flood large enough
+to matter can also erase the record of everything that happened
+immediately before it**, from the one place (the control panel / RPC
+state) an operator without a working SIEM has to look. This is a genuine
+forensic gap distinct from item 12's dashboard-only description: it
+affects every RPC consumer, not just the rendered page, and a flood is
+exactly the scenario where an operator would most want that history intact
+afterward.
+
+**What fixing it involves.** A larger cap only delays the same problem at
+a larger flood size — the principled fix is getting Wazuh forwarding
+actually working (item 6) so history has an external, durable copy before
+`pirewall-core`'s own bounded buffers evict it, or persisting the bounded
+buffers to disk (a larger change, and a new place secrets-adjacent data
+would live, so not undertaken lightly). Not attempted this session;
+recorded here because it was directly observed, not merely theorized.
 
 ## Not issues
 

@@ -1,0 +1,10 @@
+Starting Nmap 7.99 ( https://nmap.org ) at 2026-09-10 21:14 +0530
+Nmap scan report for 192.168.100.1
+Host is up (0.0064s latency).
+Not shown: 998 filtered tcp ports (no-response)
+PORT   STATE SERVICE
+53/tcp open  domain
+80/tcp open  http
+MAC Address: 88:A2:9E:68:DB:5F (Raspberry Pi (Trading))
+
+Nmap done: 1 IP address (1 host up) scanned in 5.56 seconds

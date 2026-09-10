@@ -1,0 +1,6 @@
+[sudo] password for sshuser: hping in flood mode, no replies will be shown
+
+--- 192.168.100.1 hping statistic ---
+133475 packets transmitted, 0 packets received, 100% packet loss
+round-trip min/avg/max = 0.0/0.0/0.0 ms
+HPING 192.168.100.1 (wlan0 192.168.100.1): udp mode set, 28 headers + 0 data bytes

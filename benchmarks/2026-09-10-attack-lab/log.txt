@@ -1,0 +1,12 @@
+Baseline recorded at 2026-09-10 21:13:44
+T1 (nmap scan start): 2026-09-10T21:14:26+05:30
+T1 end: 2026-09-10T21:14:32+05:30
+T2 (hping3 SYN flood start): 2026-09-10T21:16:32+05:30
+T2 end: 2026-09-10T21:16:48+05:30
+{"interface":"wlan0","packets_seen":19695,"packets_dropped":297595,"packets_malformed":25}
+T3 (slow brute-force login start): 2026-09-10T21:19:56+05:30
+T3 end: 2026-09-10T21:20:28+05:30
+T4 (UDP DoS flood on DNS 53 start): 2026-09-10T21:21:04+05:30
+T4 end: 2026-09-10T21:21:19+05:30
+T5 (many small HTTP requests start): 2026-09-10T21:21:55+05:30
+T5 end: 2026-09-10T21:21:56+05:30

@@ -40,6 +40,7 @@ move to a new uplink network.
 | 19 | Some tests depend on the host's real network addressing | Low | Observed |
 | 20 | Real floods/scans are detected but never scored above LOW | High | Observed |
 | 21 | A flood evicts the bounded history buffers within seconds | Medium | Observed |
+| 22 | Restart button can't be built as `sudo` + sudoers under `NoNewPrivileges` | Low | Blocked |
 
 ---
 
@@ -757,6 +758,61 @@ secrets-adjacent data would live, so not undertaken lightly), or raising
 the cap (only delays the same problem at a larger flood size). Not
 attempted this session; recorded here because it was directly observed,
 not merely theorized.
+
+## 22. A "restart pirewall" control-panel button cannot be built as `sudo` + a sudoers grant
+
+**Status: Blocked, not attempted (2026-09-10).** Attempted per this
+session's phase prompt (Step 4b): a `POST /api/v1/system/restart` route,
+protected the same way every other write route is
+(`require_session`/`require_admin_pc`), shelling out via a narrow explicit
+`sudoers` grant restricted to exactly one command
+(`scripts/deployment/pirewall-start`), mirroring how CAP_NET_RAW/
+CAP_NET_ADMIN are scoped narrowly to `pirewall-core` and zero for
+`pirewall-api` (ADDENDUM.md A4).
+
+**`sudo` cannot run at all under `pirewall-api.service`'s existing
+`NoNewPrivileges=true`.** Confirmed empirically, not assumed:
+
+```
+$ sudo systemd-run --property=NoNewPrivileges=true --property=User=pirewall-api \
+    --wait --pipe sudo -n true
+sudo: The "no new privileges" flag is set, which prevents sudo from running as root.
+```
+
+`NoNewPrivileges` blocks any privilege-gaining `execve` for the process
+and everything it spawns — that includes `sudo`'s own setuid-root
+mechanism, unconditionally, regardless of any `sudoers` entry. The design
+as specified cannot work without touching that hardening, and the phase
+prompt's own instruction was explicit: stop and report rather than
+improvise a broader privilege grant to make it fit. Brought back to the
+user rather than decided unilaterally; the user chose to skip this item
+for the session rather than pick a workaround under time pressure.
+
+**Real options, for whenever this is picked up:**
+
+1. **D-Bus/`systemd` unit activation instead of `sudo`.** `pirewall-api`
+   asks `systemd` (pid 1, already privileged) over its D-Bus socket to
+   start one specific, narrowly-scoped unit
+   (e.g. `pirewall-restart.service`, `Type=oneshot`, running as root,
+   `ExecStart=scripts/deployment/pirewall-start`) — a `polkit` rule
+   restricts *which* caller may start *which* unit, so the grant stays as
+   narrow as the `sudoers` line would have been, and `NoNewPrivileges`
+   never has to move: no privilege escalation happens inside
+   `pirewall-api`'s own process at all, it only sends a message.
+   `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` already permits the
+   D-Bus socket's address family, so this is plausible without loosening
+   that either — but it is new infrastructure (a helper unit + a `polkit`
+   rule + a D-Bus client call), not a one-line config change, and needs
+   its own careful review before trusting it.
+2. **Drop `NoNewPrivileges=true` from `pirewall-api.service`.** Matches
+   the originally-specified design exactly, but reopens the setuid/
+   capability-gaining attack surface A4's process split deliberately
+   closed for this specific process — explicitly the path this session
+   was told not to take without asking first, and the user did not choose
+   it when asked.
+3. **Skip the feature.** What happened this session.
+
+Not implemented; no code changed for this item.
 
 ## Not issues
 

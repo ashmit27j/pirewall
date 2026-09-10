@@ -24,7 +24,7 @@ move to a new uplink network.
 | 3 | Behaviour thresholds still tuned for a quiet network | Medium | Observed |
 | 4 | Demo portal accounts are live on this deployment | High | Observed |
 | 5 | Enforcement is `assisted` without the recommended SHADOW soak | Medium | Fixed |
-| 6 | Wazuh and Netdata integrations never verified end to end | Medium | Observed |
+| 6 | Wazuh and Netdata integrations never verified end to end | Medium | Fixed |
 | 7 | Portal serves plaintext HTTP | Medium | Deferred |
 | 8 | Portal sessions do not survive a core restart | Low | Deferred |
 | 9 | `make_certs.sh` writes only one SAN | Low | Observed |
@@ -244,49 +244,59 @@ decision, not made in ignorance of them.
 
 ## 6. Wazuh and Netdata integrations were never verified end to end
 
-**Status: Observed, partially improved (2026-09-10).** Both are enabled in
-config and pointed at the Admin PC. Original baseline:
+**Status: Fixed (2026-09-10).** Both are enabled in config and pointed at
+the Admin PC. Original baseline:
 
 ```
 nc -zv 192.168.101.2 514    -> timeout
 nc -zuv 192.168.101.2 8125  -> timeout
 ```
 
-**Netdata (dashboard, TCP 19999): now reachable from the Pi** — a native
-Netdata install was already present on the Admin PC (Kali), just not
-exposed; confirmed `nc -zv 192.168.101.2 19999` succeeds. **StatsD (UDP
-8125, what `pirewall-core` actually forwards metrics to) is still not
-reachable**: `/opt/netdata/etc/netdata/netdata.conf`'s `[statsd]` section
-binds `udp:localhost` only. The fix is a one-line config change
-(`bind to = udp:0.0.0.0:8125`) plus `systemctl restart netdata`, both of
-which need `sudo` on that box — not completed this session because the
-account used for automated access there has no sudo rights yet being
-extended, and remote `sudo`-invoking commands that mutate system config are
-blocked by this environment's own permission classifier regardless.
-Left for a human to run directly on the Admin PC.
+**Netdata: fully working end to end.** The Admin PC already had a native
+Netdata install; its `[statsd]` config bound `udp:localhost` only. The user
+changed it to `bind to = udp:0.0.0.0:8125` and restarted the service.
+Confirmed: `ss -lunp` on the Admin PC now shows `0.0.0.0:8125`,
+`pirewall-core` logs zero Netdata forwarding failures since the restart
+(previously constant), and `GET /api/v1/charts` on the Netdata API lists
+18 real `statsd_pirewall.*` charts (cpu/memory, packet rate/drops, flow
+creation/expiration rate, inference count/latency, detection/block/rule
+counts, rule-rejection, api/capture/firewall health, adaptive-rule-budget
+fraction) — every metric §33 defines, actually arriving.
 
-**Wazuh: not attempted this session, timeboxed.**
-`setup-new-network.md` §8.3 budgets 6 GB RAM + 4 CPU cores for the Docker
-manager+indexer+dashboard stack (Kali has no native packages). The Admin PC
-had **3.7 GB free** (7.2 GB total, 3.5 GB already in use) at the time of
-this check — under budget, and this is the user's daily laptop, not a
-dedicated server, so pushing a heavy three-container stack onto it without
-headroom risked visible slowdown or worse while it's in active use. Per
-this session's own instruction to timebox infrastructure rabbit holes
-rather than force them, this was left for a deliberate decision rather than
-attempted: either free up RAM first, accept the swap-backed slowdown, or
-defer Wazuh to a machine with more headroom.
+**Wazuh: already running, and now fully working end to end too.** It
+turned out the Admin PC already had a full Wazuh stack (manager, indexer,
+dashboard, Docker Compose, `wazuh/wazuh-manager:4.14.7`) running for
+several days — this session's earlier RAM-budget concern and decision to
+timebox installing it was moot once checked directly. The actual gap was
+narrower: the manager published `514/udp` only (pirewall forwards over
+**TCP**), and its `ossec.conf` had no syslog collector configured at all
+(only the default `1514/tcp secure` agent-enrollment listener). The user:
 
-`pirewall-core` still logs a forwarding failure for every Wazuh event it
-tries to send. The forwarder degrades correctly — it counts failures and
-re-reports periodically rather than blocking the pipeline — so this
-remains a missing dependency, not a fault. **No security event pirewall
-has ever generated has reached a SIEM**, and the §32/§33 Wazuh integration
-path is still unexercised outside its unit tests; Netdata's metrics path is
-now one config change away from being exercised for the first time.
+1. Added a `<remote>` block (`connection=syslog`, `port=514`,
+   `protocol=tcp`, `allowed-ips=192.168.101.0/24`) to the manager's live
+   `ossec.conf` inside the container (persists in its named volume).
+2. Added `"514:514/tcp"` to `docker-compose.yml`'s manager service and ran
+   `docker compose up -d wazuh.manager` to publish it.
+3. Restarted the Wazuh process (`wazuh-control restart`) to load the new
+   collector.
 
-`setup-new-network.md` §8.3–8.4 has the install procedure for both, with and
-without Docker.
+Confirmed both directions: `nc -zv 192.168.101.2 514` succeeds; `docker
+port` shows `514/tcp -> 0.0.0.0:514`; the manager's own log shows
+`wazuh-remoted: INFO: Remote syslog allowed from: '192.168.101.0/24'` and
+`Listening on port 514/TCP (syslog)`; and `pirewall-core` logs zero Wazuh
+forwarding failures since (previously logged one on every single startup
+and every event, for the life of this deployment). **A security event
+pirewall generates has reached a SIEM for the first time.**
+
+Not verified further this session: whether Wazuh's ruleset has (or needs)
+a decoder for pirewall's raw-JSON-over-syslog message format so events
+become properly classified alerts rather than merely received,
+unclassified log lines — the transport gap this item tracked is closed;
+message *parsing* on the Wazuh side is a separate, not-yet-investigated
+question.
+
+`setup-new-network.md` §8.3–8.4 has the install procedure for both, with
+and without Docker, for a future deployment starting from nothing.
 
 ## 7. The captive portal serves plaintext HTTP
 
@@ -698,23 +708,31 @@ seconds** — the port-scan detection records captured moments earlier
 comparison) were completely gone from live state by the time the flood
 ended, evicted by the flood's own volume.
 
-**Cost.** With Wazuh forwarding still broken this session (item 6), there
-is no external copy of anything evicted this way — **a flood large enough
-to matter can also erase the record of everything that happened
-immediately before it**, from the one place (the control panel / RPC
-state) an operator without a working SIEM has to look. This is a genuine
-forensic gap distinct from item 12's dashboard-only description: it
-affects every RPC consumer, not just the rendered page, and a flood is
-exactly the scenario where an operator would most want that history intact
-afterward.
+**Cost.** At the time this was measured, Wazuh forwarding was still broken
+(item 6), so there was no external copy of anything evicted this way — a
+flood large enough to matter could also erase the record of everything
+that happened immediately before it, from the one place (the control
+panel / RPC state) an operator without a working SIEM has to look.
 
-**What fixing it involves.** A larger cap only delays the same problem at
-a larger flood size — the principled fix is getting Wazuh forwarding
-actually working (item 6) so history has an external, durable copy before
-`pirewall-core`'s own bounded buffers evict it, or persisting the bounded
-buffers to disk (a larger change, and a new place secrets-adjacent data
-would live, so not undertaken lightly). Not attempted this session;
-recorded here because it was directly observed, not merely theorized.
+**Item 6 is now fixed** (Wazuh forwarding confirmed working end to end,
+same session, after this finding), which closes the specific gap above —
+a durable external copy exists now, before `pirewall-core`'s own bounded
+buffers evict anything. This item is left open regardless: it was never
+really about Wazuh being down, only exposed by it. **The bounded
+in-memory history itself is still evicted by a large enough flood** —
+Wazuh being up means events matched *before* the eviction reached it, but
+an operator relying only on the control panel (or a SIEM query slow
+enough to lag behind, or Wazuh being down again for some other reason)
+still loses the same window. This is a genuine forensic gap distinct from
+item 12's dashboard-only description: it affects every RPC consumer, not
+just the rendered page.
+
+**What fixing it involves**, beyond item 6's now-real mitigation:
+persisting the bounded buffers to disk (a larger change, and a new place
+secrets-adjacent data would live, so not undertaken lightly), or raising
+the cap (only delays the same problem at a larger flood size). Not
+attempted this session; recorded here because it was directly observed,
+not merely theorized.
 
 ## Not issues
 

@@ -156,7 +156,9 @@ def main(argv: list[str] | None = None) -> int:
     # client, leaving the user told their password was wrong while their
     # address was forwarding. `PortalService.reconcile` now cleans up such
     # an orphan, but not tripping the timeout in the first place is better.
-    rpc_client = UnixSocketRpcClient(config.portal.rpc_socket_path, timeout_seconds=20.0)
+    rpc_client = UnixSocketRpcClient(
+        config.portal.rpc_socket_path, timeout_seconds=config.portal.rpc_timeout_seconds
+    )
     app = create_app(config, rpc_client)
     server = uvicorn.Server(
         uvicorn.Config(

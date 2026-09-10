@@ -249,6 +249,16 @@ class APIConfig(PirewallModel):
     # to the two service users are set up in Phase 8's systemd units.
     rpc_socket_path: str = Field(default="/run/pirewall/core.sock", min_length=1)
 
+    # How long pirewall-api waits for one RPC reply from pirewall-core.
+    # Rendering the control panel makes roughly a dozen sequential calls,
+    # and pirewall-core serializes every RPC — from both sockets — behind a
+    # single lock, so a portal login's deliberately-slow scrypt lands in
+    # front of a dashboard request that is already in flight. The generic
+    # 5s socket default was thin enough for that to surface as a 503
+    # "core unavailable" on a perfectly healthy system, which is a
+    # misdiagnosis rather than a delay.
+    rpc_timeout_seconds: float = Field(default=20.0, gt=0.0)
+
 
 class AuthenticationConfig(PirewallModel):
     """Single-admin username/password authentication (spec §29: no RBAC beyond one role)."""
@@ -339,6 +349,12 @@ class PortalConfig(PirewallModel):
     # defeating the split) or the directory to 0751 (world-traversable).
     rpc_socket_path: str = Field(default="/run/pirewall-portal/portal.sock", min_length=1)
     rpc_socket_group: str = Field(default="pirewall-portal-ipc", min_length=1)
+
+    # A portal login includes scrypt under the same single core-side lock,
+    # so this is deliberately far above the generic socket default. Config
+    # rather than a literal at the call site: it is the same tuning
+    # decision as `api.rpc_timeout_seconds` and belongs next to it.
+    rpc_timeout_seconds: float = Field(default=20.0, gt=0.0)
 
     # Online password guessing against the portal is cheap for anyone who
     # can associate with the AP; scrypt alone only slows it down.

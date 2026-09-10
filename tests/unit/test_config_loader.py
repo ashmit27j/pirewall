@@ -125,3 +125,29 @@ def test_empty_tls_cert_path_raises_configuration_error(tmp_path: Path) -> None:
     config_file.write_text(broken, encoding="utf-8")
     with pytest.raises(ConfigurationError, match="tls_cert_path"):
         load_config(config_file)
+
+
+def test_rpc_timeouts_default_above_the_generic_socket_default() -> None:
+    """Both RPC timeouts default well above `UnixSocketRpcClient`'s generic 5s.
+
+    pirewall-core serializes every RPC — from `core.sock` and
+    `portal.sock` alike — behind one lock, so a portal login's scrypt can
+    sit in front of an in-flight dashboard render. At the 5s default that
+    surfaced as a 503 "core unavailable" on a healthy system.
+    """
+    config = load_config(DEFAULT_CONFIG)
+
+    assert config.api.rpc_timeout_seconds >= 20.0
+    assert config.portal.rpc_timeout_seconds >= 20.0
+
+
+def test_rpc_timeouts_are_overridable_and_must_be_positive(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(MINIMAL_VALID_TOML.replace("[api]\n", "[api]\nrpc_timeout_seconds = 45.5\n"))
+    assert load_config(path).api.rpc_timeout_seconds == 45.5
+
+    path.write_text(
+        MINIMAL_VALID_TOML.replace("[api]\n", "[api]\nrpc_timeout_seconds = 0\n")
+    )
+    with pytest.raises(ConfigurationError):
+        load_config(path)

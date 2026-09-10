@@ -170,7 +170,9 @@ def make_ssl_context_factory(
 
 def build_server(config: PirewallConfig) -> uvicorn.Server:
     """Wire the RPC client, the FastAPI app, and TLS into a ready-to-run uvicorn server."""
-    rpc_client = UnixSocketRpcClient(config.api.rpc_socket_path)
+    rpc_client = UnixSocketRpcClient(
+        config.api.rpc_socket_path, timeout_seconds=config.api.rpc_timeout_seconds
+    )
     app = create_app(config, rpc_client)
     server_config = uvicorn.Config(
         app=app,

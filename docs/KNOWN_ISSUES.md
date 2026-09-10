@@ -10,7 +10,8 @@ seen on real hardware and the evidence is quoted. **Reasoned** means it
 follows from the code but has not been triggered. **Deferred** means it is a
 deliberate choice with a stated reason, not an oversight.
 
-Last reviewed: **2026-09-10**, after the first real client session.
+Last reviewed: **2026-09-10**, after the first real client session and the
+move to a new uplink network.
 
 ---
 
@@ -32,6 +33,10 @@ Last reviewed: **2026-09-10**, after the first real client session.
 | 12 | Dashboard JS is checked by a scanner, not a parser | Low | Deferred |
 | 13 | An unmerged branch predates this work | Low | Observed |
 | 14 | `capture_stats.packets_seen` did not move during a live check | Low | Observed |
+| 15 | `pirewall-api` cannot write its own log file | Low | Observed |
+| 16 | Moving the Pi to a new network silently staleness-rots the config | Medium | Observed |
+| 17 | `security.session_timeout_seconds` is read by nothing | Low | Observed |
+| 18 | A TLS-only port answers plaintext HTTP with a bare teardown | Low | Observed |
 
 ---
 
@@ -272,6 +277,125 @@ control panel's Network panel right after a restart sees a zero that is not
 true. Worth confirming: if the counter is genuinely not incremented for
 frames that fail to parse, the Network panel under-reports traffic, and
 "packets seen" would not mean what an operator assumes.
+
+---
+
+## 15. `pirewall-api` cannot write its own log file
+
+**Status: Observed.** From `journalctl -u pirewall-api` on every start:
+
+```
+pirewall: could not open log file /var/log/pirewall/api.log
+([Errno 30] Read-only file system: '/var/log/pirewall/api.log'); logging to stderr only
+```
+
+`pirewall/api/__main__.py` logs into `<[logging] log_dir>/api.log`, which is
+the shared `/var/log/pirewall` owned `pirewall-core:pirewall-ipc`. But
+`deploy/systemd/pirewall-api.service` has `ProtectSystem=strict` and grants
+`ReadWritePaths=/run/pirewall /var/log/pirewall-api` — a *different*
+directory, which exists and is owned by `pirewall-api` but is never written
+to. So the path the unit prepared and the path the code uses do not agree,
+and the code falls back to stderr.
+
+**Cost.** Low: systemd captures stderr, so the lines are in the journal and
+nothing is lost. What is lost is the `RotatingFileHandler` bound by
+`logging.max_bytes`/`backup_count`, and the assumption in the docs that
+`/var/log/pirewall/api.log` exists.
+
+**Fixing it** means choosing which half is right. The per-process directory
+matches how `pirewall-portal` already works (`[portal] log_dir =
+/var/log/pirewall-portal`), so the consistent fix is an api-specific
+`log_dir` in config rather than widening the api unit's write access to
+core's log directory — that widening would be the one change that hands the
+API process write access inside core's own directory, which the A4 split
+exists to avoid.
+
+---
+
+## 16. Moving the Pi to a new network silently staleness-rots the config
+
+**Status: Observed (2026-09-10).** After the Pi moved to a new uplink,
+`config/local_config.toml` still read `upstream_gateway = "192.168.1.1"`
+while the live default route was via `10.253.156.97`. Nothing failed
+loudly — the value is not used for routing.
+
+**Cost.** `_validate_safety` in `pirewall/firewall/validator.py` protects
+`upstream_gateway` from being blocked, precisely because a /32 against the
+gateway is an internet outage that the `0.0.0.0/0` check does not catch.
+Pointed at a stale address, that guard protects an address no longer on the
+network **and leaves the real gateway unprotected** — an adaptive rule
+against `10.253.156.97` would have validated cleanly and cut the Pi's own
+uplink. Fixed by hand this session; `--check-config` accepts either value,
+so nothing would have caught it.
+
+**Fixing it** means a startup cross-check: compare `upstream_gateway`
+against the kernel's actual default route for `wan_interface`, and against
+`pirewall_lan_ip`/`protected_network` for `lan_interface`, and emit a
+`system_warning` event on a mismatch rather than refusing to start (the
+uplink can legitimately be down at boot). `scripts/deployment/discovery.py`
+already parses `ip -j route` and could supply the comparison. The same drift
+applies to `[integration] wazuh_host`/`netdata_host` and `[admin]
+admin_pc_ip`, which are all addresses on networks the Pi can be moved off.
+
+---
+
+## 17. `security.session_timeout_seconds` is read by nothing
+
+**Status: Observed (2026-09-10).** `grep -rn "security\.session_timeout_seconds"
+pirewall/ tests/` returns nothing. The field is declared in
+`SecurityConfig` and set in both `config/default_config.toml` and the
+deployment's `local_config.toml`, but no code path reads it. The admin
+session lifetime is governed solely by
+`authentication.token_expiry_seconds`, which `pirewall/api/app.py:129`
+hands to `SessionStore`.
+
+**Cost.** An operator who wants longer admin sessions finds a setting whose
+name says exactly that, changes it, and observes no effect — the failure is
+silent and the config gives no hint which of the two similarly-named keys is
+live. Found while raising session lifetimes at the user's request.
+
+**Fixing it** means deciding what the field is *for*. Either delete it (a
+config-schema change that breaks any existing file setting it, so it needs a
+deprecation pass in the loader) or give it the meaning its name implies —
+an idle timeout distinct from `token_expiry_seconds`'s absolute lifetime,
+which is a real feature rather than a rename. Documented in place for now:
+`config/default_config.toml` carries a comment pointing at the key that
+actually works.
+
+---
+
+## 18. A TLS-only port answers plaintext HTTP with a bare teardown
+
+**Status: Observed (2026-09-10).** Captured on the wire from the Admin PC:
+
+```
+192.168.101.2.58112 > 192.168.101.1.8443: Flags [P.], length 351
+    GET /control-panel HTTP/1.1
+    Host: 192.168.101.1:8443
+    User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:140.0) ... Firefox/140.0
+192.168.101.1.8443 > 192.168.101.2.58112: Flags [F.]      ← FIN, no data
+```
+
+A browser given `192.168.101.1:8443` with no scheme defaults to `http://`.
+uvicorn's TLS layer sees non-TLS bytes and closes the connection without
+data, which Firefox reports as "the connection was reset" — indistinguishable
+from a firewall drop or a dead service. The same symptom appears for a client
+that cannot negotiate `security.min_tls_version` (TLS 1.3 here), because the
+server closes without sending a `protocol_version` alert.
+
+**Cost.** Pure diagnosis time, and it is expensive: it sent this session
+looking at nftables, listeners, certificates and the admin-PC gate, all of
+which were healthy. The access log is no help either — neither case ever
+reaches the application, so a working server shows no trace of the failed
+attempt.
+
+**Fixing it** is awkward and may not be worth it. One port cannot serve both
+schemes, so a redirect needs a second listener on plain HTTP, which is a new
+attack surface on the management interface for a usability win. The cheaper
+mitigation is documentation: `setup-new-network.md` and `docs/SETUP.md`
+should give the panel URL with an explicit `https://` every time it appears,
+and this symptom belongs in a troubleshooting section so the next person
+recognises it in one step instead of thirty.
 
 ---
 

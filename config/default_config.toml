@@ -161,6 +161,11 @@ tls_key_path = "deploy/certificates/CHANGE_ME.key"   # CHANGE_ME — real key pa
 cors_origins = []
 history_size = 500
 rpc_socket_path = "/run/pirewall/core.sock"   # ADDENDUM.md A4 — pirewall-core <-> pirewall-api
+# How long pirewall-api waits for one reply from pirewall-core. Rendering
+# the panel makes ~a dozen sequential calls and core serializes every RPC
+# behind one lock, so this must exceed the slowest thing core can be doing
+# (a portal login's scrypt), or a healthy system reports 503.
+rpc_timeout_seconds = 20.0
 
 [authentication]
 admin_username = "CHANGE_ME"
@@ -244,6 +249,9 @@ log_dir = "/var/log/pirewall-portal"
 # the LAN-facing process cannot reach the kill switch or mutate a rule.
 rpc_socket_path = "/run/pirewall-portal/portal.sock"
 rpc_socket_group = "pirewall-portal-ipc"
+# A portal login runs scrypt under core's single RPC lock; the generic 5s
+# socket default is not enough for that. See api.rpc_timeout_seconds.
+rpc_timeout_seconds = 20.0
 
 # Online password guessing against a login anything on the AP can reach is
 # cheap; scrypt alone only slows it down.
@@ -258,6 +266,8 @@ contact_message = "Please contact your network administrator."
 [security]
 min_tls_version = "TLSv1.3"
 restrict_to_admin_pc = true
+# NOTE: not currently read by any code path — the admin session lifetime is
+# governed by `authentication.token_expiry_seconds`. Change that one.
 session_timeout_seconds = 1800
 
 [failure]

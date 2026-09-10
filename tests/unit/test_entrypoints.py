@@ -123,3 +123,27 @@ def test_api_main_exits_non_zero_on_an_unusable_config(tmp_path: Path) -> None:
     """pirewall-api returns an exit code rather than raising, so `Restart=on-failure` sees it."""
     path = _write_config(tmp_path, "not = [valid\n")
     assert api_main.main(["--config", str(path)]) == api_main.EXIT_FAILURE
+
+
+def test_build_server_gives_the_rpc_client_the_configured_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`api.rpc_timeout_seconds` reaches the socket, not just the config model.
+
+    Regression: the client was constructed without a `timeout_seconds=`
+    argument at all, so it silently kept `UnixSocketRpcClient`'s generic 5s
+    default however the config was tuned — and a slow-but-healthy core then
+    surfaced as a 503 rather than as a wait.
+    """
+    recorded: dict[str, object] = {}
+    real_client = api_main.UnixSocketRpcClient
+
+    def spy(socket_path: str, timeout_seconds: float = 5.0) -> object:
+        recorded["socket_path"] = socket_path
+        recorded["timeout_seconds"] = timeout_seconds
+        return real_client(socket_path, timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr(api_main, "UnixSocketRpcClient", spy)
+    api_main.build_server(make_config(api={"rpc_timeout_seconds": 42.0}))
+
+    assert recorded["timeout_seconds"] == 42.0

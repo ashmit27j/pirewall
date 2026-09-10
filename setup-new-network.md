@@ -828,6 +828,41 @@ sudo systemctl enable pirewall-core pirewall-api pirewall-portal
 | 8125/udp | Admin PC | Netdata StatsD (**not** 19999) |
 | 19999/tcp | Admin PC | Netdata dashboard |
 
+**Reaching the control panel** — the address is the *Pi's* admin-side IP,
+never the Admin PC's own, and the `https://` is not optional:
+
+```
+https://<pi-admin-ip>:8443/control-panel/login      # sign in here first
+https://<pi-admin-ip>:8443/control-panel            # the dashboard itself
+```
+
+On the reference deployment that is `192.168.101.1` — the Pi. `192.168.101.2`
+is the Admin PC, so probing *that* address from the Admin PC only ever tests
+the Admin PC against itself, and answers `connection refused` however healthy
+the Pi is.
+
+Two failure modes look identical from the browser and neither leaves a trace
+in the API log, because neither ever reaches the application:
+
+| Symptom | Cause | Check |
+|---|---|---|
+| `connection refused` | wrong host — you are probing the Admin PC | `nc -zvn -w5 <pi-admin-ip> 8443` |
+| `connection reset` / `ERR_CONNECTION_RESET` | `http://` against the TLS port, or a client that cannot do TLS 1.3 | `curl -vk https://<pi-admin-ip>:8443/control-panel/login` |
+| `401 missing session token` | you loaded `/control-panel` directly | go to `/control-panel/login` |
+| `403` | request did not come from `admin.admin_pc_ip` | `grep admin_pc_ip config/local_config.toml` |
+
+`curl -vk` settles it in one command: a `401` or `200` means the whole path
+works and the problem is which URL you opened; anything else is a real fault.
+
+**Forgotten the admin password?** It is stored only as a scrypt hash, so it
+cannot be recovered — rotate it:
+
+```sh
+cd /opt/pirewall
+uv run python -m scripts.deployment.configure --set-password
+sudo systemctl restart pirewall-api
+```
+
 **Health checks**
 
 ```sh

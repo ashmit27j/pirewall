@@ -70,6 +70,34 @@ implementation was wrong:
   directory setting, so the server now *verifies* the group and refuses to
   serve on a mismatch instead.
 
+### Network move: dashboard reachability and timeout tuning (2026-09-10)
+
+The Pi moved to a new uplink and the control panel appeared unreachable from
+the Admin PC. **No fault existed in the serving path** — diagnosed from the
+running system and a packet capture rather than from the code.
+
+| Finding | Label | Evidence |
+|---|---|---|
+| `nc` was probing `192.168.101.2` — the Admin PC itself, not the Pi at `.1` | Environment-dependent | Swept `.2-.20` from the Pi: only `.2` answers, MAC `c8:5b:76:9a:94:d3` vs the Pi's `eth0` `88:a2:9e:68:db:5e` |
+| The "connection reset" was Firefox sending **plaintext HTTP** to the TLS port | Observed | `tcpdump` on `eth0`: `GET /control-panel HTTP/1.1` in the clear, answered by a FIN with no data. Now KNOWN_ISSUES #18 |
+| `network.upstream_gateway` was still `192.168.1.1` from the old network | Implemented (fixed) | Live default route is via `10.253.156.97`. `_validate_safety` guards that address specifically, so the guard was protecting a host that no longer exists while leaving the real gateway blockable |
+| `security.session_timeout_seconds` is read by no code path | Observed | `grep` returns nothing; `authentication.token_expiry_seconds` is the live setting. Now KNOWN_ISSUES #17 |
+| `pirewall-api` used the generic 5s RPC timeout while the portal hardcoded 20s | Tested (fixed) | Both are now `rpc_timeout_seconds` in config; regression test verified to fail against the pre-fix code |
+
+Timeouts raised on this deployment at the user's request:
+`authentication.token_expiry_seconds` 3600 → 28800, both
+`session_timeout_seconds` 3600 → 28800, and both new
+`rpc_timeout_seconds` set to 30.0. The portal one governs how long a LAN
+client keeps network access without re-authenticating — a deliberate
+usability-over-strictness choice, recorded here because it is a security
+setting and not merely a convenience.
+
+`[failure] watchdog_sec` and the `[flow]` timeouts were deliberately **not**
+raised: the first is A6's liveness bound (raising it delays detection of a
+hung core) and the second two are detection-window parameters, not waits.
+
+ruff clean, pyright --strict clean, 878 tests pass (3 new).
+
 ### First real-client session: five false-positive causes (2026-09-10)
 
 > Outstanding work from this session, and everything else currently known to

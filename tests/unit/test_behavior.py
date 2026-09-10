@@ -229,6 +229,58 @@ def test_slow_connection_count_is_a_live_snapshot_not_an_accumulator() -> None:
     assert BehaviorPatternType.SLOW_RATE_DOS not in assessment.detected_patterns
 
 
+def test_a_long_tracked_source_is_judged_on_its_current_burst_not_diluted_by_history() -> None:
+    """Regression: HIGH_FREQUENCY must not be measured against a source's entire tracked lifetime.
+
+    A source tracked for a long time at a low, steady rate, then bursting
+    just as hard as any freshly-connecting device, used to escape
+    HIGH_FREQUENCY entirely: `connection_count / (last_seen - first_seen)`
+    buries a short burst inside a long, mostly-quiet history. The same
+    burst from a source `BehaviorAnalyzer` just started tracking (see
+    `test_syn_flood_like_pattern_flags_high_frequency_and_burst`) trips it
+    immediately, purely because it has no history to dilute against —
+    backward for security, since it means an established source is judged
+    more leniently over time, not less.
+    """
+    config = _config(
+        recent_connections_window=15,
+        high_frequency_per_second_threshold=2.0,
+    )
+    analyzer = BehaviorAnalyzer(config)
+
+    # 30 minutes of one connection a minute — an entirely ordinary, steady
+    # low-rate device with a long tracked history.
+    for i in range(30):
+        analyzer.observe_flow(
+            make_flow(
+                source_ip="203.0.113.50",
+                destination_ip="10.0.0.40",
+                destination_port=443,
+                first_seen=T0 + timedelta(minutes=i),
+                duration_seconds=0.0,
+            )
+        )
+
+    # Then, right now, the same kind of burst a freshly-connecting device
+    # produces: 15 connections inside one second.
+    burst_start = T0 + timedelta(minutes=30)
+    for i in range(15):
+        analyzer.observe_flow(
+            make_flow(
+                source_ip="203.0.113.50",
+                destination_ip="10.0.0.41",
+                destination_port=443,
+                first_seen=burst_start + timedelta(milliseconds=50 * i),
+                duration_seconds=0.0,
+            )
+        )
+
+    assessment = analyzer.assess(IPv4Address("203.0.113.50"))
+
+    assert assessment is not None
+    assert BehaviorPatternType.HIGH_FREQUENCY in assessment.detected_patterns
+
+
 def test_assess_unknown_source_returns_none() -> None:
     analyzer = BehaviorAnalyzer(_config())
     assert analyzer.assess(IPv4Address("192.0.2.1")) is None

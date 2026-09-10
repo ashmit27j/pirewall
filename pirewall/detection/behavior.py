@@ -284,6 +284,38 @@ def _inter_arrival_seconds(times: Iterable[datetime]) -> list[float]:
     return [(later - earlier).total_seconds() for earlier, later in pairwise(ordered)]
 
 
+def _recent_frequency(state: SourceBehaviorState) -> float:
+    """Connections per second over the bounded recent-connection window, not the whole tracked lifetime.
+
+    This used to be `state.connection_count / (last_seen - first_seen)` —
+    a lifetime average. That formula has a first-burst bias with no
+    principled justification: a source `BehaviorAnalyzer` has just started
+    tracking (a genuinely new device, or any existing device re-tracked
+    after `pirewall-core` restarts or its LRU state is evicted) has a tiny
+    `(last_seen - first_seen)`, so its very first burst of connections —
+    ordinary for a device that just joined Wi-Fi (OS update checks,
+    push-notification registration, several apps syncing at once) —
+    produces an inflated rate. A long-tracked source generating the exact
+    same instantaneous burst gets it diluted away by its own history and
+    never trips this signal at all — an inconsistency backward for
+    security (an established attacker gets *more* dilution-based cover
+    over time, not less), and not something `high_frequency_per_second_threshold`
+    itself can fix, however it's tuned (see `KNOWN_ISSUES.md` #3, which
+    already documents that threshold as too low for a busy device in
+    general — this fixes *whose* bursts the threshold is actually applied
+    to, not the threshold's value).
+
+    Measuring the rate over `state.recent_connection_times` (already
+    bounded by `DetectionConfig.recent_connections_window`, the same deque
+    `BURST` reads) removes that asymmetry: any source's current burst is
+    judged the same way regardless of how long it has been tracked.
+    """
+    if len(state.recent_connection_times) < 2:
+        return 0.0
+    span = max((state.last_seen - state.recent_connection_times[0]).total_seconds(), 1.0)
+    return len(state.recent_connection_times) / span
+
+
 def _assess_state(
     source_ip: IPv4Address, state: SourceBehaviorState, config: DetectionConfig
 ) -> BehaviorAssessment:
@@ -295,7 +327,7 @@ def _assess_state(
         patterns.append(BehaviorPatternType.REPEATED_CONNECTIONS)
         reasons.append(f"{state.max_connections_to_single_destination} connections to a single destination")
 
-    frequency = state.connection_count / window_seconds
+    frequency = _recent_frequency(state)
     if frequency >= config.high_frequency_per_second_threshold:
         patterns.append(BehaviorPatternType.HIGH_FREQUENCY)
         reasons.append(f"connection frequency {frequency:.2f}/s")

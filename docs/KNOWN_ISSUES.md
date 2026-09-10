@@ -95,10 +95,10 @@ evidence.
 
 ## 3. Behaviour thresholds are still tuned for a quiet network
 
-**Status: Observed.** Two of the six behavioural patterns were fixed after
-the first session (`SCANNING` now counts ports per destination, and
-`REPEATED_FAILURES` now requires an unanswered TCP SYN). The rest still fire
-on ordinary browsing:
+**Status: Observed, one sub-cause fixed (2026-09-10).** Two of the six
+behavioural patterns were fixed after the first session (`SCANNING` now
+counts ports per destination, and `REPEATED_FAILURES` now requires an
+unanswered TCP SYN). The rest still fire on ordinary browsing:
 
 | Threshold | Value | Observed on one phone loading one page |
 |---|---|---|
@@ -116,12 +116,83 @@ patterns is ~11 points — not enough alone, but enough to push a
 misclassified flow over a threshold. They also satisfy the evidence-maturity
 gate's path (b), which is the gate's whole purpose.
 
-**What fixing it involves.** These are per-deployment values and should be
-set from a measured baseline, not guessed. The principled version is to make
-the diversity and frequency signals *rate-based per source* and compare
-against that source's own recent history, so a busy device is judged against
-its own normal rather than an absolute constant. That is a design change,
-not a tuning change.
+**Investigated this session: is "new device" the trigger, per the user's
+hypothesis, or a distinct amplifier on top of this same issue?** Reading
+`pirewall/detection/behavior.py`'s `SourceBehaviorState` (no live device was
+connected this session to capture a first-minute-vs-later comparison — this
+finding is **Reasoned** from the code, not **Observed** from a live
+capture) found a real, distinct, previously-unrecorded defect in
+`HIGH_FREQUENCY` specifically: its rate was `state.connection_count /
+(last_seen - first_seen)` — a *lifetime* average, not a current rate. A
+source `BehaviorAnalyzer` has just started tracking (a genuinely new
+device, or *any* existing device re-tracked after `pirewall-core` restarts
+or its LRU state is evicted) has a tiny `(last_seen - first_seen)`, so its
+first burst of connections — ordinary for a device that just joined Wi-Fi —
+produces an artificially inflated rate. The identical instantaneous burst
+from a long-tracked source gets diluted away by its own history and never
+trips this signal at all, regardless of how it's tuned — backward for
+security, since an established source becomes harder to flag over time,
+not easier.
+
+**Conclusion: "new device" is not an independent root cause** requiring its
+own bypass/grace-period mechanism (the mitigation the user proposed, and
+evaluated rather than implemented — see below). It is this pre-existing
+issue's effect made *more visible* on new devices, for two compounding
+reasons: (a) `HIGH_FREQUENCY`'s dilution bug specifically protects
+long-tracked sources from a threshold that is already too low for everyone
+(the "not enough evidence" side of this same table), so a fresh source hits
+the exact same too-low threshold with none of that accidental cover; and
+(b) a device that just joined Wi-Fi characteristically opens *more*
+simultaneous connections than steady browsing (OS update checks,
+push-notification registration, several apps syncing at once), making the
+already-too-low threshold even easier to cross.
+
+**Fixed:** `HIGH_FREQUENCY`'s rate is now measured over
+`state.recent_connection_times` (already bounded by
+`recent_connections_window`, the same deque `BURST` reads) instead of the
+source's entire tracked lifetime — `pirewall/detection/behavior.py`'s new
+`_recent_frequency()`. This does **not** change
+`high_frequency_per_second_threshold`'s value (still whatever's
+configured, no data existed this session to justify a new number) — it
+makes the existing threshold apply consistently regardless of how long a
+source has been tracked, rather than only to freshly-tracked ones.
+**Tested**: `test_a_long_tracked_source_is_judged_on_its_current_burst_not_diluted_by_history`
+in `tests/unit/test_behavior.py`, confirmed to fail against the pre-fix
+code first. This is expected to make long-tracked sources trip
+`HIGH_FREQUENCY` on their own ordinary bursts too, which the shadow log
+should now show — that is the point: it exposes the true extent of this
+table's problem rather than half-masking it for whichever sources happen
+to have history.
+
+**Evaluated, not implemented: a per-device grace period.** The user's
+proposed mitigation — relax or bypass the decision engine for a device's
+initial communication window, continuing to log/collect evidence but not
+act on it — was considered against this session's own instruction to
+confirm it addresses the actual root cause before adopting it. Given the
+finding above, a grace period would not have fixed anything: the dilution
+bug it would be working around is now fixed directly, and a device-age
+bypass would still have left `destination_diversity_threshold`,
+`repeated_connections_threshold` and `burst_count_threshold` exactly as
+easy to trip for a new device as for an old one (none of those three are
+first-seen-dependent — they are cumulative counts or genuine sliding
+windows, so age never explains their false positives). Adopting an
+age-based bypass on top of an already-identified formula bug would also
+have created exactly the security hole this session's own instructions
+warned against: a window where a genuinely malicious first connection gets
+less scrutiny, for a benefit ("new" devices misbehave) this investigation
+did not actually find to be true.
+
+**Still open, unchanged this session** (no measured baseline exists to set
+new values without guessing, per this document's existing discipline):
+`destination_diversity_threshold`, `repeated_connections_threshold`, and
+`burst_count_threshold` are still absolute per-deployment constants, all
+still too low for a modern web page load, new device or old. **What fixing
+them involves** remains what this section already said: values set from a
+measured baseline (the SHADOW soak now running, per item 5, is exactly
+that baseline-gathering window), and ideally made rate-based per source
+compared against that source's own recent history — the same principle
+just applied to `HIGH_FREQUENCY` above — rather than one absolute constant
+for every deployment.
 
 ## 4. Demo portal accounts are live on this deployment
 

@@ -56,6 +56,9 @@ secrets/
 .idea/
 .DS_Store
 Thumbs.db
+*.swp
+*.swo
+*~
 
 # Local config overrides
 config/local_config.toml

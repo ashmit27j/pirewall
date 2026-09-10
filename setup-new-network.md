@@ -850,6 +850,9 @@ sudo systemctl start pirewall-core.service
 
 `pirewall-start` does this for you, which is what makes it re-runnable.
 
+**Before you trust a detection:** `docs/KNOWN_ISSUES.md` lists what is
+currently known to misfire, with the evidence.
+
 **More depth:** `docs/SETUP.md` (the same path with reasoning),
 `docs/DEPLOYMENT.md` (why each choice), `docs/ADDENDUM_3.md` (how the portal
 works), `docs/SECURITY.md` (threat model), `docs/PROGRESS.md` (what is

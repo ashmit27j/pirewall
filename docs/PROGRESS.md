@@ -72,6 +72,9 @@ implementation was wrong:
 
 ### First real-client session: five false-positive causes (2026-09-10)
 
+> Outstanding work from this session, and everything else currently known to
+> be wrong or unverified, is tracked in **`docs/KNOWN_ISSUES.md`**.
+
 A phone browsing a shopping site was BLOCKed as "malicious activity" within
 minutes of connecting. Diagnosed from live daemon state rather than by
 reading code — the running system's own `list_threats`/`list_decisions`
@@ -1314,6 +1317,9 @@ subsystems... report, don't improvise").
 ## Known deviations from spec
 
 ### First real-client session: five false-positive causes (2026-09-10)
+
+> Outstanding work from this session, and everything else currently known to
+> be wrong or unverified, is tracked in **`docs/KNOWN_ISSUES.md`**.
 
 A phone browsing a shopping site was BLOCKed as "malicious activity" within
 minutes of connecting. Diagnosed from live daemon state rather than by

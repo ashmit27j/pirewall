@@ -50,6 +50,7 @@ Full detail in `docs/ADDENDUM.md`.
 | `docs/ADDENDUM.md` | Safety-oriented additions on top of the spec (wins on conflict). |
 | `docs/ADDENDUM_2.md` | Detection-timing additions: creation-time behaviour counters, slow-rate DoS, the evidence-maturity gate, Heartbleed, JA3. |
 | `docs/ADDENDUM_3.md` | The LAN captive portal: a third process behind a restricted second RPC socket, sessions as kernel-expiring nftables set elements, the LAN user store, and how a blocked client is told why. Newest — wins over all of the above. |
+| `docs/KNOWN_ISSUES.md` | **Everything currently known to be wrong, unverified, or deliberately deferred**, with the evidence behind each claim and what fixing it would involve. Read before trusting a detection. |
 | `docs/PROGRESS.md` | Phase-by-phase implementation status, with honest Implemented/Tested/Mocked/Environment-dependent/Not-yet-validated labels. |
 | `docs/ARCHITECTURE.md` | Pipeline diagram, module boundaries, dependency decisions. |
 | `docs/FEATURE_SCHEMA.md` | The canonical 29-feature schema, feature by feature. |

@@ -214,20 +214,33 @@ believed.
 
 ## 5. Enforcement is `assisted` without the recommended SHADOW soak
 
-**Status: Fixed (2026-09-10).** `firewall.enforcement_mode` set to `"shadow"`
-in `config/local_config.toml` this session. ADDENDUM.md A1 recommends one to
-two weeks in `shadow` first, reviewing the shadow log, before enforcing
-anything; that soak had not happened, and items 1–3 are exactly what it
-exists to surface.
+**Status: Resolved as a deliberate operating policy (2026-09-10).**
+`firewall.enforcement_mode` was moved to `"shadow"` earlier this session
+(to run items 1–3's detection-code changes and the Step 5 attack-lab
+without anything getting live-BLOCKed mid-edit) and has now been moved
+back to `"assisted"` at the user's explicit direction, who confirmed this
+is deliberate standing policy, not an oversight: **`assisted` is the
+normal operating mode; `shadow` is a failsafe/manually-triggered state,
+not something to leave running as a background soak.**
 
-**This is an open decision for a human, not a closed loop.** The mode was
-moved to `shadow` for the duration of this session — both because items 1–3
-were about to be actively worked on (nothing should get live-BLOCKed by
-detection code mid-edit) and because the false-positive rate now measured
-makes `shadow` the honest setting until those items are addressed. It was
-deliberately **not** moved back to `assisted` automatically once item 1/2/3
-work below landed — do that only after reviewing this session's shadow log
-against ADDENDUM.md A1's recommended soak period.
+That policy is already exactly how the code behaves, independent of this
+config value — nothing needed changing beyond restoring the value itself:
+
+- **The kill-switch is "the button"** — `FirewallManager.revert_to_base`
+  (ADDENDUM.md A8, `pirewall/firewall/manager.py`) sets
+  `enforcement_mode = SHADOW` and removes every active adaptive rule,
+  already wired to the dashboard's kill-switch control.
+- **Fail-open already falls into that same state automatically** —
+  `CoreDaemon._revert_ruleset_if_failing_open` (ADDENDUM.md A6,
+  `pirewall/runtime/core.py`) calls that identical `revert_to_base` on any
+  `pirewall-core` shutdown while `failure.mode = fail_open` (the default).
+
+ADDENDUM.md A1's one-to-two-week SHADOW soak recommendation was not run
+under this policy — that tradeoff (assisted's live enforcement now, versus
+a full pre-enforcement observation window) is the user's own informed
+call, made with items 1–3's measured false-positive rate and item 20's
+measured false-negative gap both already known at the time of the
+decision, not made in ignorance of them.
 
 ## 6. Wazuh and Netdata integrations were never verified end to end
 

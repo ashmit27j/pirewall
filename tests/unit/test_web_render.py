@@ -265,6 +265,81 @@ def test_only_log_shaped_panels_get_a_clear_view_control() -> None:
         assert f'data-clear="{section_id}"' not in html
 
 
+def test_dashboard_uses_css_custom_properties_for_a_dark_theme() -> None:
+    """Dark mode is the default theme, expressed as `:root` custom properties, not hard-coded hex values."""
+    html = render_dashboard(_status(), [], [], [], [], [], None, [])
+    assert ":root {" in html
+    assert "--bg:" in html
+    assert "--text:" in html
+    # body must actually consume the variables, not just declare them
+    assert "background: var(--bg)" in html
+    assert "color: var(--text)" in html
+
+
+def test_event_severity_gets_a_colored_badge() -> None:
+    critical_event = SecurityEvent(
+        timestamp=NOW,
+        severity=EventSeverity.CRITICAL,
+        event_type=SecurityEventType.FIREWALL_BLOCK,
+        subsystem="firewall.manager",
+        reason="critical test event",
+    )
+    html = render_dashboard(_status(), [], [critical_event], [], [], [], None, [])
+    assert '<span class="badge badge-severity-critical">critical</span>' in html
+
+
+def test_threat_level_gets_a_colored_badge() -> None:
+    html = render_dashboard(
+        status=_status(),
+        rules=[],
+        events=[],
+        threats=[_threat_assessment()],  # threat_level=CRITICAL
+        models=[],
+        allowlist=[],
+        capture_stats=None,
+        detections=[],
+    )
+    assert '<span class="badge badge-severity-critical">critical</span>' in html
+
+
+def test_detection_evidence_gets_a_flag_badge_distinct_from_routine_traffic() -> None:
+    from pirewall.core.models.evidence import KnownEvidence
+
+    routine = DetectionRecord(flow_id="f-routine", recorded_at=NOW)
+    anomalous_only = _detection_record()  # anomaly_evidence.is_anomaly=True, no known_evidence
+    known_attack_and_anomalous = DetectionRecord(
+        flow_id="f-both",
+        known_evidence=KnownEvidence(
+            flow_id="f-both",
+            predicted_class="DDoS",
+            confidence=0.9,
+            model_version="1.0.0",
+            feature_schema_version="1.0.0",
+            generated_at=NOW,
+        ),
+        anomaly_evidence=anomalous_only.anomaly_evidence,
+        recorded_at=NOW,
+    )
+
+    html = render_dashboard(
+        _status(), [], [], [], [], [], None, [routine, anomalous_only, known_attack_and_anomalous]
+    )
+
+    assert '<span class="badge badge-severity-info">info</span>' in html  # routine, all-BENIGN/non-anomalous
+    assert '<span class="badge badge-severity-warning">warning</span>' in html  # one signal fired
+    assert '<span class="badge badge-severity-critical">critical</span>' in html  # both signals fired
+
+
+def test_priority_and_quiet_panels_get_their_hierarchy_class() -> None:
+    html = render_dashboard(_status(), [], [], [], [], [], None, [])
+    for section_id in ("system", "threats", "events"):
+        assert f'class="panel panel-priority" data-panel="{section_id}"' in html
+    for section_id in ("ml", "shadow-log"):
+        assert f'class="panel panel-quiet" data-panel="{section_id}"' in html
+    for section_id in ("network", "detections", "firewall", "allowlist"):
+        assert f'class="panel" data-panel="{section_id}"' in html
+
+
 def test_render_module_cannot_invoke_any_rpc_action() -> None:
     """Structural proof, not just behavioral: `render.py` never even imports the RPC client.
 

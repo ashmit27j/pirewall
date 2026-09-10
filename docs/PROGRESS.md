@@ -3133,3 +3133,63 @@ config defaults (see section 2). This session's dashboard work only touched
 `pirewall/web/render.py` and its test file — done in an isolated git
 worktree specifically to avoid colliding with a concurrently-running sibling
 session also working in this repository.
+
+### 2026-09-10 session — dashboard dark mode, severity color-coding, panel hierarchy — Tested
+
+`pirewall/web/render.py` and `tests/unit/test_web_render.py` only, per this
+session's Step 4a. `render.py` remains read-only (module docstring, and the
+pinned `test_render_module_cannot_invoke_any_rpc_action` still passes
+unmodified).
+
+- **Dark mode as the default theme.** `_STYLE` now defines every color as
+  a `:root` custom property (`--bg`, `--surface`, `--text`, `--border`,
+  `--accent`, severity/status colors) instead of hard-coded hex values
+  throughout — a light theme can be added later as a second `:root`
+  override block without touching any rule body.
+- **Severity color-coding on Events, Threats, and Detections.** Rule
+  *status* already had `.badge-*` treatment (`_status_badge`); event/
+  threat *severity* had none — a CRITICAL event read like any other row.
+  New `_severity_badge()` maps `EventSeverity`/`ThreatLevel` values onto
+  `badge-severity-*` classes. Detections have no severity field of their
+  own (that's downstream, in a `ThreatAssessment`); new
+  `_detection_flag_badge()` derives one from the same known-attack/anomaly
+  evidence the Evidence column already shows (both signals -> critical,
+  either alone -> warning, neither -> info), so a detection worth a second
+  look no longer looks identical to routine BENIGN/non-anomalous traffic.
+- **Visual hierarchy.** `_panel()` takes a new `importance` parameter
+  (`"priority"`/`"quiet"`/default `"normal"`), rendered as a `panel-*` CSS
+  class only — structure and controls are identical regardless. System,
+  Threats, and Events (what an operator needs to react to) get
+  `panel-priority`; ML and Shadow log (reference material) get
+  `panel-quiet`.
+- **Collapse/expand regression-tested specifically**, per this session's
+  own instruction (`docs/KNOWN_ISSUES.md` #12 documents this control once
+  broke silently from a Python-string-newline bug): `node` is not
+  available in this environment, so the existing regex-based scanner
+  (`tests/unit/test_dashboard_javascript.py`) stays rather than being
+  swapped for `node --check`; all 28 of its + `test_web_render.py`'s cases
+  pass unmodified, since no JS was touched this session, only CSS/HTML.
+
+**Tested**: 4 new cases in `tests/unit/test_web_render.py`
+(`test_dashboard_uses_css_custom_properties_for_a_dark_theme`,
+`test_event_severity_gets_a_colored_badge`,
+`test_threat_level_gets_a_colored_badge`,
+`test_detection_evidence_gets_a_flag_badge_distinct_from_routine_traffic`,
+`test_priority_and_quiet_panels_get_their_hierarchy_class`) plus all 20
+pre-existing tests re-run unmodified and still passing. **Also checked by
+hand**, short of an actual browser (none available in this headless
+session — labeled honestly rather than claiming the prior session's
+Chrome verification for unrelated new work): rendered a full dashboard
+page with realistic mixed-severity fixture data
+(critical/warning/info events, critical/low threats, routine/anomalous/
+both-signal detections) to a file and parsed it with Python's
+`html.parser`, confirming every tag balances with no mismatches, plus
+grepped the output for the expected badge/panel-class distribution.
+
+**Not built, deliberately**: no light theme (only `:root`'s dark values
+are defined, per the phase prompt — a light override is future work this
+change is structured to allow, not something requested now); no change to
+which sections exist or what data they show — this is presentation only.
+
+Full suite after this section: **921 passed**; `ruff check .` and
+`pyright --strict` clean.

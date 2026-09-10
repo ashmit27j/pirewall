@@ -36,37 +36,80 @@ from pirewall.core.models.status import StatusResult
 from pirewall.core.models.threat import ThreatAssessment
 
 _STYLE = """<style>
-body { font-family: system-ui, sans-serif; margin: 2rem; background: #f7f7f8; color: #1a1a1a; }
+/* Dark mode is the default theme (only `:root`'s values are defined so
+   far). Every color in this file is one of these custom properties, never
+   a bare hex value, specifically so a light theme can be added later as a
+   second block of `:root` overrides (e.g. behind a `prefers-color-scheme:
+   light` query or a toggle) without touching a single rule below. */
+:root {
+  --bg: #14161a;
+  --surface: #1c1f26;
+  --surface-raised: #242832;
+  --border: #333846;
+  --text: #e4e6eb;
+  --text-muted: #9aa3b2;
+  --accent: #4c8dff;
+  --accent-text: #ffffff;
+  --severity-info: #4c8dff;
+  --severity-warning: #d99a2b;
+  --severity-error: #e0623a;
+  --severity-critical: #e0435a;
+  --severity-low: #4c8dff;
+  --severity-medium: #d99a2b;
+  --severity-high: #e0623a;
+  --status-active: #2fa86a;
+  --status-shadow: #6c7688;
+  --status-pending: #d99a2b;
+  --status-neutral: #4b5262;
+}
+body { font-family: system-ui, sans-serif; margin: 2rem; background: var(--bg); color: var(--text); }
 h1, h2, h3 { margin-top: 2rem; }
-table { border-collapse: collapse; width: 100%; margin-bottom: 1rem; background: #fff; }
-th, td { border: 1px solid #ddd; padding: 0.4rem 0.6rem; text-align: left; font-size: 0.9rem; }
-th { background: #eee; }
-.badge { padding: 0.1rem 0.5rem; border-radius: 0.3rem; font-size: 0.8rem; color: #fff; }
-.badge-shadow { background: #6c757d; }
-.badge-active { background: #198754; }
-.badge-pending { background: #fd7e14; }
-.badge-rejected, .badge-removed, .badge-disabled { background: #adb5bd; }
-.kill-switch { background: #b02a37; color: #fff; border: none; padding: 0.6rem 1.2rem; font-size: 1rem;
-  border-radius: 0.3rem; cursor: pointer; }
-.error { color: #b02a37; }
-.hint { font-size: 0.8rem; color: #5c6b7a; margin: 0.4rem 0 0; }
+table { border-collapse: collapse; width: 100%; margin-bottom: 1rem; background: var(--surface); }
+th, td { border: 1px solid var(--border); padding: 0.4rem 0.6rem; text-align: left; font-size: 0.9rem; }
+th { background: var(--surface-raised); }
+.badge { padding: 0.1rem 0.5rem; border-radius: 0.3rem; font-size: 0.8rem; color: var(--accent-text); }
+.badge-shadow { background: var(--status-shadow); }
+.badge-active { background: var(--status-active); }
+.badge-pending { background: var(--status-pending); }
+.badge-rejected, .badge-removed, .badge-disabled { background: var(--status-neutral); }
+.badge-severity-info { background: var(--severity-info); }
+.badge-severity-warning { background: var(--severity-warning); }
+.badge-severity-error { background: var(--severity-error); }
+.badge-severity-critical { background: var(--severity-critical); }
+.badge-severity-low { background: var(--severity-low); }
+.badge-severity-medium { background: var(--severity-medium); }
+.badge-severity-high { background: var(--severity-high); }
+.kill-switch { background: var(--severity-critical); color: var(--accent-text); border: none;
+  padding: 0.6rem 1.2rem; font-size: 1rem; border-radius: 0.3rem; cursor: pointer; }
+.error { color: var(--severity-critical); }
+.hint { font-size: 0.8rem; color: var(--text-muted); margin: 0.4rem 0 0; }
 form.inline { display: inline; }
 .page-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
-.help-btn { background: #0d6efd; color: #fff; border: none; border-radius: 0.3rem; padding: 0.5rem 1rem;
-  font-size: 0.9rem; cursor: pointer; }
-.panel { margin-bottom: 1.5rem; }
+.help-btn { background: var(--accent); color: var(--accent-text); border: none; border-radius: 0.3rem;
+  padding: 0.5rem 1rem; font-size: 0.9rem; cursor: pointer; }
+.panel { margin-bottom: 1.5rem; border-left: 0.25rem solid transparent; padding-left: 0.75rem; }
+/* Visual hierarchy (System/Events/Threats vs. ML/Shadow log): an operator
+   scanning the page top to bottom should be able to tell "react to this"
+   sections from "reference material" ones without reading every heading. */
+.panel-priority { border-left-color: var(--accent); }
+.panel-priority > .panel-toolbar h2 { color: var(--text); font-size: 1.2rem; }
+.panel-quiet { opacity: 0.85; }
+.panel-quiet > .panel-toolbar h2 { color: var(--text-muted); font-size: 1rem; font-weight: 500; }
 .panel-toolbar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; }
 .panel-toolbar h2 { margin: 0; }
-.panel-controls button { background: #fff; border: 1px solid #ccc; border-radius: 0.3rem;
-  padding: 0.15rem 0.55rem; margin-left: 0.35rem; font-size: 0.8rem; cursor: pointer; }
-.panel-controls button:hover { background: #eee; }
+.panel-controls button { background: var(--surface-raised); color: var(--text);
+  border: 1px solid var(--border); border-radius: 0.3rem; padding: 0.15rem 0.55rem;
+  margin-left: 0.35rem; font-size: 0.8rem; cursor: pointer; }
+.panel-controls button:hover { background: var(--border); }
 .panel-body[hidden] { display: none; }
-dialog { max-width: 46rem; width: 90%; border-radius: 0.5rem; border: 1px solid #ccc;
-  padding: 1.5rem 1.75rem; }
-dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+dialog { max-width: 46rem; width: 90%; border-radius: 0.5rem; border: 1px solid var(--border);
+  padding: 1.5rem 1.75rem; background: var(--surface); color: var(--text); }
+dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
 dialog table { font-size: 0.85rem; }
-.dialog-close { float: right; background: #adb5bd; color: #fff; border: none; border-radius: 0.3rem;
-  padding: 0.3rem 0.8rem; cursor: pointer; }
+.dialog-close { float: right; background: var(--status-neutral); color: var(--accent-text); border: none;
+  border-radius: 0.3rem; padding: 0.3rem 0.8rem; cursor: pointer; }
+a { color: var(--accent); }
+input, button { color-scheme: dark; }
 </style>"""
 
 _SCRIPT = """<script>
@@ -298,6 +341,19 @@ def _status_badge(status: RuleStatus) -> str:
     return f'<span class="badge {css_class}">{_e(status.value)}</span>'
 
 
+def _severity_badge(value: str) -> str:
+    """A colored badge for an `EventSeverity`/`ThreatLevel` value.
+
+    Rule *status* already had `.badge-*` treatment (`_status_badge`);
+    event/threat *severity* did not, so a CRITICAL/HIGH row read exactly
+    like any other row instead of being visually unmissable. Both enums'
+    lowercase values (`info`/`warning`/`error`/`critical`,
+    `low`/`medium`/`high`/`critical`) map directly onto a `badge-severity-*`
+    class defined in `_STYLE`.
+    """
+    return f'<span class="badge badge-severity-{_e(value)}">{_e(value)}</span>'
+
+
 def _render_system_section(status: StatusResult) -> str:
     return f"""
     <table>
@@ -316,7 +372,7 @@ def _render_system_section(status: StatusResult) -> str:
 
 def _render_threats_section(threats: Iterable[ThreatAssessment]) -> str:
     rows = "".join(
-        f"<tr><td>{_e(t.assessed_at)}</td><td>{_e(t.source_ip)}</td><td>{_e(t.threat_level.value)}</td>"
+        f"<tr><td>{_e(t.assessed_at)}</td><td>{_e(t.source_ip)}</td><td>{_severity_badge(t.threat_level.value)}</td>"
         f"<td>{t.threat_score:.1f}</td><td>{_e(t.explanation)}</td></tr>"
         for t in threats
     )
@@ -355,15 +411,42 @@ def _detection_evidence_summary(record: DetectionRecord) -> str:
     return ", ".join(parts) or "&mdash;"
 
 
+_BENIGN_CLASS = "BENIGN"
+
+
+def _detection_flag_badge(record: DetectionRecord) -> str:
+    """A severity-style badge summarizing raw detection evidence, same treatment as Events/Threats.
+
+    Detections have no `EventSeverity`/`ThreatLevel` of their own — this is
+    per-flow evidence, combined into a severity only downstream in a
+    `ThreatAssessment` — so this derives one from the same two signals the
+    Evidence column already shows: a known-attack classification other
+    than BENIGN, or `anomaly_evidence.is_anomaly`. Neither alone is a
+    verdict (see `docs/KNOWN_ISSUES.md` #1/#2/#20 on how often either is
+    wrong in isolation); this exists so a row worth a second look doesn't
+    look identical to routine BENIGN/non-anomalous traffic.
+    """
+    is_known_attack = (
+        record.known_evidence is not None and record.known_evidence.predicted_class != _BENIGN_CLASS
+    )
+    is_anomaly = record.anomaly_evidence is not None and record.anomaly_evidence.is_anomaly
+    if is_known_attack and is_anomaly:
+        return _severity_badge("critical")
+    if is_known_attack or is_anomaly:
+        return _severity_badge("warning")
+    return _severity_badge("info")
+
+
 def _render_detections_section(detections: Iterable[DetectionRecord]) -> str:
     rows = "".join(
-        f"<tr><td>{_e(d.recorded_at)}</td><td>{_e(d.flow_id[:8])}</td><td>{_detection_evidence_summary(d)}</td></tr>"
+        f"<tr><td>{_e(d.recorded_at)}</td><td>{_e(d.flow_id[:8])}</td>"
+        f"<td>{_detection_flag_badge(d)}</td><td>{_detection_evidence_summary(d)}</td></tr>"
         for d in detections
     )
     return f"""
     <table>
-      <tr><th>Time</th><th>Flow</th><th>Evidence</th></tr>
-      {rows or '<tr><td colspan="3">No detections recorded yet.</td></tr>'}
+      <tr><th>Time</th><th>Flow</th><th>Flag</th><th>Evidence</th></tr>
+      {rows or '<tr><td colspan="4">No detections recorded yet.</td></tr>'}
     </table>
     """
 
@@ -519,7 +602,7 @@ def _render_portal_sessions_section(sessions: list[PortalSession]) -> str:
 
 def _event_row(event: SecurityEvent) -> str:
     return (
-        f"<tr><td>{_e(event.timestamp)}</td><td>{_e(event.severity.value)}</td>"
+        f"<tr><td>{_e(event.timestamp)}</td><td>{_severity_badge(event.severity.value)}</td>"
         f"<td>{_e(event.event_type.value)}</td><td>{_e(event.subsystem)}</td>"
         f"<td>{_e(event.reason or '')}</td></tr>"
     )
@@ -549,7 +632,7 @@ def _render_ml_section(models: Iterable[ModelMetadata]) -> str:
     """
 
 
-def _panel(section_id: str, title: str, html_block: str, *, loggy: bool) -> str:
+def _panel(section_id: str, title: str, html_block: str, *, loggy: bool, importance: str = "normal") -> str:
     """Wrap a rendered section in a collapsible panel with export/clear-view controls.
 
     The heading lives in the toolbar, outside the collapsible body, so a
@@ -560,6 +643,12 @@ def _panel(section_id: str, title: str, html_block: str, *, loggy: bool) -> str:
     append-only logs with a Time-first column (Detections/Threats/Shadow
     log/Events) — clearing a state table like Firewall/Allowlist wouldn't
     mean anything, since those rows aren't chronological history.
+
+    `importance` is `"priority"` (System/Events/Threats — the sections an
+    operator actually needs to react to), `"quiet"` (ML/Shadow log —
+    reference material, not something to react to on sight), or the
+    default `"normal"` for everything else. Purely a `panel-*` CSS class;
+    every panel keeps identical structure and controls regardless.
     """
     controls = (
         f'<button type="button" data-toggle="{_e(section_id)}">&#x25be; Collapse</button>'
@@ -567,8 +656,9 @@ def _panel(section_id: str, title: str, html_block: str, *, loggy: bool) -> str:
     )
     if loggy:
         controls += f'<button type="button" data-clear="{_e(section_id)}">Clear view</button>'
+    panel_class = "panel" + (f" panel-{importance}" if importance != "normal" else "")
     return (
-        f'<div class="panel" data-panel="{_e(section_id)}">'
+        f'<div class="{_e(panel_class)}" data-panel="{_e(section_id)}">'
         f'<div class="panel-toolbar"><h2>{_e(title)}</h2><div class="panel-controls">{controls}</div></div>'
         f'<div class="panel-body" id="panel-body-{_e(section_id)}">{html_block}</div>'
         f"</div>"
@@ -686,10 +776,10 @@ def render_dashboard(
     """Render the full control panel (spec §30's sections, plus the addendum additions)."""
     body = (
         f'<div class="page-header"><h1>pirewall control panel</h1>{_help_button()}</div>'
-        + _panel("system", "System", _render_system_section(status), loggy=False)
+        + _panel("system", "System", _render_system_section(status), loggy=False, importance="priority")
         + _panel("network", "Network", _render_network_section(capture_stats), loggy=False)
         + _panel("detections", "Detections", _render_detections_section(detections), loggy=True)
-        + _panel("threats", "Threats", _render_threats_section(threats), loggy=True)
+        + _panel("threats", "Threats", _render_threats_section(threats), loggy=True, importance="priority")
         + _panel(
             "firewall", "Firewall — active & adaptive rules", _render_firewall_section(rules), loggy=False
         )
@@ -698,6 +788,7 @@ def render_dashboard(
             "Shadow log (ADDENDUM.md A1) — what would have happened",
             _render_shadow_log_section(rules),
             loggy=True,
+            importance="quiet",
         )
         + _panel(
             "allowlist",
@@ -706,8 +797,8 @@ def render_dashboard(
             loggy=False,
         )
         + _portal_panels(portal_users, portal_sessions)
-        + _panel("events", "Events", _render_events_section(events), loggy=True)
-        + _panel("ml", "ML", _render_ml_section(models), loggy=False)
+        + _panel("events", "Events", _render_events_section(events), loggy=True, importance="priority")
+        + _panel("ml", "ML", _render_ml_section(models), loggy=False, importance="quiet")
         + _help_dialog()
     )
     return _page("pirewall control panel", body)

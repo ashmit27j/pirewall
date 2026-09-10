@@ -358,17 +358,26 @@ sudo -u pirewall-core uv run python -m scripts.deployment.portal_users \
 ```
 
 That creates `demo-alice` … `demo-erin` with passwords `pirewall-demo-1` …
-`pirewall-demo-5`. **Those passwords are published in this repository.**
-Delete them before the network carries real traffic:
+`pirewall-demo-5`.
 
-```sh
-for u in demo-alice demo-bob demo-carol demo-dave demo-erin; do
-  sudo -u pirewall-core uv run python -m scripts.deployment.portal_users remove "$u"
-done
-```
-
-While any survives, pirewall says so at every core startup, on the sign-in
-page, and on the control panel.
+> ### ⚠ Delete these before production
+>
+> **These passwords are published — they are printed in this file, in the
+> repository, and in the script's source.** They are fixed and non-secret on
+> purpose: a *generated* password written into a git-tracked document would
+> be a committed credential. Anyone who can read this repository, or who has
+> simply seen it, can join your protected network while they exist.
+>
+> ```sh
+> for u in demo-alice demo-bob demo-carol demo-dave demo-erin; do
+>   sudo -u pirewall-core uv run python -m scripts.deployment.portal_users remove "$u"
+> done
+> ```
+>
+> While any of them exists, pirewall tells you so in three places: a
+> `SYSTEM_WARNING` event at every `pirewall-core` startup, a banner on the
+> sign-in page, and a red notice on the control panel's portal panel. If you
+> see those, this step has not been done.
 
 Portal credentials cross the LAN in the clear — the sign-in page is plain
 HTTP, because a self-signed certificate breaks captive-portal detection.

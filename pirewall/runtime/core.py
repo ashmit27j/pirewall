@@ -84,6 +84,7 @@ from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.evidence import ProtocolSignatureEvidence
 from pirewall.core.models.flow import Flow
 from pirewall.core.models.packet import PacketMetadata
+from pirewall.core.network_drift import check_network_drift
 from pirewall.detection.anomaly import detect_batch as detect_anomaly_batch
 from pirewall.detection.coordinator import DetectionCoordinator, load_models, with_anomaly_evidence
 from pirewall.detection.tls_fingerprint import (
@@ -423,6 +424,18 @@ class CoreDaemon:
         RPC so the Admin PC can see why it is not filtering, which is far
         more useful than a crash-looping unit (A6).
         """
+        for drift in check_network_drift(self._config):
+            _logger.warning("network config drift: %s: %s", drift.field, drift.detail)
+            self._forwarder.emit(
+                SecurityEvent(
+                    timestamp=datetime.now(UTC),
+                    severity=EventSeverity.WARNING,
+                    event_type=SecurityEventType.SYSTEM_WARNING,
+                    subsystem=_SUBSYSTEM,
+                    reason=f"{drift.field}: {drift.detail}",
+                )
+            )
+
         self._rpc_server.start()
         _logger.info("RPC socket listening at %s", self._config.api.rpc_socket_path)
 

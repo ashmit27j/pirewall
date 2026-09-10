@@ -23,7 +23,7 @@ move to a new uplink network.
 | 2 | Isolation Forest flags benign traffic as anomalous | High | Observed |
 | 3 | Behaviour thresholds still tuned for a quiet network | Medium | Observed |
 | 4 | Demo portal accounts are live on this deployment | High | Observed |
-| 5 | Enforcement is `assisted` without the recommended SHADOW soak | Medium | Observed |
+| 5 | Enforcement is `assisted` without the recommended SHADOW soak | Medium | Fixed |
 | 6 | Wazuh and Netdata integrations never verified end to end | Medium | Observed |
 | 7 | Portal serves plaintext HTTP | Medium | Deferred |
 | 8 | Portal sessions do not survive a core restart | Low | Deferred |
@@ -34,7 +34,7 @@ move to a new uplink network.
 | 13 | An unmerged branch predates this work | Low | Observed |
 | 14 | `capture_stats.packets_seen` did not move during a live check | Low | Observed |
 | 15 | `pirewall-api` cannot write its own log file | Low | Observed |
-| 16 | Moving the Pi to a new network silently staleness-rots the config | Medium | Observed |
+| 16 | Moving the Pi to a new network silently staleness-rots the config | Medium | Fixed |
 | 17 | `security.session_timeout_seconds` is read by nothing | Low | Observed |
 | 18 | A TLS-only port answers plaintext HTTP with a bare teardown | Low | Observed |
 
@@ -140,14 +140,20 @@ believed.
 
 ## 5. Enforcement is `assisted` without the recommended SHADOW soak
 
-**Status: Observed.** `firewall.enforcement_mode = "assisted"`.
-ADDENDUM.md A1 recommends one to two weeks in `shadow` first, reviewing the
-shadow log, before enforcing anything. That soak has not happened, and items
-1–3 are exactly what it exists to surface.
+**Status: Fixed (2026-09-10).** `firewall.enforcement_mode` set to `"shadow"`
+in `config/local_config.toml` this session. ADDENDUM.md A1 recommends one to
+two weeks in `shadow` first, reviewing the shadow log, before enforcing
+anything; that soak had not happened, and items 1–3 are exactly what it
+exists to surface.
 
-Given the false-positive rate now measured, `shadow` is the honest setting
-until items 1–3 are addressed. Enforcing on a detection stack known to
-misclassify ordinary browsing means throttling real users to no benefit.
+**This is an open decision for a human, not a closed loop.** The mode was
+moved to `shadow` for the duration of this session — both because items 1–3
+were about to be actively worked on (nothing should get live-BLOCKed by
+detection code mid-edit) and because the false-positive rate now measured
+makes `shadow` the honest setting until those items are addressed. It was
+deliberately **not** moved back to `assisted` automatically once item 1/2/3
+work below landed — do that only after reviewing this session's shadow log
+against ADDENDUM.md A1's recommended soak period.
 
 ## 6. Wazuh and Netdata integrations were never verified end to end
 
@@ -314,28 +320,48 @@ exists to avoid.
 
 ## 16. Moving the Pi to a new network silently staleness-rots the config
 
-**Status: Observed (2026-09-10).** After the Pi moved to a new uplink,
+**Status: Fixed (2026-09-10).** After the Pi moved to a new uplink,
 `config/local_config.toml` still read `upstream_gateway = "192.168.1.1"`
 while the live default route was via `10.253.156.97`. Nothing failed
-loudly — the value is not used for routing.
+loudly — the value is not used for routing. By this session, the network
+had moved *again* (the AP's own upstream changed to `192.168.1.1` via
+`wlan1`, coincidentally reusing the earlier value) — confirming this drifts
+more than once and needed the structural fix, not another hand edit.
 
 **Cost.** `_validate_safety` in `pirewall/firewall/validator.py` protects
 `upstream_gateway` from being blocked, precisely because a /32 against the
 gateway is an internet outage that the `0.0.0.0/0` check does not catch.
 Pointed at a stale address, that guard protects an address no longer on the
 network **and leaves the real gateway unprotected** — an adaptive rule
-against `10.253.156.97` would have validated cleanly and cut the Pi's own
-uplink. Fixed by hand this session; `--check-config` accepts either value,
-so nothing would have caught it.
+against the real live gateway would have validated cleanly and cut the
+Pi's own uplink. `--check-config` accepts any syntactically valid address,
+so nothing would have caught it before this session.
 
-**Fixing it** means a startup cross-check: compare `upstream_gateway`
-against the kernel's actual default route for `wan_interface`, and against
-`pirewall_lan_ip`/`protected_network` for `lan_interface`, and emit a
-`system_warning` event on a mismatch rather than refusing to start (the
-uplink can legitimately be down at boot). `scripts/deployment/discovery.py`
-already parses `ip -j route` and could supply the comparison. The same drift
-applies to `[integration] wazuh_host`/`netdata_host` and `[admin]
-admin_pc_ip`, which are all addresses on networks the Pi can be moved off.
+**Fixed two ways:**
+- **Immediate:** `config/local_config.toml`'s `upstream_gateway` corrected
+  to `192.168.1.1`, matching the live default route observed via `ip -j
+  route` at the time of this fix.
+- **Structural:** `pirewall/core/network_drift.py` (new), called from
+  `CoreDaemon.start()` on every `pirewall-core` startup. It compares
+  `network.upstream_gateway`/`wan_interface` against the kernel's live
+  default route (parsed from `/proc/net/route`, stdlib-only — no
+  `subprocess`, so it doesn't reach for `scripts/deployment/discovery.py`,
+  which is setup-time tooling outside the `pirewall` package on purpose),
+  and `pirewall_lan_ip`/`protected_network` against `lan_interface`'s
+  actual address (via `SIOCGIFADDR`/`SIOCGIFNETMASK`). `admin.admin_pc_ip`
+  and any of `integration.wazuh_host`/`netdata_host` that parse as a literal
+  IPv4 (not a hostname) are checked against every subnet the host has an
+  address on, across all interfaces — not just WAN/LAN, since the Admin PC
+  segment is a third interface (`eth0` on this deployment). Every mismatch
+  emits a `SYSTEM_WARNING` `SecurityEvent` rather than refusing to start,
+  since the uplink can legitimately be down at boot.
+
+**Tested**: `tests/unit/test_network_drift.py`, 8 cases covering exact
+match (no warnings), gateway-only drift, interface drift, LAN
+IP/network drift, stale Admin PC IP, integration hosts skipped when
+disabled or when they're hostnames rather than IPv4 literals, and a
+missing default route reported without crashing. Full suite: 886 passed;
+`ruff check .` and `pyright --strict` clean.
 
 ---
 

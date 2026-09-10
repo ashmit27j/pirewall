@@ -28,7 +28,7 @@ move to a new uplink network.
 | 7 | Portal serves plaintext HTTP | Medium | Deferred |
 | 8 | Portal sessions do not survive a core restart | Low | Deferred |
 | 9 | `make_certs.sh` writes only one SAN | Low | Observed |
-| 10 | Runtime allowlist additions are not persisted | Medium | Reasoned |
+| 10 | Runtime allowlist additions are not persisted | Medium | Fixed |
 | 11 | `AF_PACKET`, `nft` and systemd paths remain partly unverified | Medium | Deferred |
 | 12 | Dashboard JS is checked by a scanner, not a parser | Low | Deferred |
 | 13 | An unmerged branch predates this work | Low | Fixed |
@@ -338,24 +338,48 @@ failed outright. Any deployment predating that should regenerate.
 
 ## 10. Runtime allowlist additions are not persisted
 
-**Status: Reasoned** (from the code; not triggered deliberately).
-`POST /api/v1/allowlist` mutates `FirewallManager`'s in-memory list only.
-`config.firewall.allowlist` is re-read at startup, so **every allowlist entry
-added through the control panel is silently lost on the next restart** — and
-the allowlist is the mechanism that is supposed to outrank every adaptive
-rule unconditionally (ADDENDUM.md A2).
+**Status: Fixed (2026-09-10).** `POST /api/v1/allowlist` used to mutate
+`FirewallManager`'s in-memory list only — `config.firewall.allowlist` is
+re-read at startup, so every allowlist entry added through the control
+panel was silently lost on the next restart, for the mechanism that is
+supposed to outrank every adaptive rule unconditionally (ADDENDUM.md A2).
+An operator who allowlisted a printer, restarted for an unrelated reason,
+and then watched that printer get blocked had no way to connect the two
+events.
 
-An operator who allowlists a printer, restarts for an unrelated reason, and
-then watches that printer get blocked has no way to connect the two events.
+Fixed the second way this document already named: a separate state file
+the config seeds, mirroring the exact single-writer pattern portal
+accounts already used (ADDENDUM_3.md C3) rather than giving `pirewall-api`
+write access to `config/local_config.toml`.
 
-Fixing it means deciding who owns the allowlist: the config file (in which
-case the API must write back to it, atomically, the way
-`scripts/deployment/configure.py` does) or a separate state file that the
-config seeds. The first keeps one source of truth; the second avoids the API
-process needing write access to config. Worth an ADDENDUM entry either way.
+- New `pirewall/firewall/allowlist_store.py` — `AllowlistStore`, same
+  temp-file-then-`os.replace` write discipline, `0600` mode, as
+  `pirewall.portal.store.PortalUserStore`. Only `pirewall-core` ever opens
+  it; already covered by the existing `deploy/systemd/pirewall-core.service`
+  `ReadWritePaths=.../var/lib/pirewall` and
+  `pirewall-portal.service`'s `InaccessiblePaths=/var/lib/pirewall` — no
+  deployment/systemd changes needed, the file lives alongside
+  `portal_users.json` in a directory already locked down correctly.
+- New `firewall.allowlist_store_path` config field (default
+  `/var/lib/pirewall/allowlist.json`).
+- `FirewallManager` takes an optional `allowlist_store` — `None` (every
+  existing caller, including every test that doesn't care) keeps the old
+  in-memory-only behavior exactly. When given one (wired in
+  `CoreDaemon.__init__`), `add_allowlist_entry`/`remove_allowlist_entry`
+  read/write through it, and startup seeds the in-memory list from
+  `config.firewall.allowlist` (the static, deployment-declared entries)
+  **union** the store's persisted entries (runtime-added ones). Removing a
+  config-seeded entry is a no-op against the store (it was never there) —
+  it reappears on the next restart, same as always; only runtime-added
+  entries are this item's persistence concern, and those now survive.
 
-Portal accounts already solved the same problem — see ADDENDUM_3.md C3 for
-the single-writer pattern to copy.
+**Tested**: `tests/unit/test_allowlist_store.py` (7 cases: persistence
+across a fresh store instance, overwrite-by-id, permissions, missing
+parent directory) and `tests/unit/test_allowlist_persistence.py` (4 cases:
+a runtime-added entry surviving a simulated restart, removal persisting,
+a config-seeded entry correctly *not* removed from the store, and
+`allowlist_store=None` behaving exactly as before). 916 passed; `ruff
+check .` and `pyright --strict` clean.
 
 ## 11. `AF_PACKET`, `nft` and systemd paths remain partly unverified
 

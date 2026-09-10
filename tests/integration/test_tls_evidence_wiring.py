@@ -11,7 +11,9 @@ it runs (and is actually verified) on every platform.
 """
 
 import struct
+import tempfile
 from datetime import UTC, datetime
+from pathlib import Path
 
 from pirewall.capture.fake import FakePacketCapture
 from pirewall.capture.parser import parse_packet
@@ -35,7 +37,11 @@ def _daemon() -> CoreDaemon:
         "lightgbm_model_path": "/nonexistent/pirewall-test/lightgbm_model.txt",
         "isolation_forest_model_path": "/nonexistent/pirewall-test/isolation_forest.joblib",
     }
-    config = make_config(ml=missing)
+    # AllowlistStore (KNOWN_ISSUES.md #10) is always constructed; give it
+    # somewhere accessible instead of the real default (/var/lib/pirewall/).
+    # This file never adds/removes an entry, so nothing is ever written.
+    allowlist_path = str(Path(tempfile.gettempdir()) / "pirewall-test-unused-allowlist.json")
+    config = make_config(ml=missing, firewall={"allowlist_store_path": allowlist_path})
     return CoreDaemon(
         config,
         capture=FakePacketCapture("test0", []),

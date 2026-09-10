@@ -93,6 +93,7 @@ from pirewall.detection.tls_fingerprint import (
     match_known_tool,
 )
 from pirewall.detection.tls_heartbeat import check_heartbleed
+from pirewall.firewall.allowlist_store import AllowlistStore
 from pirewall.firewall.backend.nftables import NftablesBackend
 from pirewall.firewall.interface import FirewallBackend
 from pirewall.firewall.manager import FirewallManager
@@ -272,7 +273,11 @@ class CoreDaemon:
         self._state = CoreStateStore(
             max_history=config.api.history_size, started_at=self._started_at
         )
-        self._manager = FirewallManager(config, firewall_backend)
+        # KNOWN_ISSUES.md #10: runtime-added allowlist entries persist here,
+        # the same single-writer pattern as `PortalUserStore` (ADDENDUM_3.md
+        # C3) — only pirewall-core ever opens this file.
+        self._allowlist_store = AllowlistStore(config.firewall.allowlist_store_path)
+        self._manager = FirewallManager(config, firewall_backend, self._allowlist_store)
         self._counters = RuntimeCounters()
         self._forwarder = EventForwarder(self._state, self._build_wazuh(), self._lock)
         # ADDENDUM_2.md B1: fed from the capture thread the instant a flow

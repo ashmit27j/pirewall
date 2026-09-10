@@ -114,7 +114,15 @@ def _daemon(
 ) -> tuple[CoreDaemon, PirewallConfig, FakeFirewallBackend]:
     api_overrides: dict[str, object] = {"rpc_socket_path": socket_path, "history_size": 50}
     api_overrides.update(overrides.pop("api", {}))
-    config = make_config(api=api_overrides, **overrides)
+    # AllowlistStore (KNOWN_ISSUES.md #10) is always constructed, unlike
+    # PortalUserStore which only opens when portal.enabled — give it
+    # somewhere writable in the same per-test temp directory `socket_path`
+    # already lives in, rather than the real default (/var/lib/pirewall/).
+    firewall_overrides: dict[str, object] = {
+        "allowlist_store_path": str(Path(socket_path).parent / "allowlist.json")
+    }
+    firewall_overrides.update(overrides.pop("firewall", {}))
+    config = make_config(api=api_overrides, firewall=firewall_overrides, **overrides)
     backend = FakeFirewallBackend()
     daemon = CoreDaemon(
         config,
@@ -216,7 +224,10 @@ def test_a_capture_that_cannot_start_is_reported_not_fatal(socket_path: str) -> 
 
             raise CaptureError("no such device test0")
 
-    config = make_config(api={"rpc_socket_path": socket_path, "history_size": 50})
+    config = make_config(
+        api={"rpc_socket_path": socket_path, "history_size": 50},
+        firewall={"allowlist_store_path": str(Path(socket_path).parent / "allowlist.json")},
+    )
     daemon = CoreDaemon(
         config,
         capture=_UnstartableCapture("test0", []),
@@ -240,7 +251,10 @@ def test_backpressure_drops_flows_rather_than_blocking_capture(socket_path: str)
     for index in range(6):
         packets.extend(_one_completed_session(src=f"203.0.113.{10 + index}"))
 
-    config = make_config(api={"rpc_socket_path": socket_path, "history_size": 50})
+    config = make_config(
+        api={"rpc_socket_path": socket_path, "history_size": 50},
+        firewall={"allowlist_store_path": str(Path(socket_path).parent / "allowlist.json")},
+    )
     daemon = CoreDaemon(
         config,
         capture=FakePacketCapture("test0", packets),
@@ -322,6 +336,7 @@ def test_anomaly_scoring_backpressure_still_finishes_every_flow(socket_path: str
 
     config = make_config(
         api={"rpc_socket_path": socket_path, "history_size": 50},
+        firewall={"allowlist_store_path": str(Path(socket_path).parent / "allowlist.json")},
         # batch_size=1 so the inference thread scores (and blocks on) one
         # flow at a time instead of draining the whole burst into one batch
         # before the slow model call ever runs — otherwise the artificial
@@ -388,7 +403,9 @@ def test_scanning_visible_through_a_completing_flow_while_scan_flows_stay_open(
         "flow": {"active_timeout_seconds": 3600, "inactive_timeout_seconds": 3600},
     }
     config = make_config(
-        api={"rpc_socket_path": socket_path, "history_size": 50}, **config_overrides
+        api={"rpc_socket_path": socket_path, "history_size": 50},
+        firewall={"allowlist_store_path": str(Path(socket_path).parent / "allowlist.json")},
+        **config_overrides,
     )
     daemon = CoreDaemon(
         config,
@@ -432,6 +449,7 @@ def test_slow_rate_dos_detected_without_waiting_for_connections_to_close_or_time
 
     config = make_config(
         api={"rpc_socket_path": socket_path, "history_size": 50},
+        firewall={"allowlist_store_path": str(Path(socket_path).parent / "allowlist.json")},
         detection={
             "concurrent_slow_connections_threshold": 5,
             "slow_connection_min_duration_seconds": 0.2,

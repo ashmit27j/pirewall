@@ -218,6 +218,14 @@ class FirewallConfig(PirewallModel):
     max_active_rules: int = Field(default=500, gt=0)
     allowlist: tuple[AllowlistEntry, ...] = Field(default_factory=tuple)
 
+    # Where runtime-added allowlist entries (control panel / API) persist
+    # across a restart — KNOWN_ISSUES.md #10. `allowlist` above stays the
+    # static, deployment-declared seed; entries added at runtime live here
+    # instead, following the same single-writer pattern as
+    # `portal.user_store_path` (ADDENDUM_3.md C3): only `pirewall-core`
+    # ever opens this file.
+    allowlist_store_path: str = Field(default="/var/lib/pirewall/allowlist.json", min_length=1)
+
     # spec §24 "reject any rule broader than the evidence that generated
     # it": v1's adaptive pipeline only ever has single-flow evidence, so no
     # legitimate candidate should need to target anything broader than

@@ -38,6 +38,7 @@ from pirewall.core.models.allowlist import AllowlistEntry
 from pirewall.core.models.decision import FirewallDecision
 from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.rule import CandidateRule, FirewallRule
+from pirewall.firewall.allowlist_store import AllowlistStore
 from pirewall.firewall.interface import FirewallBackend
 from pirewall.firewall.rate_limiter import RuleCreationRateLimiter
 from pirewall.firewall.validator import validate_candidate_rule
@@ -67,7 +68,12 @@ class SubmissionResult:
 class FirewallManager:
     """Owns rule state, enforcement mode, and the only reference to a `FirewallBackend`."""
 
-    def __init__(self, config: PirewallConfig, backend: FirewallBackend) -> None:
+    def __init__(
+        self,
+        config: PirewallConfig,
+        backend: FirewallBackend,
+        allowlist_store: AllowlistStore | None = None,
+    ) -> None:
         self._config = config
         self.__backend = backend
         self._rules: dict[str, FirewallRule] = {}
@@ -77,7 +83,16 @@ class FirewallManager:
             config.firewall.max_adaptive_rules_per_window, config.firewall.rate_window_seconds
         )
         self._enforcement_mode = config.firewall.enforcement_mode
+        # `config.firewall.allowlist` is the static, deployment-declared
+        # seed; `allowlist_store` (KNOWN_ISSUES.md #10) holds whatever was
+        # added at runtime and survives a restart. `None` means "no
+        # persistence" — every existing caller (tests, and any deployment
+        # that hasn't set `allowlist_store_path`) keeps working exactly as
+        # before, just without the durability fix.
+        self._allowlist_store = allowlist_store
         self._allowlist: list[AllowlistEntry] = list(config.firewall.allowlist)
+        if allowlist_store is not None:
+            self._allowlist.extend(allowlist_store.list_entries())
 
     @property
     def enforcement_mode(self) -> EnforcementMode:
@@ -178,14 +193,27 @@ class FirewallManager:
         return updated
 
     def add_allowlist_entry(self, entry: AllowlistEntry) -> None:
-        """Add a static allowlist entry (ADDENDUM.md A2)."""
+        """Add an allowlist entry (ADDENDUM.md A2), persisted so it survives a restart.
+
+        See KNOWN_ISSUES.md #10.
+        """
         self._allowlist.append(entry)
+        if self._allowlist_store is not None:
+            self._allowlist_store.add(entry)
 
     def remove_allowlist_entry(self, entry_id: str) -> bool:
-        """Remove an allowlist entry by id. Returns `False` if `entry_id` wasn't found."""
+        """Remove an allowlist entry by id. Returns `False` if `entry_id` wasn't found.
+
+        Also removes it from the persistent store if it was there — a
+        no-op for an entry that came from `config.firewall.allowlist`
+        instead, which reappears on the next restart regardless (it is the
+        static seed, not something this call owns).
+        """
         for index, entry in enumerate(self._allowlist):
             if entry.id == entry_id:
                 del self._allowlist[index]
+                if self._allowlist_store is not None:
+                    self._allowlist_store.remove(entry_id)
                 return True
         return False
 

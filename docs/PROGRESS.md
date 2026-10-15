@@ -19,8 +19,92 @@ Environment-dependent / Not yet validated.
 | 9 | Security/integration testing, docs & final validation | Complete | See detailed notes below. |
 | — | Entry points & process runtime (`pirewall/main.py`, `pirewall/api/__main__.py`, `pirewall/runtime/`) | Complete | Not a numbered phase — the scoped follow-up the Phase 8 open question recommended. Tested: whole `CoreDaemon` end to end through every thread and the real `AF_UNIX` transport, the detection coordinator's ML-degradation paths, `sd_notify`, metrics, the event forwarder, rule expiry, both entry points' validation, `/config` redaction, the SSE stream (61 new tests, 472 total). Also verified by hand: both processes running together over real TLS and a real socket. Three defects found by running the code, each fixed with a regression test. Environment-dependent: `AF_PACKET`, `nft`, systemd supervision. See `docs/DEPLOYMENT_COMPLETE.md`. |
 | 10 | LAN captive portal, user accounts & local console (ADDENDUM_3.md C1–C6) | Complete | Tested: the portal privilege boundary (structural + behavioural + over the real `AF_UNIX` transport), the user store (round-trip, 0600, atomic replace, timing-equalised verification, corrupt-file refusal), session binding/expiry/bounding, the login throttle, the nft grant through `FirewallManager`, `rules_targeting`, both DHCP regressions in `base.nft.template`, the section-aware systemd check, and the whole sign-in→keepalive→countdown→block→auto-logout flow end to end (141 new tests, 812 total). Also **verified on the real Pi**: both sockets bound in their correct separate groups, a real sign-in adding a kernel-expiring `@authed` element, sign-out removing it, and the three-table `forward`-hook ordering. Environment-dependent: the blocked-client notice on real hardware needs a genuine detection event (spec §34 attack lab) — the path itself is covered end to end against the validated rule pipeline in `tests/integration/test_portal_flow.py`. Known limitation, not a defect: the portal serves plaintext HTTP (ADDENDUM_3.md C5). Three latent defects found and fixed — see below. |
+| — | Detection-quality + native capture overhaul (2026-10-15) | Complete (dev hardware); Pi verification Environment-dependent | Feature schema 2.0.0 (training/runtime semantic parity), windowed behavior state, per-pattern scoring, source-level fast path, ML protocol-domain guard, kernel timestamps, optional Rust capture engine (`native/`). Tested: 950+ tests on Linux incl. bit-exact Python/native parity. Live A/B on real captured traffic. See "Detection-quality and native capture overhaul" below. |
 | — | Setup tooling (`scripts/deployment/configure.py`, `discovery.py`, `make_certs.sh`, `docs/SETUP.md`) | Complete | Network layout detected from `ip -j` instead of retyped; Admin PC and password asked for, never guessed. Tested: 35 tests over discovery parsing (captured `ip -j` fixtures), config generation and validate-then-write, the Admin-PC prompt, and `--set-admin-pc` as a targeted edit. Also run for real against a stubbed `ip` reproducing a Pi 4 gateway, end to end through both entry points and real TLS 1.3. Environment-dependent: `ip -j` output from a real Pi (fixtures are captured, not synthesized from imagination — but no Pi was available to confirm). |
 
+
+### Detection-quality and native capture overhaul (2026-10-15)
+
+Operator request: find out why outputs and performance were poor, refactor
+hot paths into a faster language where that is actually the cause. Work on
+branch `overhaul/feature-parity-and-native-capture`. Diagnosis first, every
+claim measured; fixes second.
+
+**Root causes found** (each with evidence in the linked doc):
+
+1. **Training/runtime feature mismatch** — the same `Flow` field meant two
+   different quantities: L4 payload vs IP length, sample vs population
+   std, unreproducible 0/1 flag "counts" vs real counts, ≤120 s vs ≤1800 s
+   flows, kernel vs userspace timestamps. Verified against the real CSVs.
+   (`docs/FEATURE_SCHEMA.md` "Why 2.0.0")
+2. **Behavior state never decayed** — `behavior_window_seconds` was read
+   by nothing. (`docs/KNOWN_ISSUES.md` #3)
+3. **Scoring arithmetic capped behavior-only evidence at 40 < 50** — no
+   flood or scan could ever be acted on without an ML attack label.
+   (#20)
+4. **Per-flow assessment waited for flow completion** — a SYN flood's
+   half-open flows complete only at the inactive timeout. (#20)
+5. **Floods against closed ports invisible; responders counted as
+   attackers** — found by replaying real attack traffic (KNOWN_ISSUES #20
+   items 4–5): binary rate patterns carry no magnitude, and a flow first
+   seen at a response packet was attributed to the responder, which got the
+   flood's victim rate-limited.
+6. **ML consulted outside its training domain** — ICMP never appears as
+   ICMP in CICIDS2017; found by the live A/B, where it produced the only
+   BLOCK on benign traffic.
+7. **Per-packet Python under the GIL** — ~127 µs/packet on a Pi
+   uncontended, and the detection/inference threads compete for the same
+   GIL, which is what turned a 10k pkt/s flood into 94% drops.
+   Also: `SO_RCVBUF` silently capped by `rmem_max`.
+
+**Deliverables and labels**
+
+| item | label | where |
+|---|---|---|
+| Feature schema 2.0.0: `PayloadStats`, sample std, flag features removed, adapter mapped to real CSV semantics, Ethernet-padding normalization | **Tested** | `pirewall/features/`, `pirewall/flow/state.py`, `pirewall/ml/preprocessing/`, `tests/unit/test_feature_extractor.py`, `test_flow_state.py`, `tests/ml/test_cicids_adapter.py` |
+| `flow.active_timeout_seconds` default 1800 → 120 (CICFlowMeter) | **Implemented** (config) | `config/default_config.toml` |
+| Kernel receive timestamps (`SO_TIMESTAMPNS`), `SO_RCVBUFFORCE` on the Python path | **Environment-dependent** (exercised only inside the native benchmark's container, not on the Pi) | `pirewall/capture/af_packet.py` |
+| Models retrained on schema 2.0.0 (LightGBM v1.0.0, Isolation Forest v1.0.0) | **Tested** on held-out split; artifacts gitignored, **not deployed** | `docs/ML_PIPELINE.md` |
+| Sliding-window behavior state; per-destination REPEATED_FAILURES; streak-based PERSISTENCE; expiring slow-cluster snapshots | **Tested** | `pirewall/detection/behavior.py`, `tests/unit/test_behavior_window.py` |
+| Per-pattern behavior scoring (`behavior_pattern_points`, cap 80) | **Tested** (pins the observed attack-lab and page-load pattern sets) | `pirewall/engine/scoring.py`, `tests/unit/test_scoring.py` |
+| Source-level fast path; snapshot assessments run no ML and fold no completion signal (also fixes B2 double-counting) | **Tested** (both capture paths, end to end through the daemon) | `pirewall/runtime/core.py`, `pipeline.py`, `tests/integration/test_core_daemon*.py` |
+| ML protocol-domain guard (`ML_DOMAIN_PROTOCOLS`) | **Tested** | `pirewall/detection/coordinator.py` |
+| FLOOD pattern (per-destination connection rate) | **Tested** | `pirewall/detection/behavior.py`, `tests/unit/test_behavior_window.py` |
+| Responder-opened flows never counted as connections (`Flow.opened_by_initiation`) | **Tested** (both engines, parity) | `pirewall/flow/`, `native/src/flow.rs`, `tests/unit/test_flow_aggregator.py` |
+| Native engine: `TPACKET_V3` ring + Rust parser/flow table, PyO3 extension, optional `native` extra, `capture.backend` | **Tested** (Rust unit tests; bit-exact parity vs Python on a 6.7k-frame mixed stream; daemon end to end via `FakeFlowCapture`); **real ring Environment-dependent on the Pi** — exercised for real only on a veth pair in a Linux container | `native/`, `pirewall/{capture,flow}/native.py`, `tests/unit/test_native_parity.py`, `tests/integration/test_core_daemon_native.py` |
+| Native per-drain load shedding, counted as backpressure | **Tested** | same |
+| Capture benchmark (x86 container, **not Pi**) | measured | `benchmarks/2026-10-15-native-capture/REPORT.md` |
+| Live A/B on real benign + attack captures, both pipelines | measured | `benchmarks/2026-10-15-native-capture/LIVE_AB.md` |
+
+**Verification**: `ruff check .` clean; `pyright --strict` 0 errors (stub for
+the optional extension in `typings/`); `cargo clippy` clean, `cargo fmt`
+applied; full `pytest` in a Linux container: all pass except
+`test_a_socket_in_the_wrong_group_is_refused`, which fails only as root
+(root bypasses socket group permissions) and passes as an unprivileged user
+— also checked. The previously skipped/failing batched-anomaly daemon
+tests run against the retrained v1.0.0 artifacts.
+
+**Deviations / decisions made without asking**, stated so they can be
+reversed:
+- The Ubuntu WSL distro recorded in memory no longer exists; Docker Desktop
+  was started and a throwaway dev image built in the session scratchpad
+  (not the repo) for every Linux run.
+- Busy-client pattern points were lowered after the first live A/B showed
+  45 + a spurious anomaly flag (15) turning 10% of a browsing burst into
+  MEDIUM events; SCANNING raised to 55 so the observed nmap pattern still
+  reaches HIGH. Both choices are pinned by tests and documented in config.
+- Every pre-2.0.0 model artifact is now refused at load. A Pi updated
+  without new artifacts runs behavior-only (and says so) until they are
+  copied over — `docs/DEPLOYMENT.md` §3.2.
+- Behavior evidence can now reach RATE_LIMIT on its own. Under the Pi's
+  `assisted` policy (KNOWN_ISSUES #5) RATE_LIMIT is not approval-gated, so
+  after deployment scans/floods **will** be rate-limited live — the point
+  of #20, but a real change in what enforcement does.
+
+**What a human needs to do on the Pi**: build the extension (`uv sync
+--no-dev --extra native`, §3.1), copy the v1.0.0 artifacts, migrate
+`local_config.toml` (§3.2), then re-run the attack lab and compare against
+`benchmarks/2026-09-10-attack-lab/REPORT.md`.
 
 ### Phase 10 defects found (2026-09-09)
 

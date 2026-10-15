@@ -15,15 +15,15 @@ _CICIDS_HEADER = (
     " Bwd Packet Length Mean, Bwd Packet Length Std, Flow IAT Mean,"
     " Flow IAT Std, Flow IAT Max, Flow IAT Min, SYN Flag Count,"
     " ACK Flag Count, FIN Flag Count, RST Flag Count, PSH Flag Count,"
-    " URG Flag Count, Label"
+    " URG Flag Count, Fwd Header Length, Bwd Header Length, Label"
 )
 _BENIGN_ROW = (
     "443,1000000,5,4,600,400,"
-    "150,100,120,15,120,80,100,12,50000,10000,80000,20000,1,4,1,0,3,0,BENIGN"
+    "150,100,120,15,120,80,100,12,50000,10000,80000,20000,1,4,1,0,3,0,100,80,BENIGN"
 )
 _DDOS_ROW = (
     "80,500000,100,1,6000,60,"
-    "60,60,60,0,60,60,60,0,5000,1000,8000,2000,100,1,0,0,0,0,DDoS"
+    "60,60,60,0,60,60,60,0,5000,1000,8000,2000,100,1,0,0,0,0,100,80,DDoS"
 )
 
 

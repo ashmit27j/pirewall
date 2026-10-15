@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 from pirewall.config.models import MLConfig
-from pirewall.core.enums import ModelType, SecurityEventType
+from pirewall.core.enums import ModelType, Protocol, SecurityEventType
 from pirewall.core.exceptions import ModelInferenceError
 from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.evidence import AnomalyEvidence
@@ -225,3 +225,37 @@ def test_analyze_equals_analyze_except_anomaly_plus_with_anomaly_evidence(tmp_pa
 
     assert combined_outcome.record == split_outcome.record
     assert combined_outcome.behavior == split_outcome.behavior
+
+
+def test_flows_outside_the_models_training_domain_get_no_ml_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ICMP never appears as ICMP in CICIDS2017 (the adapter can only infer TCP/UDP).
+
+    On real benign traffic the model called an ICMP flow "DoS Slowhttptest"
+    at 92% and the pipeline BLOCKed it. Neither model may be consulted for
+    a protocol its training data cannot represent; behavior still runs.
+    """
+
+    def _must_not_be_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("no ML for an out-of-domain flow")
+
+    monkeypatch.setattr("pirewall.detection.coordinator.classify_known_attack", _must_not_be_called)
+    monkeypatch.setattr("pirewall.detection.coordinator.detect_anomaly", _must_not_be_called)
+    config = make_config()
+    coordinator = DetectionCoordinator(
+        config.detection,
+        ModelRegistry(
+            lightgbm=_ExplodingModel(),  # pyright: ignore[reportArgumentType]
+            isolation_forest=_ExplodingModel(),  # pyright: ignore[reportArgumentType]
+        ),
+    )
+    flow = make_flow(protocol=Protocol.ICMP, source_port=None, destination_port=None)
+
+    outcome = coordinator.analyze(flow, extract_features(flow), NOW)
+
+    assert outcome.record.known_evidence is None
+    assert outcome.record.anomaly_evidence is None
+    assert outcome.behavior is not None
+    assert not DetectionCoordinator.in_model_domain(flow)
+    assert DetectionCoordinator.in_model_domain(make_flow(protocol=Protocol.UDP))

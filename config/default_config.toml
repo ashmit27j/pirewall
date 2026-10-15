@@ -24,9 +24,19 @@ interface = "eth1"              # CHANGE_ME — must match the interface facing 
 snap_len = 65535
 promiscuous = true
 buffer_size_bytes = 2097152
+# "auto": native TPACKET_V3 ring + Rust flow table when pirewall-native is
+# installed (uv sync --extra native), else the pure-Python path.
+backend = "auto"
+ring_block_size_bytes = 1048576
+ring_block_count = 16
+ring_block_timeout_ms = 50
+# Native path: per-drain conversion caps; excess is shed and counted.
+native_max_flows_per_drain = 1000
+native_max_new_flows_per_drain = 5000
 
 [flow]
-active_timeout_seconds = 1800
+# 120 = CICFlowMeter's flow timeout: no CICIDS2017 training flow is longer.
+active_timeout_seconds = 120
 inactive_timeout_seconds = 60
 max_flows = 100000
 cleanup_interval_seconds = 30
@@ -34,7 +44,7 @@ cleanup_interval_seconds = 30
 [features]
 # Pinned schema version — bump only when pirewall/features/schema.py changes
 # in a way that alters feature names/order/count (spec §11, §15).
-schema_version = "1.0.0"
+schema_version = "2.0.0"
 
 [detection]
 known_attack_confidence_threshold = 0.8
@@ -59,6 +69,9 @@ destination_diversity_threshold = 15
 scanning_port_threshold = 10
 repeated_failures_threshold = 10
 temporal_pattern_cv_threshold = 0.15
+# FLOOD: new connections/s from one source to one destination (over
+# burst_window_seconds). ~12x the busiest benign client measured.
+flood_connections_per_second_threshold = 100.0
 
 # ADDENDUM_2.md B2 — slow-rate (slowloris-class) aggregate signal. A flow
 # only becomes a "slow connection" candidate once open this many seconds
@@ -82,10 +95,15 @@ known_tool_fingerprints_path = "config/known_tool_fingerprints.toml"
 anomaly_batch_size = 50
 anomaly_batch_max_wait_seconds = 0.2
 
+# Source-level fast path: a source whose behavior alone already scores
+# MEDIUM+ is assessed immediately (from a snapshot of an open flow) rather
+# than when its first flow completes; at most once per source per this long.
+source_assessment_cooldown_seconds = 10.0
+
 [ml]
 lightgbm_model_path = "pirewall/ml/artifacts/lightgbm_model.txt"
 isolation_forest_model_path = "pirewall/ml/artifacts/isolation_forest_model.joblib"
-feature_schema_version = "1.0.0"
+feature_schema_version = "2.0.0"
 
 [threat]
 low_threshold = 25.0
@@ -104,11 +122,19 @@ critical_threshold = 90.0
 # classifier's false-positive rate, so at 15 it cannot reach low_threshold
 # (25) on its own — it can only contribute in combination. A confident
 # known-attack detection alone reaches 60: past medium (50), short of high
-# (75), so enforcement still requires corroboration. Behavior is unchanged
-# at 25 — deterministic, with no labelled ground truth to tune against.
+# (75), so enforcement still requires corroboration.
 known_attack_weight = 60.0
 anomaly_weight = 15.0
-behavior_weight = 25.0
+
+# Behavior: per-pattern points, summed, capped at behavior_weight. The cap
+# (80) lets strong attack-shaped behavior reach HIGH -> RATE_LIMIT on its
+# own and stays below critical (90), so BLOCK always needs corroboration.
+# Was a flat 25 * patterns/9, which capped a real SYN flood at LOW
+# (docs/KNOWN_ISSUES.md #20). Checked against observed pattern sets: one
+# phone loading a page (diversity+repeated+frequency+burst) = 30, and with a
+# spurious anomaly flag 45 — still LOW; the attack-lab nmap scan = 75, HIGH;
+# the floods = 80 (capped), HIGH (benchmarks/2026-10-15-native-capture/LIVE_AB.md).
+behavior_weight = 80.0
 
 # ADDENDUM_2.md B4/B5 — a structural TLS protocol-field match (Heartbleed
 # length mismatch, a JA3 fingerprint hit against known attack tooling).
@@ -124,6 +150,20 @@ protocol_signature_weight = 75.0
 # windows.
 evidence_maturity_consistency_windows = 3
 max_tracked_maturity_sources = 10000
+
+# Points per detected behavior pattern (see behavior_weight above). Every
+# pattern must be listed; the config loader rejects a missing one.
+[threat.behavior_pattern_points]
+scanning = 55.0
+repeated_failures = 45.0
+slow_rate_dos = 45.0
+flood = 80.0
+burst = 10.0
+high_frequency = 10.0
+repeated_connections = 5.0
+temporal_pattern = 10.0
+destination_diversity = 5.0
+persistence = 0.0
 
 [firewall]
 # See docs/ADDENDUM.md for the letter references below.

@@ -31,10 +31,12 @@ So:
   connection is counted once, not twice.
 """
 
+import math
 import statistics
 from collections import OrderedDict, deque
 from collections.abc import Iterable
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from ipaddress import IPv4Address
 from itertools import pairwise
 
@@ -46,84 +48,131 @@ from pirewall.core.models.flow import Flow
 _TOTAL_PATTERN_TYPES = len(BehaviorPatternType)
 
 
+@dataclass(slots=True)
+class _ConnectionEvent:
+    """One newly-opened connection, as remembered inside a source's sliding window.
+
+    The `*_tracked` flags record whether this event was admitted into each
+    bounded index at insertion time, so expiring it later decrements exactly
+    the counters it incremented — never one it was refused from by a cap.
+    """
+
+    timestamp: datetime
+    destination_ip: IPv4Address
+    destination_port: int | None
+    destination_tracked: bool
+    port_tracked: bool
+    global_port_tracked: bool
+    pair_tracked: bool
+
+
 class SourceBehaviorState:
-    """Bounded, mutable behavior-tracking state for one source IP."""
+    """Bounded, mutable, **time-windowed** behavior-tracking state for one source IP.
+
+    Every count-based signal is computed over the last
+    `DetectionConfig.behavior_window_seconds` only. This used to be lifetime
+    state that never decayed (the window setting existed but nothing read
+    it), so any long-lived device eventually tripped DESTINATION_DIVERSITY,
+    REPEATED_FAILURES and REPEATED_CONNECTIONS permanently — a phone
+    browsing for an hour had simply *accumulated* its way past thresholds
+    meant for a short burst (docs/KNOWN_ISSUES.md #3).
+
+    "Now" is the newest timestamp this state has seen (packet time, not the
+    wall clock), so pruning is deterministic and identical in replay,
+    tests, and production.
+    """
 
     __slots__ = (
+        "_events",
+        "_failures",
+        "_flood_window_seconds",
         "_max_destinations",
+        "_max_events",
+        "_max_flood_entries",
         "_max_ports",
-        "connection_count",
+        "_window_seconds",
         "connections_per_destination",
-        "destinations",
-        "failure_count",
+        "destination_counts",
+        "failures_per_destination",
         "first_seen",
         "last_seen",
         "ports",
         "ports_per_destination",
         "recent_connection_times",
+        "recent_per_destination",
         "slow_connection_counts",
+        "streak_started",
     )
 
-    def __init__(self, first_seen: datetime, max_destinations: int, max_ports: int, max_recent: int) -> None:
+    def __init__(
+        self,
+        first_seen: datetime,
+        max_destinations: int,
+        max_ports: int,
+        max_recent: int,
+        window_seconds: float = 300.0,
+        max_events: int = 2_000,
+        flood_window_seconds: float = 5.0,
+        max_flood_entries: int = 1_000,
+    ) -> None:
         self.first_seen = first_seen
         self.last_seen = first_seen
-        self.connection_count = 0
-        self.destinations: set[IPv4Address] = set()
-        self.ports: set[int] = set()
-        # Ports grouped by destination, bounded the same way as `destinations`.
-        # `scanned_port_breadth` reads this; the flat `ports` set is kept for
-        # the reason string and for anything that wants the raw breadth.
-        self.ports_per_destination: dict[IPv4Address, set[int]] = {}
-        self.connections_per_destination: dict[tuple[IPv4Address, int | None], int] = {}
-        self.failure_count = 0
-        self.recent_connection_times: deque[datetime] = deque(maxlen=max_recent)
-        # ADDENDUM_2.md B2 — most recent concurrent-slow-connection count
-        # per destination, a live snapshot (see `note_slow_connections`),
-        # capped the same way `connections_per_destination` is.
-        self.slow_connection_counts: dict[IPv4Address, int] = {}
+        # Start of the current uninterrupted activity streak (PERSISTENCE):
+        # reset whenever the source goes quiet for longer than the window.
+        self.streak_started = first_seen
+        self._window_seconds = window_seconds
+        self._max_events = max_events
         self._max_destinations = max_destinations
         self._max_ports = max_ports
+        self._events: deque[_ConnectionEvent] = deque()
+        self._failures: deque[tuple[datetime, IPv4Address, bool]] = deque()
+        # Windowed indexes: each value is a count of live events, and each
+        # dict is bounded by the configured caps.
+        self.destination_counts: dict[IPv4Address, int] = {}
+        self.ports: dict[int, int] = {}
+        self.ports_per_destination: dict[IPv4Address, dict[int, int]] = {}
+        self.connections_per_destination: dict[tuple[IPv4Address, int | None], int] = {}
+        self.failures_per_destination: dict[IPv4Address, int] = {}
+        self.recent_connection_times: deque[datetime] = deque(maxlen=max_recent)
+        # ADDENDUM_2.md B2 — latest live concurrent-slow-connection snapshot
+        # per destination, with when it was taken, so a cluster that has
+        # since dissolved stops counting once its snapshot ages out.
+        self.slow_connection_counts: dict[IPv4Address, tuple[int, datetime]] = {}
+        # FLOOD: recent connection times per destination over the (short)
+        # burst window, each deque capped just above the flood threshold —
+        # past that, more entries cannot change the answer.
+        self._flood_window_seconds = flood_window_seconds
+        self._max_flood_entries = max_flood_entries
+        self.recent_per_destination: dict[IPv4Address, deque[datetime]] = {}
 
-    def observe_new_connection(
-        self, destination_ip: IPv4Address, destination_port: int | None, timestamp: datetime
-    ) -> None:
-        """Fold in one newly-opened flow (ADDENDUM_2.md B1) — everything knowable at creation."""
-        if timestamp > self.last_seen:
-            self.last_seen = timestamp
-        self.connection_count += 1
+    # ------------------------------------------------------------ properties
 
-        if len(self.destinations) < self._max_destinations:
-            self.destinations.add(destination_ip)
-        if destination_port is not None and len(self.ports) < self._max_ports:
-            self.ports.add(destination_port)
-        if destination_port is not None:
-            ports_here = self.ports_per_destination.get(destination_ip)
-            if ports_here is not None:
-                if len(ports_here) < self._max_ports:
-                    ports_here.add(destination_port)
-            elif len(self.ports_per_destination) < self._max_destinations:
-                self.ports_per_destination[destination_ip] = {destination_port}
+    @property
+    def destinations(self) -> set[IPv4Address]:
+        """Distinct destinations contacted within the window (capped)."""
+        return set(self.destination_counts)
 
-        destination_key = (destination_ip, destination_port)
-        already_tracked = destination_key in self.connections_per_destination
-        if already_tracked or len(self.connections_per_destination) < self._max_destinations:
-            self.connections_per_destination[destination_key] = (
-                self.connections_per_destination.get(destination_key, 0) + 1
-            )
+    @property
+    def connection_count(self) -> int:
+        """Connections opened within the window."""
+        return len(self._events)
 
-        self.recent_connection_times.append(timestamp)
+    @property
+    def failure_count(self) -> int:
+        """Unanswered connection attempts within the window, to any destination."""
+        return len(self._failures)
 
-    def observe_completion(self, flow: Flow) -> None:
-        """Fold in the one signal only knowable once a flow ends: did it ever get a response?
+    @property
+    def max_failures_to_single_destination(self) -> int:
+        """Most unanswered attempts within the window against any one destination.
 
-        Must be called at most once per flow, and only ever *after* that same
-        flow's `observe_new_connection` — never on its own, or `failure_count`
-        would be counted for a connection this state never opened.
+        REPEATED_FAILURES reads this, not `failure_count`: a SYN flood or a
+        scan of filtered ports concentrates its failures on its target,
+        while a device whose traffic is being dropped (e.g. not yet signed
+        in to the captive portal) fails across dozens of unrelated hosts.
+        Same principle as `scanned_port_breadth` measuring per destination.
         """
-        if flow.last_seen > self.last_seen:
-            self.last_seen = flow.last_seen
-        if is_failed_connection_attempt(flow):
-            self.failure_count += 1
+        return max(self.failures_per_destination.values(), default=0)
 
     @property
     def scanned_port_breadth(self) -> int:
@@ -137,9 +186,106 @@ class SourceBehaviorState:
         belonging to reply-direction flows, and tripped a "port scan" at a
         threshold of 10.
         """
-        if not self.ports_per_destination:
-            return 0
-        return max(len(ports) for ports in self.ports_per_destination.values())
+        return max((len(ports) for ports in self.ports_per_destination.values()), default=0)
+
+    @property
+    def max_connections_to_single_destination(self) -> int:
+        return max(self.connections_per_destination.values(), default=0)
+
+    @property
+    def max_concurrent_slow_connections(self) -> int:
+        return max((count for count, _ in self.slow_connection_counts.values()), default=0)
+
+    @property
+    def max_recent_connections_to_single_destination(self) -> int:
+        """Most connections to one destination within the flood window, as of `last_seen`."""
+        horizon = self.last_seen - timedelta(seconds=self._flood_window_seconds)
+        best = 0
+        for times in self.recent_per_destination.values():
+            best = max(best, sum(1 for moment in times if moment >= horizon))
+        return best
+
+    @property
+    def streak_seconds(self) -> float:
+        """Length of the current uninterrupted activity streak."""
+        return (self.last_seen - self.streak_started).total_seconds()
+
+    # ------------------------------------------------------------- updates
+
+    def observe_new_connection(
+        self, destination_ip: IPv4Address, destination_port: int | None, timestamp: datetime
+    ) -> None:
+        """Fold in one newly-opened flow (ADDENDUM_2.md B1) — everything knowable at creation."""
+        self._advance(timestamp)
+        if len(self._events) >= self._max_events:
+            self._expire_event(self._events.popleft())
+
+        destination_tracked = destination_ip in self.destination_counts or (
+            len(self.destination_counts) < self._max_destinations
+        )
+        if destination_tracked:
+            self.destination_counts[destination_ip] = self.destination_counts.get(destination_ip, 0) + 1
+
+        port_tracked = False
+        global_port_tracked = False
+        if destination_port is not None:
+            if destination_port in self.ports or len(self.ports) < self._max_ports:
+                self.ports[destination_port] = self.ports.get(destination_port, 0) + 1
+                global_port_tracked = True
+            if destination_tracked:
+                ports_here = self.ports_per_destination.setdefault(destination_ip, {})
+                if destination_port in ports_here or len(ports_here) < self._max_ports:
+                    ports_here[destination_port] = ports_here.get(destination_port, 0) + 1
+                    port_tracked = True
+
+        pair = (destination_ip, destination_port)
+        pair_tracked = pair in self.connections_per_destination or (
+            len(self.connections_per_destination) < self._max_destinations
+        )
+        if pair_tracked:
+            self.connections_per_destination[pair] = self.connections_per_destination.get(pair, 0) + 1
+
+        self._events.append(
+            _ConnectionEvent(
+                timestamp=timestamp,
+                destination_ip=destination_ip,
+                destination_port=destination_port,
+                destination_tracked=destination_tracked,
+                port_tracked=port_tracked,
+                global_port_tracked=global_port_tracked,
+                pair_tracked=pair_tracked,
+            )
+        )
+        self.recent_connection_times.append(timestamp)
+
+        times = self.recent_per_destination.get(destination_ip)
+        if times is None and len(self.recent_per_destination) < self._max_destinations:
+            times = self.recent_per_destination[destination_ip] = deque(maxlen=self._max_flood_entries)
+        if times is not None:
+            times.append(timestamp)
+
+    def observe_completion(self, flow: Flow) -> None:
+        """Fold in the one signal only knowable once a flow ends: did it ever get a response?
+
+        Must be called at most once per flow, and only ever *after* that same
+        flow's `observe_new_connection` — never on its own, or a failure
+        would be counted for a connection this state never opened. The
+        failure is timestamped when the flow *completed* (when it became
+        known to be unanswered), which keeps the failure queue in arrival
+        order so window expiry can pop from its oldest end.
+        """
+        self._advance(flow.last_seen)
+        if not is_failed_connection_attempt(flow):
+            return
+        if len(self._failures) >= self._max_events:
+            self._expire_failure(self._failures.popleft())
+        destination = flow.destination_ip
+        tracked = destination in self.failures_per_destination or (
+            len(self.failures_per_destination) < self._max_destinations
+        )
+        if tracked:
+            self.failures_per_destination[destination] = self.failures_per_destination.get(destination, 0) + 1
+        self._failures.append((flow.last_seen, destination, tracked))
 
     def observe(self, flow: Flow) -> None:
         """Fold one already-completed flow into the tracked state in one call.
@@ -158,21 +304,65 @@ class SourceBehaviorState:
         snapshot of how many qualifying connections are open *right now*
         (from `pirewall.flow.aggregator.FlowAggregator.
         snapshot_slow_connection_clusters`), not an event to fold in
-        incrementally the way a new connection is.
+        incrementally the way a new connection is. The snapshot expires
+        with the window like everything else.
         """
-        if timestamp > self.last_seen:
-            self.last_seen = timestamp
+        self._advance(timestamp)
         already_tracked = destination_ip in self.slow_connection_counts
         if already_tracked or len(self.slow_connection_counts) < self._max_destinations:
-            self.slow_connection_counts[destination_ip] = count
+            self.slow_connection_counts[destination_ip] = (count, timestamp)
 
-    @property
-    def max_connections_to_single_destination(self) -> int:
-        return max(self.connections_per_destination.values(), default=0)
+    def prune(self, now: datetime) -> None:
+        """Expire everything older than the window as of `now` (never moves `last_seen` backwards)."""
+        self._advance(now)
 
-    @property
-    def max_concurrent_slow_connections(self) -> int:
-        return max(self.slow_connection_counts.values(), default=0)
+    # ------------------------------------------------------------ internals
+
+    def _advance(self, timestamp: datetime) -> None:
+        if timestamp > self.last_seen:
+            if (timestamp - self.last_seen).total_seconds() > self._window_seconds:
+                self.streak_started = timestamp
+            self.last_seen = timestamp
+        horizon = self.last_seen - timedelta(seconds=self._window_seconds)
+        while self._events and self._events[0].timestamp < horizon:
+            self._expire_event(self._events.popleft())
+        while self._failures and self._failures[0][0] < horizon:
+            self._expire_failure(self._failures.popleft())
+        flood_horizon = self.last_seen - timedelta(seconds=self._flood_window_seconds)
+        for ip in [ip for ip, times in self.recent_per_destination.items() if times[-1] < flood_horizon]:
+            del self.recent_per_destination[ip]
+        if self.slow_connection_counts:
+            stale = [ip for ip, (_, taken) in self.slow_connection_counts.items() if taken < horizon]
+            for ip in stale:
+                del self.slow_connection_counts[ip]
+
+    def _expire_event(self, event: _ConnectionEvent) -> None:
+        if event.destination_tracked:
+            _decrement(self.destination_counts, event.destination_ip)
+        if event.destination_port is not None:
+            if event.global_port_tracked:
+                _decrement(self.ports, event.destination_port)
+            if event.port_tracked:
+                ports_here = self.ports_per_destination.get(event.destination_ip)
+                if ports_here is not None:
+                    _decrement(ports_here, event.destination_port)
+                    if not ports_here:
+                        del self.ports_per_destination[event.destination_ip]
+        if event.pair_tracked:
+            _decrement(self.connections_per_destination, (event.destination_ip, event.destination_port))
+
+    def _expire_failure(self, failure: tuple[datetime, IPv4Address, bool]) -> None:
+        _, destination, tracked = failure
+        if tracked:
+            _decrement(self.failures_per_destination, destination)
+
+
+def _decrement[K](counts: dict[K, int], key: K) -> None:
+    remaining = counts.get(key, 0) - 1
+    if remaining > 0:
+        counts[key] = remaining
+    else:
+        counts.pop(key, None)
 
 
 class BehaviorAnalyzer:
@@ -238,6 +428,10 @@ class BehaviorAnalyzer:
         """
         state = self._sources.get(flow.source_ip)
         if state is None:
+            if not flow.opened_by_initiation:
+                # A responder's flow (see `Flow.opened_by_initiation`): it is
+                # not a connection this source made, so it seeds nothing.
+                return
             state = self._get_or_create(flow.source_ip, flow.first_seen)
             state.observe(flow)
             return
@@ -265,6 +459,13 @@ class BehaviorAnalyzer:
                 max_destinations=self._config.max_tracked_destinations_per_source,
                 max_ports=self._config.max_tracked_ports_per_source,
                 max_recent=self._config.recent_connections_window,
+                window_seconds=float(self._config.behavior_window_seconds),
+                max_events=self._config.max_tracked_connections_per_source,
+                flood_window_seconds=self._config.burst_window_seconds,
+                max_flood_entries=math.ceil(
+                    self._config.flood_connections_per_second_threshold * self._config.burst_window_seconds
+                )
+                + 1,
             )
             self._sources[source_ip] = state
         else:
@@ -276,6 +477,19 @@ class BehaviorAnalyzer:
         state = self._sources.get(source_ip)
         if state is None:
             return None
+        return _assess_state(source_ip, state, self._config)
+
+    def assess_at(self, source_ip: IPv4Address, now: datetime) -> BehaviorAssessment | None:
+        """Like `assess`, but first expires anything older than the window as of `now`.
+
+        For callers assessing on a clock tick rather than on that source's
+        own traffic (the source-level fast path), where the source's newest
+        event may itself be old.
+        """
+        state = self._sources.get(source_ip)
+        if state is None:
+            return None
+        state.prune(now)
         return _assess_state(source_ip, state, self._config)
 
 
@@ -321,7 +535,7 @@ def _assess_state(
 ) -> BehaviorAssessment:
     patterns: list[BehaviorPatternType] = []
     reasons: list[str] = []
-    window_seconds = max((state.last_seen - state.first_seen).total_seconds(), 1.0)
+    streak_seconds = state.streak_seconds
 
     if state.max_connections_to_single_destination >= config.repeated_connections_threshold:
         patterns.append(BehaviorPatternType.REPEATED_CONNECTIONS)
@@ -341,9 +555,9 @@ def _assess_state(
         patterns.append(BehaviorPatternType.BURST)
         reasons.append(f"{burst_count} connections within {config.burst_window_seconds:.0f}s")
 
-    if window_seconds >= config.persistence_seconds_threshold and state.connection_count >= 2:
+    if streak_seconds >= config.persistence_seconds_threshold and state.connection_count >= 2:
         patterns.append(BehaviorPatternType.PERSISTENCE)
-        reasons.append(f"active for {window_seconds:.0f}s")
+        reasons.append(f"continuously active for {streak_seconds:.0f}s")
 
     if len(state.destinations) >= config.destination_diversity_threshold:
         patterns.append(BehaviorPatternType.DESTINATION_DIVERSITY)
@@ -354,14 +568,22 @@ def _assess_state(
         patterns.append(BehaviorPatternType.SCANNING)
         reasons.append(f"{port_breadth} distinct ports on a single destination")
 
-    if state.failure_count >= config.repeated_failures_threshold:
+    failures_here = state.max_failures_to_single_destination
+    if failures_here >= config.repeated_failures_threshold:
         patterns.append(BehaviorPatternType.REPEATED_FAILURES)
-        reasons.append(f"{state.failure_count} unanswered connection attempts")
+        reasons.append(f"{failures_here} unanswered connection attempts to a single destination")
 
     if state.max_concurrent_slow_connections >= config.concurrent_slow_connections_threshold:
         patterns.append(BehaviorPatternType.SLOW_RATE_DOS)
         reasons.append(
             f"{state.max_concurrent_slow_connections} concurrent slow connections to one destination"
+        )
+
+    flood_count = state.max_recent_connections_to_single_destination
+    if flood_count >= config.flood_connections_per_second_threshold * config.burst_window_seconds:
+        patterns.append(BehaviorPatternType.FLOOD)
+        reasons.append(
+            f"{flood_count} new connections to a single destination within {config.burst_window_seconds:.0f}s"
         )
 
     intervals = _inter_arrival_seconds(state.recent_connection_times)
@@ -381,7 +603,9 @@ def _assess_state(
         detected_patterns=tuple(patterns),
         confidence=confidence,
         description=description,
-        window_start=state.first_seen,
+        window_start=max(
+            state.first_seen, state.last_seen - timedelta(seconds=config.behavior_window_seconds)
+        ),
         window_end=state.last_seen,
     )
 

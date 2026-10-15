@@ -33,6 +33,31 @@ missing IP/port columns, not silently:
 One CICIDS2017-specific unit quirk handled here, not left for callers to
 discover the hard way: `Flow Duration` is in **microseconds**, not seconds.
 
+**What the size columns actually mean (feature schema 2.0.0).** Measured on
+the real CSVs, not assumed: every "Packet Length" / "Total Length of ...
+Packets" column is **L4 payload bytes** (84% of benign port-443 flows have
+a 0-byte minimum packet, impossible for an IP length), and every std column
+is **sample** std (a two-packet flow with sizes 0 and 7 reports 4.9497 =
+7/sqrt(2)). They map onto `Flow.payload_stats`, which is what the 2.0.0
+extractor reads — schema 1.0.0 put them into the IP-level `byte_count`/
+`packet_size_stats` fields that runtime fills with *total* length, which is
+the training/runtime mismatch behind docs/KNOWN_ISSUES.md #1-#2.
+
+Two further adjustments, both documented rather than silent:
+
+* **Ethernet padding.** CICFlowMeter computes payload as frame length minus
+  headers, so a wired frame padded up to the 60-byte Ethernet minimum
+  reports 6 bytes of "payload" for a bare ACK (14% of benign HTTPS flows have
+  minimum exactly 6). pirewall computes payload from the IP header's own
+  length — and the deployment captures Wi-Fi, which has no padding at all —
+  so runtime reports 0 for the same packet. A minimum of 1..6 bytes is
+  therefore normalized to 0 here. Sums and means keep the (<= 6 bytes per
+  padded packet) inflation, which cannot be undone from aggregate columns.
+* **IP-level fields** (`byte_count`, `packet_size_stats`) are not features;
+  they are reconstructed as payload + the CSV's own L4 header-length
+  columns + a 20-byte IPv4 header per packet, only so the `Flow` is
+  internally consistent.
+
 If your CSV doesn't have the columns checked below (e.g. a further
 stripped-down mirror), this adapter will fail with a clear `DatasetError`
 naming the missing column.
@@ -51,7 +76,7 @@ from pirewall.ml.preprocessing.common import (
     DatasetLoadResult,
     LabeledFlow,
     SkipCounter,
-    combine_weighted_stats,
+    combine_weighted_sample_stats,
     parse_float,
 )
 
@@ -74,6 +99,8 @@ _REQUIRED_COLUMNS = (
     "flow iat std",
     "flow iat max",
     "flow iat min",
+    "fwd header length",
+    "bwd header length",
     "syn flag count",
     "ack flag count",
     "fin flag count",
@@ -89,6 +116,11 @@ _PLACEHOLDER_DESTINATION_IP = "10.255.255.2"
 # Real, well-known UDP service ports -- used only as a fallback signal when
 # every TCP flag count is zero (see module docstring). Not exhaustive; a
 # real port assignment fact, not a fabricated one.
+# Largest "payload" CICFlowMeter can report for an empty segment padded to the
+# Ethernet minimum frame (60 - 14 Ethernet - 20 IPv4 - 20 TCP).
+_MAX_ETHERNET_PADDING_BYTES = 6
+_IPV4_HEADER_BYTES = 20
+
 _KNOWN_UDP_PORTS = frozenset({53, 67, 68, 69, 123, 137, 138, 161, 162, 500, 514, 520, 1900, 5353})
 
 
@@ -181,13 +213,28 @@ def _parse_row(raw_row: dict[str, str], header: dict[str, str], index: int) -> L
     bwd_mean = parse_float(raw_row, header["bwd packet length mean"])
     bwd_std = parse_float(raw_row, header["bwd packet length std"])
 
-    combined_mean, combined_std = combine_weighted_stats(
+    payload_mean, payload_std = combine_weighted_sample_stats(
         fwd_mean, fwd_std, fwd_packets, bwd_mean, bwd_std, bwd_packets
     )
     candidates_min = [v for v, n in ((fwd_min, fwd_packets), (bwd_min, bwd_packets)) if n > 0]
     candidates_max = [v for v, n in ((fwd_max, fwd_packets), (bwd_max, bwd_packets)) if n > 0]
-    min_bytes = min(candidates_min) if candidates_min else 0.0
-    max_bytes = max(candidates_max) if candidates_max else 0.0
+    payload_min = min(candidates_min) if candidates_min else 0.0
+    payload_max = max(candidates_max) if candidates_max else 0.0
+    if 0 < payload_min <= _MAX_ETHERNET_PADDING_BYTES:
+        payload_min = 0.0
+
+    # Not features (see module docstring) -- reconstructed only so the Flow
+    # is internally consistent. Header columns are occasionally negative in
+    # the published CSVs (a known CICFlowMeter overflow), hence the clamp.
+    total_packets = fwd_packets + bwd_packets
+    header_bytes = max(parse_float(raw_row, header["fwd header length"]), 0.0) + max(
+        parse_float(raw_row, header["bwd header length"]), 0.0
+    )
+    per_packet_overhead = (
+        header_bytes / total_packets + _IPV4_HEADER_BYTES if total_packets > 0 else 0.0
+    )
+    fwd_ip_bytes = round(fwd_bytes + fwd_packets * per_packet_overhead)
+    bwd_ip_bytes = round(bwd_bytes + bwd_packets * per_packet_overhead)
 
     iat_mean = parse_float(raw_row, header["flow iat mean"])
     iat_std = parse_float(raw_row, header["flow iat std"])
@@ -216,17 +263,25 @@ def _parse_row(raw_row: dict[str, str], header: dict[str, str], index: int) -> L
             "first_seen": SYNTHETIC_EPOCH,
             "last_seen": SYNTHETIC_EPOCH + timedelta(seconds=duration_seconds),
             "packet_count": round(fwd_packets) + round(bwd_packets),
-            "byte_count": round(fwd_bytes) + round(bwd_bytes),
+            "byte_count": fwd_ip_bytes + bwd_ip_bytes,
             "forward_packet_count": round(fwd_packets),
             "backward_packet_count": round(bwd_packets),
-            "forward_byte_count": round(fwd_bytes),
-            "backward_byte_count": round(bwd_bytes),
+            "forward_byte_count": fwd_ip_bytes,
+            "backward_byte_count": bwd_ip_bytes,
             "tcp_flags": {"syn": syn, "ack": ack, "fin": fin, "rst": rst, "psh": psh, "urg": urg},
             "packet_size_stats": {
-                "min_bytes": round(min_bytes),
-                "max_bytes": round(max_bytes),
-                "mean_bytes": max(combined_mean, 0.0),
-                "std_bytes": max(combined_std, 0.0),
+                "min_bytes": round(payload_min + per_packet_overhead),
+                "max_bytes": round(payload_max + per_packet_overhead),
+                "mean_bytes": max(payload_mean, 0.0) + per_packet_overhead,
+                "std_bytes": max(payload_std, 0.0),
+            },
+            "payload_stats": {
+                "forward_bytes": round(fwd_bytes),
+                "backward_bytes": round(bwd_bytes),
+                "min_bytes": round(payload_min),
+                "max_bytes": round(payload_max),
+                "mean_bytes": max(payload_mean, 0.0),
+                "std_bytes": max(payload_std, 0.0),
             },
             "inter_arrival_stats": {
                 "min_seconds": max(iat_min, 0.0) / 1_000_000.0,

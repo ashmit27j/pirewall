@@ -123,6 +123,53 @@ uv run python -c "from pirewall.api.auth import hash_password; \
 
 **Never commit `config/local_config.toml`.**
 
+### 3.1 Native capture engine (recommended)
+
+The pure-Python capture path drops most of a flood on a Pi
+(`benchmarks/2026-09-10-attack-lab/`: 94% of a 10k pkt/s SYN flood). The
+optional native engine (`native/`, Rust; `docs/ARCHITECTURE.md` "Native
+capture engine") replaces the per-packet path. It needs a Rust toolchain on
+whatever machine builds it:
+
+```sh
+curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+. "$HOME/.cargo/env"
+cd /opt/pirewall
+uv sync --no-dev --extra native     # builds pirewall-native; several minutes on a Pi 4
+uv run python -c "import pirewall_native as n; print(n.HAS_PACKET_RING)"   # must print True
+```
+
+Every later `uv sync` must keep passing `--extra native`, or uv removes the
+extension again (it syncs the environment exactly). With
+`capture.backend = "auto"` (the default) pirewall-core uses the engine when
+present and logs `capture started on <iface> (native path)`; without it, the
+Python path runs exactly as before. Ring memory is
+`ring_block_size_bytes × ring_block_count` (16 MiB by default), well
+inside `MemoryMax=768M`.
+
+### 3.2 Upgrading an existing deployment to feature schema 2.0.0
+
+Feature schema 2.0.0 (`docs/FEATURE_SCHEMA.md`) changes what the model
+features mean, so **every previously trained artifact is refused at load**
+(by design — the loader checks the schema version). Until new artifacts are
+in place pirewall-core runs behavior-only and says so at startup. To
+upgrade:
+
+1. Retrain both models on a development machine (`docs/ML_PIPELINE.md`) and
+   copy `pirewall/ml/artifacts/{lightgbm_model.txt,isolation_forest_model.joblib}`
+   plus their `.metadata.json` sidecars to the Pi.
+2. In `config/local_config.toml`, set `[features] schema_version` and
+   `[ml] feature_schema_version` to `"2.0.0"`, and `[flow]
+   active_timeout_seconds = 120`.
+3. Replace the `[threat]` weights with the new behavior scoring:
+   `behavior_weight = 80.0` plus a complete `[threat.behavior_pattern_points]`
+   table — copy both from `config/default_config.toml`. The loader rejects a
+   points table missing any pattern. (A config generated before 2026-10-15
+   by `scripts/deployment/configure.py` also still carries the even older
+   `known_attack_weight = 50 / anomaly_weight = 25` — use 60 / 15.)
+4. `uv run python -m pirewall.main --check-config`, then restart
+   `pirewall-core`.
+
 ## 4. Render and apply the network templates
 
 ```sh

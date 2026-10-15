@@ -28,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 
 from pirewall.config.models import DetectionConfig, MLConfig
-from pirewall.core.enums import EventSeverity, ModelType, SecurityEventType
+from pirewall.core.enums import EventSeverity, ModelType, Protocol, SecurityEventType
 from pirewall.core.exceptions import ModelInferenceError, ModelLoadError
 from pirewall.core.models.behavior import BehaviorAssessment
 from pirewall.core.models.detection_record import DetectionRecord
@@ -50,6 +50,17 @@ _logger = logging.getLogger(__name__)
 _SUBSYSTEM = "detection.coordinator"
 
 EventSink = Callable[[SecurityEvent], None]
+
+# The protocols the shipped models' training data can actually represent.
+# The CICIDS2017 "MachineLearningCVE" CSVs have no protocol column, so
+# `pirewall.ml.preprocessing.cicids_adapter` can only *infer* TCP or UDP —
+# an ICMP flow in that data is labeled TCP with port 0. A runtime ICMP (or
+# other-protocol) flow is therefore out of the models' domain by
+# construction, and they answer it arbitrarily: on real benign traffic an
+# ICMP flow to a DNS host came back "DoS Slowhttptest" at 92% and was
+# BLOCKed (benchmarks/2026-10-15-native-capture/LIVE_AB.md). Out-of-domain
+# flows get no ML evidence at all — behavior analysis still covers them.
+ML_DOMAIN_PROTOCOLS = frozenset({Protocol.TCP, Protocol.UDP})
 
 # A model that fails inference for one flow usually fails for every flow.
 # Emitting a `SecurityEvent` per failure would flood the audit trail (and
@@ -177,6 +188,11 @@ class DetectionCoordinator:
     def models(self) -> ModelRegistry:
         return self._models
 
+    @staticmethod
+    def in_model_domain(flow: Flow) -> bool:
+        """Whether the ML models' training data can represent this flow at all (`ML_DOMAIN_PROTOCOLS`)."""
+        return flow.protocol in ML_DOMAIN_PROTOCOLS
+
     @property
     def behavior_analyzer(self) -> BehaviorAnalyzer:
         """Exposed so the runtime can report how many sources are being tracked."""
@@ -225,7 +241,7 @@ class DetectionCoordinator:
         anomaly-inference thread).
         """
         outcome = self.analyze_except_anomaly(flow, features, now, protocol_signature)
-        anomaly = self._detect_anomaly(features, now)
+        anomaly = self._detect_anomaly(features, now) if self.in_model_domain(flow) else None
         return with_anomaly_evidence(outcome, anomaly)
 
     def analyze_except_anomaly(
@@ -247,7 +263,7 @@ class DetectionCoordinator:
         regardless of which entry point a caller uses.
         """
         self._behavior.observe_completion(flow)
-        known = self._classify_known(features, now)
+        known = self._classify_known(features, now) if self.in_model_domain(flow) else None
         record = DetectionRecord(
             flow_id=flow.flow_id,
             known_evidence=known,
@@ -256,6 +272,35 @@ class DetectionCoordinator:
             recorded_at=now,
         )
         return DetectionOutcome(record=record, behavior=self._behavior.assess(flow.source_ip))
+
+    def analyze_snapshot(self, flow: Flow, now: datetime) -> DetectionOutcome:
+        """Behavior-only evidence for a *still-open* flow standing in for its source.
+
+        Used for source-level assessments that cannot wait for any one flow
+        to complete — a flood's or scan's behavior is fully visible long
+        before its first half-open connection times out (the source-level
+        fast path, and ADDENDUM_2.md B2's slow-connection clusters).
+
+        Deliberately runs **no ML**: both models were trained on complete
+        CICFlowMeter flows, and a point-in-time snapshot of a half-open
+        connection is exactly the kind of input they have never seen
+        (feature schema 2.0.0's whole point is not to feed them such
+        inputs). And deliberately folds in **no completion signal**: the
+        flow has not completed, so counting it as answered/unanswered now
+        would double-count it when it really does complete.
+        """
+        record = DetectionRecord(
+            flow_id=flow.flow_id,
+            known_evidence=None,
+            anomaly_evidence=None,
+            protocol_signature_evidence=None,
+            recorded_at=now,
+        )
+        # Window expiry runs on packet time, never the wall clock (see
+        # `SourceBehaviorState`): the snapshot's own newest packet is "now".
+        return DetectionOutcome(
+            record=record, behavior=self._behavior.assess_at(flow.source_ip, flow.last_seen)
+        )
 
     def _classify_known(self, features: FeatureVector, now: datetime) -> KnownEvidence | None:
         model = self._models.lightgbm

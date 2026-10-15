@@ -1,0 +1,13 @@
+[project]
+name = "pirewall-native"
+version = "0.1.0"
+description = "pirewall's native packet hot path (capture, parsing, flow table)"
+requires-python = ">=3.12"
+
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+features = ["extension-module"]
+module-name = "pirewall_native"

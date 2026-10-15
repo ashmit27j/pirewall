@@ -30,35 +30,35 @@ def extract_features(flow: Flow) -> FeatureVector:
 
 
 def _extract_features(flow: Flow) -> FeatureVector:
+    payload = flow.payload_stats
+    if payload is None:
+        # Never substitute zeros or IP-level sizes: that is exactly the
+        # training/runtime mismatch schema 2.0.0 exists to remove.
+        raise FeatureExtractionError(
+            f"flow {flow.flow_id} has no payload_stats; schema {SCHEMA_VERSION} requires them"
+        )
     duration = flow.duration_seconds
+    payload_total = float(payload.total_bytes)
     values_by_name: dict[str, float] = {
         "duration_seconds": duration,
         "packet_count": float(flow.packet_count),
-        "byte_count": float(flow.byte_count),
         "forward_packet_count": float(flow.forward_packet_count),
         "backward_packet_count": float(flow.backward_packet_count),
-        "forward_byte_count": float(flow.forward_byte_count),
-        "backward_byte_count": float(flow.backward_byte_count),
+        "payload_byte_count": payload_total,
+        "forward_payload_byte_count": float(payload.forward_bytes),
+        "backward_payload_byte_count": float(payload.backward_bytes),
         "packets_per_second": (flow.packet_count / duration) if duration > 0 else 0.0,
-        "bytes_per_second": (flow.byte_count / duration) if duration > 0 else 0.0,
-        "mean_packet_size": flow.packet_size_stats.mean_bytes,
-        "std_packet_size": flow.packet_size_stats.std_bytes,
-        "min_packet_size": float(flow.packet_size_stats.min_bytes),
-        "max_packet_size": float(flow.packet_size_stats.max_bytes),
+        "payload_bytes_per_second": (payload_total / duration) if duration > 0 else 0.0,
+        "mean_payload_size": payload.mean_bytes,
+        "std_payload_size": payload.std_bytes,
+        "min_payload_size": float(payload.min_bytes),
+        "max_payload_size": float(payload.max_bytes),
         "mean_inter_arrival_seconds": flow.inter_arrival_stats.mean_seconds,
         "std_inter_arrival_seconds": flow.inter_arrival_stats.std_seconds,
         "min_inter_arrival_seconds": flow.inter_arrival_stats.min_seconds,
         "max_inter_arrival_seconds": flow.inter_arrival_stats.max_seconds,
-        "syn_count": float(flow.tcp_flags.syn),
-        "ack_count": float(flow.tcp_flags.ack),
-        "fin_count": float(flow.tcp_flags.fin),
-        "rst_count": float(flow.tcp_flags.rst),
-        "psh_count": float(flow.tcp_flags.psh),
-        "urg_count": float(flow.tcp_flags.urg),
-        "forward_backward_byte_ratio": (
-            flow.forward_byte_count / flow.backward_byte_count
-            if flow.backward_byte_count > 0
-            else 0.0
+        "forward_backward_payload_ratio": (
+            payload.forward_bytes / payload.backward_bytes if payload.backward_bytes > 0 else 0.0
         ),
         "destination_port": (
             float(flow.destination_port) if flow.destination_port is not None else -1.0

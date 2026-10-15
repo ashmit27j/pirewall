@@ -11,6 +11,7 @@ Protocol/Fake rule.
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
+from ipaddress import IPv4Address
 from typing import Protocol, runtime_checkable
 
 from pirewall.core.models.capture_stats import CaptureStatistics
@@ -62,6 +63,57 @@ class PacketCapture(Protocol):
         capture implementation is the single owner of capture statistics
         (spec §6 "expose capture statistics ... malformed count"), so the
         loop that parses packets reports failures back here.
+        """
+        ...
+
+    def statistics(self) -> CaptureStatistics:
+        """Return a snapshot of this capture session's counters."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class TcpPayload:
+    """One IPv4 TCP segment's payload, offered to the TLS structural detectors (ADDENDUM_2.md B4/B5).
+
+    Internal hot-path plumbing like `CapturedPacket`, not a domain model.
+    Produced by the Python capture loop (from `parser.extract_tcp_payload`)
+    or by the native engine (pre-filtered to records the detectors can act
+    on: a heartbeat or a ClientHello).
+    """
+
+    source_ip: IPv4Address
+    destination_ip: IPv4Address
+    source_port: int | None
+    destination_port: int | None
+    timestamp: datetime
+    payload: bytes
+
+
+@runtime_checkable
+class FlowCapture(Protocol):
+    """Contract for a capture that aggregates flows itself (the native engine).
+
+    Where a `PacketCapture` yields packets for Python to parse and
+    aggregate, a `FlowCapture` feeds an engine handle that does both
+    natively; the caller then drains that engine for completed flows,
+    new-flow signals and TLS candidate payloads. Real implementation:
+    `pirewall.capture.native.NativePacketCapture`; test double:
+    `pirewall.capture.fake.FakeFlowCapture`.
+    """
+
+    def start(self) -> None:
+        """Bind to the interface. Raises `CaptureError` on failure."""
+        ...
+
+    def stop(self) -> None:
+        """Stop polling and release the capture resource. Idempotent."""
+        ...
+
+    def poll(self, timeout_ms: int) -> int:
+        """Wait up to `timeout_ms` for packets and feed every ready one into the engine.
+
+        Returns how many were processed (0 on timeout or after `stop()`).
+        Raises `CaptureError` on a capture failure.
         """
         ...
 

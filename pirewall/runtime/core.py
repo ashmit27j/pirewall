@@ -8,9 +8,13 @@ Threads, and why there is more than one
 ---------------------------------------
 
 ===================  =========================================================
-`capture`            Blocks in `recv()` on the `AF_PACKET` socket, parses each
-                     packet, feeds `FlowAggregator`, and hands completed flows
-                     to the detection thread through a bounded queue.
+`capture`            Python path: blocks in `recv()` on the `AF_PACKET`
+                     socket, parses each packet, feeds `FlowAggregator`.
+                     Native path (`capture.backend`, docs/ARCHITECTURE.md):
+                     polls a `TPACKET_V3` ring whose packets are parsed and
+                     aggregated in Rust with the GIL released, then drains
+                     the engine. Either way, completed flows go to the
+                     detection thread through a bounded queue.
 `detection`          Drains that queue and runs `FlowPipeline` per flow. Runs
                      known-attack (LightGBM) and behavior analysis inline;
                      hands anomaly scoring off to the `anomaly-inference`
@@ -74,11 +78,12 @@ from pathlib import Path
 from types import FrameType
 
 from pirewall.capture.af_packet import AFPacketCapture
-from pirewall.capture.interfaces import PacketCapture
+from pirewall.capture.interfaces import FlowCapture, PacketCapture, TcpPayload
+from pirewall.capture.native import NativePacketCapture, native_capture_available
 from pirewall.capture.parser import extract_tcp_payload
 from pirewall.capture.pipeline import capture_packets
 from pirewall.config.models import PirewallConfig
-from pirewall.core.enums import EventSeverity, FailureMode, SecurityEventType
+from pirewall.core.enums import EventSeverity, FailureMode, Protocol, SecurityEventType
 from pirewall.core.exceptions import CaptureError, ModelInferenceError, PirewallError
 from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.evidence import ProtocolSignatureEvidence
@@ -99,6 +104,7 @@ from pirewall.firewall.interface import FirewallBackend
 from pirewall.firewall.manager import FirewallManager
 from pirewall.flow.aggregator import FlowAggregator, NewFlowSignal, SlowConnectionCluster
 from pirewall.flow.key import FlowKey, compute_flow_key
+from pirewall.flow.native import NativeFlowAggregator, native_engine_available
 from pirewall.integration.netdata import NetdataExporter, StatsdNetdataTransport
 from pirewall.integration.wazuh import SyslogWazuhTransport, WazuhForwarder
 from pirewall.ipc.dispatcher import CoreRpcDispatcher
@@ -145,6 +151,9 @@ _TLS_EVIDENCE_CACHE_MAX = 10_000
 # an unbounded queue here would just move the OOM risk `_FLOW_QUEUE_MAX`
 # already exists to avoid one stage later.
 _ANOMALY_QUEUE_MAX = 5_000
+# How long one native ring poll may block before re-checking the stop flag
+# (also bounds how long `stop()` waits for the ring to close).
+_NATIVE_POLL_TIMEOUT_MS = 100
 # How long the queue drain waits before re-checking the stop flag.
 _QUEUE_POLL_SECONDS = 0.5
 # Threads get this long to finish after `stop()` before the process gives up
@@ -229,17 +238,21 @@ class CoreDaemon:
     def __init__(
         self,
         config: PirewallConfig,
-        capture: PacketCapture | None = None,
+        capture: PacketCapture | FlowCapture | None = None,
         backend: FirewallBackend | None = None,
         notifier: SystemdNotifier | None = None,
         flow_queue_max: int = _FLOW_QUEUE_MAX,
         anomaly_queue_max: int = _ANOMALY_QUEUE_MAX,
+        native_aggregator: NativeFlowAggregator | None = None,
     ) -> None:
         """Build every subsystem. `capture`/`backend`/`notifier` are injectable for testing.
 
         Injecting `FakePacketCapture` and `FakeFirewallBackend` is what lets
         the whole daemon run without root, without a NIC, and without
         touching a real nftables ruleset (CLAUDE.md's Protocol/Fake rule).
+        An injected `FlowCapture` (e.g. `FakeFlowCapture`) runs the native
+        path and must come with the `native_aggregator` whose engine it
+        feeds. With nothing injected, `capture.backend` picks the path.
         """
         self._config = config
         self._started_at = datetime.now(UTC)
@@ -253,12 +266,12 @@ class CoreDaemon:
         # so contending it against the state lock would be pointless.
         self._flow_lock = threading.Lock()
 
-        self._capture: PacketCapture = capture or AFPacketCapture(
-            interface=config.capture.interface,
-            snap_len=config.capture.snap_len,
-            promiscuous=config.capture.promiscuous,
-            buffer_size_bytes=config.capture.buffer_size_bytes,
-        )
+        # Set when `capture.backend = "native"` was asked for but could not
+        # be honoured; reported as a SYSTEM_WARNING at start().
+        self._capture_fallback_reason: str | None = None
+        self._capture: PacketCapture | FlowCapture
+        self._native_aggregator: NativeFlowAggregator | None
+        self._capture, self._native_aggregator = self._select_capture(config, capture, native_aggregator)
         # Constructed here and handed straight to `FirewallManager`, which
         # is the only code path permitted to call into
         # `pirewall.firewall.backend` (CLAUDE.md). Deliberately not retained
@@ -293,16 +306,23 @@ class CoreDaemon:
             maxsize=_SLOW_CLUSTER_QUEUE_MAX
         )
         self._slow_clusters_dropped = 0
-        self._aggregator = FlowAggregator(
-            config.flow,
-            on_new_flow=self._handle_new_flow,
-            protected_network=config.network.protected_network,
+        self._aggregator: FlowAggregator | NativeFlowAggregator = (
+            self._native_aggregator
+            if self._native_aggregator is not None
+            else FlowAggregator(
+                config.flow,
+                on_new_flow=self._handle_new_flow,
+                protected_network=config.network.protected_network,
+            )
         )
         # ADDENDUM_2.md B4/B5 — written by the capture thread
         # (`_handle_tcp_payload`), read/popped by the detection thread
         # (`_pop_tls_evidence`) once the flow it belongs to completes.
         # Guarded by `_flow_lock`, same as the aggregator's own table.
         self._tls_evidence: OrderedDict[FlowKey, _CachedTlsMatch] = OrderedDict()
+        # Source-level fast path: when each source was last assessed early
+        # (monotonic seconds). Detection thread only; LRU-bounded.
+        self._early_assessed_at: OrderedDict[IPv4Address, float] = OrderedDict()
         # ADDENDUM_2.md B5 — read once at startup; a missing/malformed file
         # degrades to no JA3 matches ever being reported (see
         # `load_known_tool_fingerprints`'s own docstring), never a startup
@@ -386,6 +406,56 @@ class CoreDaemon:
 
     # ------------------------------------------------------------------ setup
 
+    def _select_capture(
+        self,
+        config: PirewallConfig,
+        capture: PacketCapture | FlowCapture | None,
+        native_aggregator: NativeFlowAggregator | None,
+    ) -> tuple[PacketCapture | FlowCapture, NativeFlowAggregator | None]:
+        """Pick the capture path: injected, else `capture.backend` and what is installed."""
+        if capture is not None:
+            if isinstance(capture, FlowCapture) and not isinstance(capture, PacketCapture):
+                if native_aggregator is None:
+                    raise ValueError("an injected FlowCapture needs the native_aggregator it feeds")
+                return capture, native_aggregator
+            return capture, None
+
+        wanted = config.capture.backend
+        native_ready = native_engine_available() and native_capture_available()
+        if wanted != "python" and native_ready:
+            aggregator = NativeFlowAggregator(
+                config.flow,
+                config.network.protected_network,
+                max_pending_completed=config.capture.native_max_flows_per_drain,
+                max_pending_new_flows=config.capture.native_max_new_flows_per_drain,
+            )
+            return (
+                NativePacketCapture(
+                    interface=config.capture.interface,
+                    engine=aggregator.engine,
+                    promiscuous=config.capture.promiscuous,
+                    block_size_bytes=config.capture.ring_block_size_bytes,
+                    block_count=config.capture.ring_block_count,
+                    block_timeout_ms=config.capture.ring_block_timeout_ms,
+                ),
+                aggregator,
+            )
+        if wanted == "native":
+            self._capture_fallback_reason = (
+                "capture.backend = native, but the pirewall-native extension is not installed "
+                "(or has no AF_PACKET ring support on this platform); using the Python capture "
+                "path, which drops packets under load. Install it with `uv sync --extra native`."
+            )
+        return (
+            AFPacketCapture(
+                interface=config.capture.interface,
+                snap_len=config.capture.snap_len,
+                promiscuous=config.capture.promiscuous,
+                buffer_size_bytes=config.capture.buffer_size_bytes,
+            ),
+            None,
+        )
+
     def _build_wazuh(self) -> WazuhForwarder | None:
         integration = self._config.integration
         if not integration.wazuh_enabled:
@@ -454,10 +524,25 @@ class CoreDaemon:
                 "portal RPC socket listening at %s", self._config.portal.rpc_socket_path
             )
 
+        if self._capture_fallback_reason is not None:
+            _logger.warning("%s", self._capture_fallback_reason)
+            self._forwarder.emit(
+                SecurityEvent(
+                    timestamp=datetime.now(UTC),
+                    severity=EventSeverity.WARNING,
+                    event_type=SecurityEventType.SYSTEM_WARNING,
+                    subsystem=_SUBSYSTEM,
+                    reason=self._capture_fallback_reason,
+                )
+            )
         try:
             self._capture.start()
             self._capture_started = True
-            _logger.info("capture started on %s", self._config.capture.interface)
+            _logger.info(
+                "capture started on %s (%s path)",
+                self._config.capture.interface,
+                "native" if self._native_aggregator is not None else "python",
+            )
         except CaptureError as exc:
             _logger.error("packet capture failed to start: %s", exc)
             self._forwarder.emit(
@@ -633,14 +718,20 @@ class CoreDaemon:
     def _capture_loop(self) -> None:
         """Capture -> parse -> aggregate. Completed flows go onto the detection queue."""
         try:
-            for packet in capture_packets(
-                self._capture, self._forwarder, on_tcp_payload=self._handle_tcp_payload
-            ):
-                if self._stop.is_set():
-                    return
-                with self._flow_lock:
-                    completed = self._aggregator.process_packet(packet)
-                self._enqueue(completed)
+            capture = self._capture
+            native = self._native_aggregator
+            if isinstance(capture, PacketCapture) and isinstance(self._aggregator, FlowAggregator):
+                python_aggregator = self._aggregator
+                for packet in capture_packets(
+                    capture, self._forwarder, on_tcp_payload=self._handle_tcp_payload
+                ):
+                    if self._stop.is_set():
+                        return
+                    with self._flow_lock:
+                        completed = python_aggregator.process_packet(packet)
+                    self._enqueue(completed)
+            elif native is not None and isinstance(capture, FlowCapture):
+                self._native_capture_loop(capture, native)
         except CaptureError as exc:
             if self._stop.is_set():
                 return
@@ -660,6 +751,64 @@ class CoreDaemon:
             _logger.exception("capture loop crashed")
         finally:
             _logger.info("capture loop exited")
+
+    def _native_capture_loop(self, capture: FlowCapture, aggregator: NativeFlowAggregator) -> None:
+        """Native path: poll the ring (GIL released), then drain the engine.
+
+        Drained output is handled in the order `NativeBatch` documents — TLS
+        payloads, then new-flow signals, then completed flows — so detection
+        sees evidence and behavioral signals before the completion they
+        precede, exactly as the Python loop's program order guarantees.
+        """
+        shed_flows = shed_signals = 0
+        while not self._stop.is_set():
+            capture.poll(_NATIVE_POLL_TIMEOUT_MS)
+            batch = aggregator.drain()
+            for payload in batch.tls_payloads:
+                self._inspect_tcp_payload(payload)
+            for new_flow in batch.new_flows:
+                self._handle_new_flow(new_flow)
+            self._enqueue(batch.completed)
+            total_flows, total_signals = aggregator.shed()
+            if total_flows > shed_flows or total_signals > shed_signals:
+                self._note_native_shedding(total_flows - shed_flows, total_signals - shed_signals)
+                shed_flows, shed_signals = total_flows, total_signals
+
+    def _note_native_shedding(self, flows: int, signals: int) -> None:
+        """Account for work the engine shed at its per-drain caps — counted, never silent.
+
+        A shed completed flow is the same outcome as a full detection queue
+        (never assessed), so it is counted and reported exactly like one; a
+        shed new-flow signal is the same outcome as a full new-flow queue.
+        """
+        if flows:
+            self._counters.add(flows_dropped_for_backpressure=flows)
+            before = self._backpressure_drops
+            self._backpressure_drops += flows
+            crossed = before == 0 or before // _BACKPRESSURE_REPORT_INTERVAL != (
+                self._backpressure_drops // _BACKPRESSURE_REPORT_INTERVAL
+            )
+            if crossed:
+                _logger.warning(
+                    "native engine shed %d completed flow(s) at its per-drain cap (%d dropped so far)",
+                    flows,
+                    self._backpressure_drops,
+                )
+                self._forwarder.emit(
+                    SecurityEvent(
+                        timestamp=datetime.now(UTC),
+                        severity=EventSeverity.WARNING,
+                        event_type=SecurityEventType.SYSTEM_WARNING,
+                        subsystem=_SUBSYSTEM,
+                        reason=(
+                            f"capture is completing flows faster than detection can assess them; "
+                            f"{self._backpressure_drops} flow(s) dropped without analysis so far "
+                            "(source-level behavior detection still sees the traffic)."
+                        ),
+                    )
+                )
+        if signals:
+            self._new_flow_signals_dropped += signals
 
     def _enqueue(self, flows: Iterable[Flow]) -> None:
         """Hand completed flows to the detection thread, dropping rather than blocking."""
@@ -709,12 +858,6 @@ class CoreDaemon:
         would otherwise treat an escaped exception as a fatal capture-loop
         crash).
         """
-        try:
-            self._handle_tcp_payload_unsafe(metadata, raw)
-        except Exception:
-            _logger.exception("TLS structural inspection failed for a packet; continuing")
-
-    def _handle_tcp_payload_unsafe(self, metadata: PacketMetadata, raw: bytes) -> None:
         if not isinstance(metadata.source_ip, IPv4Address) or not isinstance(
             metadata.destination_ip, IPv4Address
         ):
@@ -722,11 +865,37 @@ class CoreDaemon:
         payload = extract_tcp_payload(raw)
         if not payload:
             return
+        self._inspect_tcp_payload(
+            TcpPayload(
+                source_ip=metadata.source_ip,
+                destination_ip=metadata.destination_ip,
+                source_port=metadata.source_port,
+                destination_port=metadata.destination_port,
+                timestamp=metadata.timestamp,
+                payload=payload,
+            )
+        )
 
+    def _inspect_tcp_payload(self, segment: TcpPayload) -> None:
+        """Run the TLS structural detectors on one payload. Capture thread; never raises.
+
+        Shared by both capture paths: the Python loop extracts the payload
+        itself (`_handle_tcp_payload`), the native engine hands it over
+        pre-filtered to records these detectors can act on.
+        """
+        try:
+            self._inspect_tcp_payload_unsafe(segment)
+        except Exception:
+            _logger.exception("TLS structural inspection failed for a packet; continuing")
+
+    def _inspect_tcp_payload_unsafe(self, segment: TcpPayload) -> None:
+        payload = segment.payload
+        if not payload:
+            return
         heartbleed = check_heartbleed(payload)
         if heartbleed is not None:
             self._cache_tls_match(
-                metadata,
+                segment,
                 signature="heartbleed",
                 confidence=1.0,
                 detail=(
@@ -743,7 +912,7 @@ class CoreDaemon:
         known_tool = match_known_tool(fingerprint, self._known_tool_fingerprints)
         if known_tool is not None:
             self._cache_tls_match(
-                metadata,
+                segment,
                 signature=f"ja3:{known_tool.ja3_hash}",
                 # Honestly weaker than a Heartbleed length mismatch (ADDENDUM_2.md
                 # B5): a JA3 match against known, *unmodified* tooling is real
@@ -753,19 +922,17 @@ class CoreDaemon:
             )
 
     def _cache_tls_match(
-        self, metadata: PacketMetadata, *, signature: str, confidence: float, detail: str
+        self, segment: TcpPayload, *, signature: str, confidence: float, detail: str
     ) -> None:
-        assert isinstance(metadata.source_ip, IPv4Address)
-        assert isinstance(metadata.destination_ip, IPv4Address)
         key = compute_flow_key(
-            metadata.source_ip,
-            metadata.destination_ip,
-            metadata.source_port,
-            metadata.destination_port,
-            metadata.protocol,
+            segment.source_ip,
+            segment.destination_ip,
+            segment.source_port,
+            segment.destination_port,
+            Protocol.TCP,
         )
         match = _CachedTlsMatch(
-            signature=signature, confidence=confidence, detail=detail, generated_at=metadata.timestamp
+            signature=signature, confidence=confidence, detail=detail, generated_at=segment.timestamp
         )
         with self._flow_lock:
             if key not in self._tls_evidence and len(self._tls_evidence) >= _TLS_EVIDENCE_CACHE_MAX:
@@ -791,15 +958,56 @@ class CoreDaemon:
         )
 
     def _drain_new_flow_signals(self) -> None:
-        """Fold every pending creation-time signal into `BehaviorAnalyzer`. Detection thread only."""
+        """Fold every pending creation-time signal into `BehaviorAnalyzer`. Detection thread only.
+
+        Then gives every source those signals touched a chance at the
+        source-level fast path (`_assess_sources_early`).
+        """
+        touched: set[IPv4Address] = set()
         while True:
             try:
                 signal = self._new_flow_queue.get_nowait()
             except queue.Empty:
-                return
+                break
             self._coordinator.behavior_analyzer.observe_new_connection(
                 signal.source_ip, signal.destination_ip, signal.destination_port, signal.timestamp
             )
+            touched.add(signal.source_ip)
+        if touched:
+            self._assess_sources_early(touched)
+
+    def _assess_sources_early(self, sources: Iterable[IPv4Address]) -> None:
+        """Source-level fast path. Detection thread only.
+
+        A flood or scan is fully visible in its new-connection signals
+        within seconds, but per-flow assessment only happens when a flow
+        *completes* — for half-open SYN-flood connections, at the inactive
+        timeout. So once a source's behavior alone already scores MEDIUM or
+        above, it is assessed now, from a snapshot of its newest open flow,
+        through the ordinary decision/validation/enforcement chain.
+        Rate-limited per source by `detection.source_assessment_cooldown_seconds`;
+        the cooldown map is LRU-bounded like every other per-source table.
+        """
+        cooldown = self._config.detection.source_assessment_cooldown_seconds
+        analyzer = self._coordinator.behavior_analyzer
+        for source in sources:
+            now_monotonic = time.monotonic()
+            last = self._early_assessed_at.get(source)
+            if last is not None and now_monotonic - last < cooldown:
+                continue
+            assessment = analyzer.assess(source)
+            if assessment is None or not self._pipeline.behavior_warrants_assessment(assessment):
+                continue
+            with self._flow_lock:
+                snapshot = self._aggregator.snapshot_open_flow_from(source)
+            if snapshot is None:
+                continue
+            self._early_assessed_at[source] = now_monotonic
+            self._early_assessed_at.move_to_end(source)
+            while len(self._early_assessed_at) > self._config.detection.max_tracked_sources:
+                self._early_assessed_at.popitem(last=False)
+            self._counters.add(source_snapshot_assessments=1)
+            self._pipeline.process_snapshot(snapshot, datetime.now(UTC))
 
     def _drain_slow_clusters(self) -> None:
         """Fold every pending slow-connection cluster into `BehaviorAnalyzer` and the normal pipeline.
@@ -819,14 +1027,13 @@ class CoreDaemon:
             self._coordinator.behavior_analyzer.note_slow_connections(
                 cluster.source_ip, cluster.destination_ip, cluster.concurrent_count, now
             )
-            # Not `_enqueue`: that increments `flows_completed`, and this
-            # flow did not complete — it's a still-open connection's
-            # point-in-time snapshot (see `SlowConnectionCluster`'s
-            # docstring). Metrics must not conflate the two.
-            try:
-                self._flow_queue.put_nowait(cluster.representative_flow)
-            except queue.Full:
-                self._note_backpressure_drop(cluster.representative_flow)
+            # A still-open connection's point-in-time snapshot (see
+            # `SlowConnectionCluster`'s docstring), so it takes the
+            # snapshot path — behavior evidence only, no ML on a partial
+            # flow, no completion signal for a flow that has not completed
+            # (which previously counted it as a failure twice) — not the
+            # completed-flow queue, and never `flows_completed`.
+            self._pipeline.process_snapshot(cluster.representative_flow, now)
 
     def _note_backpressure_drop(self, flow: Flow) -> None:
         self._backpressure_drops += 1

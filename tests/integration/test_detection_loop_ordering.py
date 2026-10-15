@@ -40,7 +40,9 @@ from pathlib import Path
 from pirewall.capture.fake import FakePacketCapture
 from pirewall.core.models.common import TcpFlags
 from pirewall.core.models.flow import Flow
+from pirewall.core.models.threat import ThreatAssessment
 from pirewall.firewall.backend.fake import FakeFirewallBackend
+from pirewall.flow.aggregator import FlowAggregator
 from pirewall.runtime.core import CoreDaemon
 from pirewall.runtime.watchdog import SystemdNotifier
 from tests.helpers.config import make_config
@@ -88,9 +90,11 @@ def test_detection_loop_redrains_new_flow_signals_after_waking_from_a_blocking_g
         # The capture thread's burst: six new connections to distinct
         # ports, landing in `_new_flow_queue` while the detection thread
         # is already inside its blocking `get()`.
+        aggregator = daemon._aggregator  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(aggregator, FlowAggregator)  # injected FakePacketCapture -> Python path
         with daemon._flow_lock:  # pyright: ignore[reportPrivateUsage]
             for port in range(6000, 6006):
-                daemon._aggregator.process_packet(  # pyright: ignore[reportPrivateUsage]
+                aggregator.process_packet(
                     make_packet(
                         source_ip=_SRC,
                         destination_ip=_DST,
@@ -120,20 +124,33 @@ def test_detection_loop_redrains_new_flow_signals_after_waking_from_a_blocking_g
                     destination_port=60000, timestamp=NOW, tcp_flags=TcpFlags(fin=True, ack=True),
                 ),
             ]:
-                completed.extend(daemon._aggregator.process_packet(packet))  # pyright: ignore[reportPrivateUsage]
+                completed.extend(aggregator.process_packet(packet))
 
         assert len(completed) == 1, "expected exactly one completed flow from the FIN-closing session"
         daemon._flow_queue.put_nowait(completed[0])  # pyright: ignore[reportPrivateUsage]
 
         deadline = time.monotonic() + _WAIT_DEADLINE_SECONDS
-        while time.monotonic() < deadline and len(daemon._state.threats) < 1:  # pyright: ignore[reportPrivateUsage]
+        completed_id = completed[0].flow_id
+
+        def completed_assessments() -> list[ThreatAssessment]:
+            return [
+                threat
+                for threat in daemon._state.threats  # pyright: ignore[reportPrivateUsage]
+                if threat.flow_id == completed_id
+            ]
+
+        while time.monotonic() < deadline and not completed_assessments():
             time.sleep(_WAIT_POLL_SECONDS)
     finally:
         daemon._stop.set()  # pyright: ignore[reportPrivateUsage]
         thread.join(timeout=2.0)
 
-    assert len(daemon._state.threats) == 1, "the completing flow's assessment never arrived"  # pyright: ignore[reportPrivateUsage]
-    assessment = daemon._state.threats[0]  # pyright: ignore[reportPrivateUsage]
+    # The completing flow's own assessment is the one under test. (The
+    # source-level fast path may additionally have assessed this source
+    # from a snapshot of an open scan flow; that is a separate threat.)
+    matching = completed_assessments()
+    assert len(matching) == 1, "the completing flow's assessment never arrived"
+    assessment = matching[0]
     assert assessment.behavior_assessment is not None
     assert "scanning" in [p.value for p in assessment.behavior_assessment.detected_patterns], (
         "the six-port scan burst was not visible in the completing flow's own assessment -- "

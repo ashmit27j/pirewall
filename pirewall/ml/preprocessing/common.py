@@ -91,3 +91,30 @@ def parse_float(row: dict[str, str], column: str) -> float:
     if raw is None or raw.strip() == "":
         raise ValueError(f"missing value for column {column!r}")
     return float(raw)
+
+
+def combine_weighted_sample_stats(
+    mean_a: float, std_a: float, count_a: float, mean_b: float, std_b: float, count_b: float
+) -> tuple[float, float]:
+    """Pool two groups' (mean, *sample* std, count) into one overall (mean, sample std).
+
+    The sample-std (n - 1) counterpart of `combine_weighted_stats`, for
+    datasets that report bias-corrected std per direction (CICFlowMeter
+    does). Uses the exact identity: total sum of squared deviations =
+    sum over groups of (n_i - 1) * s_i^2 + n_i * (m_i - m)^2, divided by
+    N - 1. Returns std 0.0 for fewer than two packets overall, matching
+    `pirewall.flow.state.RunningStats.sample_std`.
+    """
+    total = count_a + count_b
+    if total <= 0:
+        return 0.0, 0.0
+    combined_mean = (count_a * mean_a + count_b * mean_b) / total
+    if total < 2:
+        return combined_mean, 0.0
+    squared_deviations = (
+        max(count_a - 1, 0.0) * std_a**2
+        + count_a * (mean_a - combined_mean) ** 2
+        + max(count_b - 1, 0.0) * std_b**2
+        + count_b * (mean_b - combined_mean) ** 2
+    )
+    return combined_mean, (squared_deviations / (total - 1)) ** 0.5

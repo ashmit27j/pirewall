@@ -56,7 +56,18 @@ def make_flow(
     forward_byte_count: int = 600,
     backward_byte_count: int = 400,
     tcp_flags: dict[str, int] | None = None,
+    payload_stats: dict[str, float] | None = None,
 ) -> Flow:
+    """Build a valid `Flow`. `payload_stats` defaults to IP bytes minus 40 per packet."""
+    if payload_stats is None:
+        payload_stats = {
+            "forward_bytes": max(forward_byte_count - 40 * forward_packet_count, 0),
+            "backward_bytes": max(backward_byte_count - 40 * backward_packet_count, 0),
+            "min_bytes": 0,
+            "max_bytes": 1460,
+            "mean_bytes": 60.0,
+            "std_bytes": 20.0,
+        }
     return Flow.model_validate(
         {
             "flow_id": flow_id,
@@ -86,5 +97,6 @@ def make_flow(
                 "mean_seconds": 0.1,
                 "std_seconds": 0.05,
             },
+            "payload_stats": payload_stats,
         }
     )

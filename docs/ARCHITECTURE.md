@@ -175,7 +175,9 @@ core.models / core.enums / core.exceptions   (no dependents flow backward into h
 config                                        (validated settings, spec §37)
         |
         v
-capture  ->  flow  ->  features               (packet -> flow -> feature vector)
+capture  ->  flow  ->  features               (packet -> flow -> feature vector;
+                                               capture.native/flow.native wrap the
+                                               optional Rust engine, same contracts)
         |
         v
 ml  ->  detection                             (model artifacts -> evidence wrappers)
@@ -238,6 +240,77 @@ becomes concrete. Detection produces evidence and stops; `detection` never
 imports `engine`, because that would invert `detection -> engine ->
 firewall`. The pipeline is what carries evidence across each boundary, and
 it holds no detection, scoring, or rule logic of its own.
+
+## Native capture engine (`native/`, `capture.backend`)
+
+The per-*packet* stages — capture, L3/L4 parsing, flow aggregation — are
+implemented twice: in Python (`capture.af_packet`, `capture.parser`,
+`flow.aggregator`/`state`) and in Rust (`native/src/`, built as the optional
+`pirewall_native` CPython extension). Everything per-*flow* and above —
+features, ML, behavior, scoring, decisions, validation, enforcement, IPC,
+API — exists once, in Python, unchanged.
+
+**Why these stages and only these.** On the Pi the Python packet path was
+measured at ~127 µs/packet uncontended (`benchmarks/2026-08-30/REPORT.md`
+§3) — under 8k pkt/s on one core before any other thread competes for the
+GIL — and in practice delivered ~1,300 pkt/s through a 10k pkt/s SYN flood,
+dropping 94% (`benchmarks/2026-09-10-attack-lab/`). The cost is structural:
+one `recvmsg` syscall, two Pydantic validations, several `ipaddress`
+objects and a lock per packet, all holding the GIL the detection and
+inference threads also need. Nothing per-flow comes close to that rate, so
+rewriting it would buy little and put the validation chain, the A4 process
+split and the A2/A3/A7/A8 safety machinery at risk for no reason.
+
+**What the engine is.** `PacketRing` (Linux) reads a `TPACKET_V3`
+memory-mapped ring: one `poll` per block of packets, kernel receive
+timestamps in each header. Frames go straight into `FlowEngine`, a
+line-for-line port of the Python parser and aggregator, with the GIL
+released. Python only sees what it already handled per flow: completed
+flows, new-flow signals (ADDENDUM_2.md B1), and TCP/443 payloads
+pre-filtered to the two record shapes the TLS detectors act on
+(heartbeat, ClientHello; B4/B5). `pirewall.flow.native.NativeFlowAggregator`
+turns those into the same `Flow`/`NewFlowSignal`/`SlowConnectionCluster`
+objects and offers the same sweep/snapshot/flush methods, so nothing
+downstream knows which path is running.
+
+**Held to identical output.** `tests/unit/test_native_parity.py` feeds a
+6,700-frame mixed stream (sessions, scans, UDP, ICMP, ARP, IPv6, truncated
+frames, non-unicast, LRU eviction, out-of-order timestamps, timeouts)
+through both and requires every completed flow, signal, TLS candidate,
+malformed count, sweep, cluster and snapshot to match — floats compared
+exactly. Both use the same Welford accumulation order and whole-microsecond
+clock, so they agree to the bit. This matters beyond tidiness: feature
+schema 2.0.0 exists because two producers of "the same" flow statistic once
+disagreed (`docs/FEATURE_SCHEMA.md`).
+
+**Load shedding happens in the engine.** A SYN flood completes tens of
+thousands of flows a second; detection on a Pi assesses a few hundred. The
+engine converts at most `capture.native_max_flows_per_drain` completed
+flows and `native_max_new_flows_per_drain` signals per drain and *counts*
+the rest (`flows_dropped_for_backpressure`, a SYSTEM_WARNING event) instead
+of spending the GIL building objects the bounded queues would drop anyway.
+The source-level fast path needs far fewer signals than that to see a
+flood.
+
+**Layering.** `pirewall.capture.native` imports nothing from
+`pirewall.flow` — the engine is an opaque handle — and the
+`FlowCapture` protocol (`capture.interfaces`) has a test double,
+`capture.fake.FakeFlowCapture`, that drives the real engine without a NIC
+(`tests/integration/test_core_daemon_native.py`). Every mutex in the
+extension is taken only while the GIL is released and dropped before it is
+re-acquired, so no thread can hold one while waiting for the other.
+
+**Selection.** `capture.backend = "auto"` (default) uses the extension when
+it is installed and built with ring support, else the Python path;
+`"python"` forces Python; `"native"` reports a SYSTEM_WARNING if it has to
+fall back. Install with `uv sync --extra native` (needs a Rust toolchain;
+see `docs/DEPLOYMENT.md`). Without it, pirewall behaves exactly as before.
+
+Measured (`benchmarks/2026-10-15-native-capture/REPORT.md`, x86 Docker
+VM — **not** Pi numbers): under a ~1M frame/s SYN flood the native path
+processed 656k pkt/s against Python's 29k; with a GIL-contending thread,
+252k against 8.5k; at a 16k frame/s SYN rate with contention, 0% kernel
+drops against 45%.
 
 ## Batched anomaly scoring (ADDENDUM_2 follow-up pass, section 3)
 
@@ -420,6 +493,19 @@ worse version of a well-known library" CLAUDE.md's dependency policy exists
 to avoid. Added on explicit operator instruction, training-only (dev
 machine, spec §4) — never imported by `pirewall/` runtime code, so it never
 reaches the Pi.
+
+### Rust, PyO3, maturin and `libc` for the native capture engine (2026-10-15)
+
+Asked for explicitly by the operator ("refactor into a faster language like
+Rust"), scoped to the measured bottleneck only — see "Native capture
+engine" above. `pyo3` (pinned 0.25, `abi3-py312`: one build for every
+CPython ≥ 3.12) is the standard Rust↔CPython binding; `libc` provides the
+`AF_PACKET`/`mmap`/`poll` FFI; `maturin` is the standard build backend for
+PyO3 extensions and is a *build-time* tool only, never imported. All three
+stay behind the optional `native` extra: a plain `uv sync` installs none of
+them and pirewall runs its pure-Python path. A C extension was the
+alternative and was rejected: the same FFI with none of Rust's bounds
+checking, in the one component that parses attacker-controlled bytes.
 
 ## Process split (ADDENDUM.md A4)
 

@@ -17,7 +17,21 @@ table in the first place.
 from dataclasses import dataclass
 from enum import StrEnum
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "2.0.0"
+"""Bumped from 1.0.0, deliberately breaking every 1.x artifact (the loader
+refuses a schema mismatch, so an old model is simply not loaded rather than
+fed features it was not trained on). 1.0.0 was measured against the real
+CICIDS2017 CSVs to disagree with the training data on what its own columns
+meant — see `docs/FEATURE_SCHEMA.md` "Why 2.0.0":
+
+* sizes/byte counts were IP total length at runtime but L4 *payload* bytes in
+  training (84% of benign HTTPS training flows have a 0-byte minimum packet,
+  which an IP length can never be);
+* std columns were population std at runtime, sample std in training;
+* the six TCP flag-count columns have no reproducible meaning in the
+  published CSVs (SYN "present" on 13% of HTTPS flows, ACK on 28%, max value
+  1 everywhere) and are removed rather than imitated.
+"""
 
 
 class FeatureType(StrEnum):
@@ -47,28 +61,22 @@ class FeatureDefinition:
 _FEATURE_TABLE: tuple[tuple[str, FeatureType, str, str], ...] = (
     ("duration_seconds", FeatureType.DURATION, "seconds", "Time between the flow's first/last packet."),
     ("packet_count", FeatureType.COUNT, "packets", "Total packets observed in the flow."),
-    ("byte_count", FeatureType.SIZE, "bytes", "Total bytes observed in the flow."),
     ("forward_packet_count", FeatureType.COUNT, "packets", "Packets in the initiating direction."),
     ("backward_packet_count", FeatureType.COUNT, "packets", "Packets in the response direction."),
-    ("forward_byte_count", FeatureType.SIZE, "bytes", "Bytes in the initiating direction."),
-    ("backward_byte_count", FeatureType.SIZE, "bytes", "Bytes in the response direction."),
+    ("payload_byte_count", FeatureType.SIZE, "bytes", "L4 payload bytes, both directions."),
+    ("forward_payload_byte_count", FeatureType.SIZE, "bytes", "L4 payload bytes, initiating direction."),
+    ("backward_payload_byte_count", FeatureType.SIZE, "bytes", "L4 payload bytes, response direction."),
     ("packets_per_second", FeatureType.RATE, "packets/second", "packet_count / duration (0 if 0)."),
-    ("bytes_per_second", FeatureType.RATE, "bytes/second", "byte_count / duration (0 if duration is 0)."),
-    ("mean_packet_size", FeatureType.SIZE, "bytes", "Mean packet size across the flow."),
-    ("std_packet_size", FeatureType.SIZE, "bytes", "Std deviation of packet size."),
-    ("min_packet_size", FeatureType.SIZE, "bytes", "Smallest packet observed."),
-    ("max_packet_size", FeatureType.SIZE, "bytes", "Largest packet observed."),
+    ("payload_bytes_per_second", FeatureType.RATE, "bytes/second", "payload_byte_count / duration (0 if 0)."),
+    ("mean_payload_size", FeatureType.SIZE, "bytes", "Mean per-packet L4 payload size."),
+    ("std_payload_size", FeatureType.SIZE, "bytes", "Sample std (n-1) of per-packet payload size."),
+    ("min_payload_size", FeatureType.SIZE, "bytes", "Smallest per-packet payload (0 for a bare ACK)."),
+    ("max_payload_size", FeatureType.SIZE, "bytes", "Largest per-packet payload."),
     ("mean_inter_arrival_seconds", FeatureType.DURATION, "seconds", "Mean inter-packet time."),
-    ("std_inter_arrival_seconds", FeatureType.DURATION, "seconds", "Std deviation of inter-packet time."),
+    ("std_inter_arrival_seconds", FeatureType.DURATION, "seconds", "Sample std (n-1) of inter-packet time."),
     ("min_inter_arrival_seconds", FeatureType.DURATION, "seconds", "Smallest inter-packet time."),
     ("max_inter_arrival_seconds", FeatureType.DURATION, "seconds", "Largest inter-packet time."),
-    ("syn_count", FeatureType.COUNT, "packets", "TCP SYN flags observed."),
-    ("ack_count", FeatureType.COUNT, "packets", "TCP ACK flags observed."),
-    ("fin_count", FeatureType.COUNT, "packets", "TCP FIN flags observed."),
-    ("rst_count", FeatureType.COUNT, "packets", "TCP RST flags observed."),
-    ("psh_count", FeatureType.COUNT, "packets", "TCP PSH flags observed."),
-    ("urg_count", FeatureType.COUNT, "packets", "TCP URG flags observed."),
-    ("forward_backward_byte_ratio", FeatureType.RATIO, "ratio", "forward/backward bytes (0 if 0)."),
+    ("forward_backward_payload_ratio", FeatureType.RATIO, "ratio", "Forward/backward payload (0 if 0)."),
     ("destination_port", FeatureType.PORT, "port", "Destination port, or -1 if none (e.g. ICMP)."),
     ("protocol_is_tcp", FeatureType.FLAG, "boolean", "1.0 if the flow's protocol is TCP, else 0.0."),
     ("protocol_is_udp", FeatureType.FLAG, "boolean", "1.0 if the flow's protocol is UDP, else 0.0."),

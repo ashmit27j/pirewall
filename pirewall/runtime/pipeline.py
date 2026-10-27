@@ -43,12 +43,14 @@ from datetime import datetime
 from pirewall.config.models import PirewallConfig
 from pirewall.core.enums import EventSeverity, FirewallAction, SecurityEventType, ThreatLevel
 from pirewall.core.exceptions import FeatureExtractionError, PirewallError
+from pirewall.core.models.behavior import BehaviorAssessment
 from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.evidence import ProtocolSignatureEvidence
 from pirewall.core.models.feature_vector import FeatureVector
 from pirewall.core.models.flow import Flow
 from pirewall.detection.coordinator import DetectionCoordinator, DetectionOutcome
 from pirewall.engine.decision import EvidenceMaturityTracker, decide
+from pirewall.engine.scoring import score_evidence
 from pirewall.engine.threat import assess_threat
 from pirewall.features.extractor import extract_features
 from pirewall.firewall.generator import generate_candidate_rule
@@ -153,6 +155,38 @@ class FlowPipeline:
             _logger.exception("unexpected error processing flow %s", flow.flow_id)
             self._report_failure(flow, now, exc)
 
+    def process_snapshot(self, flow: Flow, now: datetime) -> None:
+        """Assess a still-open flow's *source* from behavior alone. Never raises.
+
+        The source-level counterpart to `process`: `flow` is a point-in-time
+        snapshot of one open connection, carrying (source, destination,
+        port, protocol) identity so the normal decision -> candidate ->
+        `FirewallManager` chain can act on it — it goes through exactly the
+        same validation as everything else. See
+        `DetectionCoordinator.analyze_snapshot` for why no ML runs here.
+        """
+        try:
+            with self._lock:
+                self._state.record_flow(flow)
+            self._finish(flow, now, self._coordinator.analyze_snapshot(flow, now))
+        except PirewallError as exc:
+            self._report_failure(flow, now, exc)
+        except Exception as exc:  # a bug here must not take the detection thread down with it
+            _logger.exception("unexpected error assessing snapshot of flow %s", flow.flow_id)
+            self._report_failure(flow, now, exc)
+
+    def behavior_warrants_assessment(self, assessment: BehaviorAssessment) -> bool:
+        """Whether behavior alone already scores at least MEDIUM — worth a source-level assessment.
+
+        Uses the real scoring function (no separate threshold of its own),
+        so "worth assessing early" can never drift from what the engine
+        would actually conclude.
+        """
+        if not assessment.detected_patterns:
+            return False
+        breakdown = score_evidence(self._config.threat, None, None, assessment)
+        return breakdown.total >= self._config.threat.medium_threshold
+
     def finish(self, flow: Flow, now: datetime, outcome: DetectionOutcome) -> None:
         """Complete a flow's pipeline processing once its anomaly evidence is ready.
 
@@ -185,7 +219,11 @@ class FlowPipeline:
             self._report_failure(flow, now, exc)
             return
 
-        if self._anomaly_scorer is not None and self._coordinator.models.isolation_forest is not None:
+        if (
+            self._anomaly_scorer is not None
+            and self._coordinator.models.isolation_forest is not None
+            and self._coordinator.in_model_domain(flow)
+        ):
             started = time.perf_counter()
             outcome = self._coordinator.analyze_except_anomaly(flow, features, now, protocol_signature)
             elapsed_seconds = time.perf_counter() - started

@@ -174,7 +174,10 @@ class FlowAggregator:
         state = self._table.get(key)
         if state is None:
             state = FlowState.opening(key, packet)
-            if self._on_new_flow is not None:
+            # Only a connection *initiation* is a new connection for behavior
+            # analysis; a flow first seen mid-conversation is attributed to its
+            # responder and must not count against it (see Flow.opened_by_initiation).
+            if self._on_new_flow is not None and state.initiated:
                 self._on_new_flow(
                     NewFlowSignal(
                         source_ip=packet.source_ip,
@@ -264,6 +267,23 @@ class FlowAggregator:
                 )
             )
         return clusters
+
+    def snapshot_open_flow_from(self, source_ip: IPv4Address) -> Flow | None:
+        """A point-in-time `Flow` snapshot of `source_ip`'s most recently active open flow.
+
+        Read-only, like `snapshot_slow_connection_clusters`: the connection
+        keeps running untouched in the table. `None` if the source has no
+        open flow. A linear scan — callers rate-limit it (the source-level
+        fast path asks at most once per source per cooldown, and only for a
+        source whose behavior already scores MEDIUM or above).
+        """
+        newest: FlowState | None = None
+        for state in self._table.values():
+            if state.forward_source_ip != source_ip:
+                continue
+            if newest is None or state.last_seen > newest.last_seen:
+                newest = state
+        return None if newest is None else newest.to_flow(flow_id=str(uuid4()))
 
     def flush(self) -> list[Flow]:
         """Finalize every remaining open flow, regardless of timeout status.

@@ -128,6 +128,12 @@ class BehaviorPatternType(StrEnum):
     # source-level aggregate pattern, same category as SCANNING/BURST, not
     # a per-flow classification of any single ambiguous connection.
     SLOW_RATE_DOS = "slow_rate_dos"
+    # Connection-rate flood: new connections from one source to one
+    # destination at a rate no ordinary client produces. HIGH_FREQUENCY and
+    # BURST fire the same at 3/s and 3,000/s; this is the pattern that
+    # measures magnitude (benchmarks/2026-10-15-native-capture/LIVE_AB.md:
+    # benign peak 39 per 5 s to one host, real floods 21k-39k).
+    FLOOD = "flood"
 
 
 class ModelType(StrEnum):

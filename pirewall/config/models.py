@@ -8,10 +8,11 @@ insecure or empty value.
 """
 
 from ipaddress import IPv4Address, IPv4Network
+from typing import Literal
 
 from pydantic import Field, model_validator
 
-from pirewall.core.enums import EnforcementMode, FailureMode
+from pirewall.core.enums import BehaviorPatternType, EnforcementMode, FailureMode
 from pirewall.core.models.allowlist import AllowlistEntry
 from pirewall.core.models.common import PirewallModel
 
@@ -43,11 +44,40 @@ class CaptureConfig(PirewallModel):
     promiscuous: bool = True
     buffer_size_bytes: int = Field(default=2 * 1024 * 1024, gt=0)
 
+    # Which capture/aggregation path pirewall-core runs. "auto" uses the
+    # native extension (TPACKET_V3 ring + Rust flow table, see
+    # docs/ARCHITECTURE.md) when it is installed and falls back to the
+    # pure-Python AF_PACKET path when it is not; "python" forces the
+    # latter; "native" asks for the former and reports a SYSTEM_WARNING
+    # if it has to fall back. `snap_len`/`buffer_size_bytes` apply to the
+    # Python path only; the ring_* fields to the native path only.
+    backend: Literal["auto", "native", "python"] = "auto"
+    # TPACKET_V3 ring: block_count blocks of block_size bytes (a multiple
+    # of the page size). 16 x 1 MiB holds tens of thousands of small
+    # packets — seconds of a 10k pkt/s flood — in 16 MiB of a 768 MiB
+    # MemoryMax. A partially filled block is handed over after
+    # ring_block_timeout_ms, which bounds added latency at low rates.
+    ring_block_size_bytes: int = Field(default=1024 * 1024, gt=0)
+    ring_block_count: int = Field(default=16, gt=0)
+    ring_block_timeout_ms: int = Field(default=50, gt=0)
+    # Native path load shedding: at most this many completed flows / new-flow
+    # signals are converted to Python objects per engine drain (~every 100 ms
+    # under load); the excess is counted as backpressure and discarded inside
+    # the engine. A flood completes tens of thousands of flows a second while
+    # detection on a Pi assesses a few hundred, so converting them all would
+    # only spend the GIL on objects the bounded queues then drop. The
+    # source-level fast path needs far fewer signals than this to see a flood.
+    native_max_flows_per_drain: int = Field(default=1_000, gt=0)
+    native_max_new_flows_per_drain: int = Field(default=5_000, gt=0)
+
 
 class FlowConfig(PirewallModel):
     """Flow-table timeouts and bounds (spec §8)."""
 
-    active_timeout_seconds: int = Field(default=1800, gt=0)
+    # 120 s matches CICFlowMeter, which segmented the CICIDS2017 training data:
+    # no training flow is longer than that (max measured 119.99997 s), so a
+    # longer runtime flow would be a duration the models have never seen.
+    active_timeout_seconds: int = Field(default=120, gt=0)
     inactive_timeout_seconds: int = Field(default=60, gt=0)
     max_flows: int = Field(default=100_000, gt=0)
     cleanup_interval_seconds: int = Field(default=30, gt=0)
@@ -56,7 +86,7 @@ class FlowConfig(PirewallModel):
 class FeaturesConfig(PirewallModel):
     """Feature-schema pinning (spec §11)."""
 
-    schema_version: str = Field(default="1.0.0", min_length=1)
+    schema_version: str = Field(default="2.0.0", min_length=1)
 
 
 class DetectionConfig(PirewallModel):
@@ -76,6 +106,9 @@ class DetectionConfig(PirewallModel):
     max_tracked_sources: int = Field(default=10_000, gt=0)
     max_tracked_destinations_per_source: int = Field(default=200, gt=0)
     max_tracked_ports_per_source: int = Field(default=200, gt=0)
+    # Connection events (and, separately, failures) remembered per source
+    # inside the sliding `behavior_window_seconds` window.
+    max_tracked_connections_per_source: int = Field(default=2_000, gt=0)
     recent_connections_window: int = Field(default=50, gt=0)
 
     # Pattern thresholds.
@@ -88,6 +121,10 @@ class DetectionConfig(PirewallModel):
     scanning_port_threshold: int = Field(default=10, gt=0)
     repeated_failures_threshold: int = Field(default=10, gt=0)
     temporal_pattern_cv_threshold: float = Field(default=0.15, gt=0.0)
+    # FLOOD: new connections per second from one source to *one* destination,
+    # measured over `burst_window_seconds`. 100/s = 500 in the default 5 s
+    # window, ~12x the busiest benign client measured (39 in 5 s).
+    flood_connections_per_second_threshold: float = Field(default=100.0, gt=0.0)
 
     # ADDENDUM_2.md B2 — slow-rate (slowloris-class) aggregate signal. A
     # flow only counts as a "slow connection" candidate once it has been
@@ -123,13 +160,22 @@ class DetectionConfig(PirewallModel):
     anomaly_batch_size: int = Field(default=50, gt=0)
     anomaly_batch_max_wait_seconds: float = Field(default=0.2, gt=0.0)
 
+    # Source-level fast path. When new-connection signals push a source's
+    # behavior score to MEDIUM or above, that source is assessed right away
+    # from a snapshot of one of its open flows instead of waiting for a
+    # flow to complete (a SYN flood's half-open flows only complete at the
+    # inactive timeout, 60-90 s later). At most once per source per this
+    # many seconds; the validator's duplicate check and the A3 rate cap
+    # still apply to anything it proposes.
+    source_assessment_cooldown_seconds: float = Field(default=10.0, gt=0.0)
+
 
 class MLConfig(PirewallModel):
     """Model artifact locations and expected feature schema (spec §15)."""
 
     lightgbm_model_path: str = Field(min_length=1)
     isolation_forest_model_path: str = Field(min_length=1)
-    feature_schema_version: str = Field(default="1.0.0", min_length=1)
+    feature_schema_version: str = Field(default="2.0.0", min_length=1)
 
 
 class ThreatConfig(PirewallModel):
@@ -158,12 +204,45 @@ class ThreatConfig(PirewallModel):
     # reach `low_threshold` (25) unaided, only push a score over a line in
     # combination. A confident known-attack detection alone reaches 60 —
     # past `medium` (50) but short of `high` (75), so enforcement still
-    # wants corroboration. Behavior stays at 25: it is deterministic
-    # pattern matching with no labelled ground truth, so there is no
-    # measurement to justify moving it and inventing one would be worse.
+    # wants corroboration.
     known_attack_weight: float = Field(default=60.0, ge=0.0, le=100.0)
     anomaly_weight: float = Field(default=15.0, ge=0.0, le=100.0)
-    behavior_weight: float = Field(default=25.0, ge=0.0, le=100.0)
+
+    # Behavior: the *cap* on the summed per-pattern points below. Was 25
+    # with every pattern worth weight/9, which made a behavior-only score
+    # top out at 25 + anomaly 15 = 40 < `medium` (50): the attack-lab run
+    # (benchmarks/2026-09-10-attack-lab) watched a real SYN flood, UDP flood
+    # and port scan get detected and then capped at LOW (KNOWN_ISSUES #20).
+    # 80 lets strong attack-shaped behavior reach HIGH (RATE_LIMIT) on its
+    # own, while staying below `critical` (90) so BLOCK still needs a
+    # second, independent kind of evidence.
+    behavior_weight: float = Field(default=80.0, ge=0.0, le=100.0)
+    # Points per detected pattern, summed then capped at `behavior_weight`.
+    # Patterns are not equally diagnostic: SCANNING (many ports on one
+    # host), REPEATED_FAILURES (unanswered attempts concentrated on one
+    # host) and SLOW_RATE_DOS are shapes ordinary clients do not produce;
+    # BURST/HIGH_FREQUENCY/REPEATED_CONNECTIONS/DESTINATION_DIVERSITY are
+    # exactly what one phone loading one web page produces (KNOWN_ISSUES
+    # #3). Checked against observed sets: a page load
+    # (diversity+repeated+frequency+burst) = 30, and 45 with a spurious
+    # anomaly flag -> still LOW (on real benign traffic, 45 + 15 made 10% of
+    # a browsing burst MEDIUM: benchmarks/2026-10-15-native-capture/LIVE_AB.md);
+    # the nmap scan (scanning+burst+frequency) = 75 -> HIGH; the floods
+    # (scanning+failures+slow-rate) = capped 80 -> HIGH.
+    behavior_pattern_points: dict[BehaviorPatternType, float] = Field(
+        default_factory=lambda: {
+            BehaviorPatternType.SCANNING: 55.0,
+            BehaviorPatternType.REPEATED_FAILURES: 45.0,
+            BehaviorPatternType.SLOW_RATE_DOS: 45.0,
+            BehaviorPatternType.FLOOD: 80.0,
+            BehaviorPatternType.BURST: 10.0,
+            BehaviorPatternType.HIGH_FREQUENCY: 10.0,
+            BehaviorPatternType.REPEATED_CONNECTIONS: 5.0,
+            BehaviorPatternType.TEMPORAL_PATTERN: 10.0,
+            BehaviorPatternType.DESTINATION_DIVERSITY: 5.0,
+            BehaviorPatternType.PERSISTENCE: 0.0,
+        }
+    )
 
     # ADDENDUM_2.md B4/B5 — a structural TLS protocol-field match
     # (Heartbleed length mismatch, a JA3 fingerprint hit against known
@@ -198,6 +277,18 @@ class ThreatConfig(PirewallModel):
         )
         if list(thresholds) != sorted(thresholds) or len(set(thresholds)) != len(thresholds):
             raise ValueError("threat thresholds must be strictly ascending: low<med<high<critical")
+        return self
+
+    @model_validator(mode="after")
+    def _check_pattern_points(self) -> "ThreatConfig":
+        # Every pattern must be priced explicitly: a pattern silently worth 0
+        # because a config file predates it is the kind of unread-setting bug
+        # KNOWN_ISSUES #17 already records once.
+        missing = sorted(set(BehaviorPatternType) - set(self.behavior_pattern_points))
+        if missing:
+            raise ValueError(f"behavior_pattern_points is missing pattern(s): {missing}")
+        if any(points < 0.0 or points > 100.0 for points in self.behavior_pattern_points.values()):
+            raise ValueError("behavior_pattern_points values must be within [0, 100]")
         return self
 
 

@@ -14,7 +14,12 @@ from datetime import datetime
 from ipaddress import IPv4Address
 
 from pirewall.core.enums import Protocol
-from pirewall.core.models.common import InterArrivalStats, PacketSizeStats, TcpFlagCounts
+from pirewall.core.models.common import (
+    InterArrivalStats,
+    PacketSizeStats,
+    PayloadStats,
+    TcpFlagCounts,
+)
 from pirewall.core.models.flow import Flow
 from pirewall.core.models.packet import PacketMetadata
 from pirewall.flow.key import FlowKey
@@ -51,7 +56,20 @@ class RunningStats:
 
     @property
     def std(self) -> float:
+        """Population standard deviation (divides by n)."""
         return math.sqrt(self._m2 / self.count) if self.count else 0.0
+
+    @property
+    def sample_std(self) -> float:
+        """Bias-corrected sample standard deviation (divides by n - 1); 0.0 below two samples.
+
+        This is what CICFlowMeter reports for every std column (verified on
+        the real CICIDS2017 CSVs: a two-packet flow with sizes 0 and 7 has
+        std 4.9497 = 7/sqrt(2), not 3.5), so every *feature-bearing*
+        statistic uses it — otherwise short flows, where the two differ
+        most, are systematically shifted between training and runtime.
+        """
+        return math.sqrt(self._m2 / (self.count - 1)) if self.count > 1 else 0.0
 
     @property
     def min(self) -> float:
@@ -60,6 +78,14 @@ class RunningStats:
     @property
     def max(self) -> float:
         return self._max if self.count else 0.0
+
+
+def is_initiation(packet: PacketMetadata) -> bool:
+    """Whether `packet` can open a connection: a TCP SYN without ACK or RST, or anything non-TCP."""
+    flags = packet.tcp_flags
+    if packet.protocol is not Protocol.TCP or flags is None:
+        return True
+    return flags.syn and not flags.ack and not flags.rst
 
 
 class FlowState:
@@ -76,6 +102,7 @@ class FlowState:
         "ack_count",
         "backward_byte_count",
         "backward_packet_count",
+        "backward_payload_bytes",
         "byte_count",
         "fin_count",
         "first_seen",
@@ -83,13 +110,16 @@ class FlowState:
         "forward_destination_ip",
         "forward_destination_port",
         "forward_packet_count",
+        "forward_payload_bytes",
         "forward_source_ip",
         "forward_source_port",
+        "initiated",
         "inter_arrival_stats",
         "key",
         "last_seen",
         "packet_count",
         "packet_size_stats",
+        "payload_size_stats",
         "protocol",
         "psh_count",
         "rst_count",
@@ -124,6 +154,8 @@ class FlowState:
         self.backward_packet_count = 0
         self.forward_byte_count = 0
         self.backward_byte_count = 0
+        self.forward_payload_bytes = 0
+        self.backward_payload_bytes = 0
         self.syn_count = 0
         self.ack_count = 0
         self.fin_count = 0
@@ -134,8 +166,10 @@ class FlowState:
         self.saw_fin_backward = False
         self.saw_rst = False
         self.packet_size_stats = RunningStats()
+        self.payload_size_stats = RunningStats()
         self.inter_arrival_stats = RunningStats()
         self._last_packet_time: datetime | None = None
+        self.initiated = True
 
     @classmethod
     def opening(cls, key: FlowKey, packet: PacketMetadata) -> "FlowState":
@@ -151,6 +185,7 @@ class FlowState:
             forward_destination_port=packet.destination_port,
             first_seen=packet.timestamp,
         )
+        state.initiated = is_initiation(packet)
         state.observe(packet)
         return state
 
@@ -169,9 +204,11 @@ class FlowState:
         if is_forward:
             self.forward_packet_count += 1
             self.forward_byte_count += packet.total_length
+            self.forward_payload_bytes += packet.payload_length
         else:
             self.backward_packet_count += 1
             self.backward_byte_count += packet.total_length
+            self.backward_payload_bytes += packet.payload_length
 
         if packet.tcp_flags is not None:
             flags = packet.tcp_flags
@@ -190,6 +227,7 @@ class FlowState:
                 self.saw_rst = True
 
         self.packet_size_stats.add(float(packet.total_length))
+        self.payload_size_stats.add(float(packet.payload_length))
         if self._last_packet_time is not None:
             delta = (packet.timestamp - self._last_packet_time).total_seconds()
             if delta >= 0:
@@ -231,7 +269,16 @@ class FlowState:
                 min_seconds=self.inter_arrival_stats.min,
                 max_seconds=self.inter_arrival_stats.max,
                 mean_seconds=self.inter_arrival_stats.mean,
-                std_seconds=self.inter_arrival_stats.std,
+                std_seconds=self.inter_arrival_stats.sample_std,
+            ),
+            opened_by_initiation=self.initiated,
+            payload_stats=PayloadStats(
+                forward_bytes=self.forward_payload_bytes,
+                backward_bytes=self.backward_payload_bytes,
+                min_bytes=round(self.payload_size_stats.min),
+                max_bytes=round(self.payload_size_stats.max),
+                mean_bytes=self.payload_size_stats.mean,
+                std_bytes=self.payload_size_stats.sample_std,
             ),
         )
 

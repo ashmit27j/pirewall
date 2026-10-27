@@ -201,15 +201,25 @@ interface = "{discovered.lan_interface}"
 snap_len = 65535
 promiscuous = true
 buffer_size_bytes = 2097152
+# "auto": native TPACKET_V3 ring + Rust flow table when pirewall-native is
+# installed (uv sync --extra native), else the pure-Python path.
+backend = "auto"
+ring_block_size_bytes = 1048576
+ring_block_count = 16
+ring_block_timeout_ms = 50
+# Native path: per-drain conversion caps; excess is shed and counted.
+native_max_flows_per_drain = 1000
+native_max_new_flows_per_drain = 5000
 
 [flow]
-active_timeout_seconds = 1800
+# 120 = CICFlowMeter's flow timeout: no CICIDS2017 training flow is longer.
+active_timeout_seconds = 120
 inactive_timeout_seconds = 60
 max_flows = 100000
 cleanup_interval_seconds = 30
 
 [features]
-schema_version = "1.0.0"
+schema_version = "2.0.0"
 
 [detection]
 known_attack_confidence_threshold = 0.8
@@ -228,6 +238,7 @@ destination_diversity_threshold = 15
 scanning_port_threshold = 10
 repeated_failures_threshold = 10
 temporal_pattern_cv_threshold = 0.15
+flood_connections_per_second_threshold = 100.0
 
 [ml]
 # Both artifacts are gitignored and trained separately. If either is
@@ -235,16 +246,31 @@ temporal_pattern_cv_threshold = 0.15
 # rather than refusing to start.
 lightgbm_model_path = "pirewall/ml/artifacts/lightgbm_model.txt"
 isolation_forest_model_path = "pirewall/ml/artifacts/isolation_forest_model.joblib"
-feature_schema_version = "1.0.0"
+feature_schema_version = "2.0.0"
 
 [threat]
 low_threshold = 25.0
 medium_threshold = 50.0
 high_threshold = 75.0
 critical_threshold = 90.0
-known_attack_weight = 50.0
-anomaly_weight = 25.0
-behavior_weight = 25.0
+known_attack_weight = 60.0
+anomaly_weight = 15.0
+# Cap on summed per-pattern points; below critical, so behavior alone can
+# RATE_LIMIT but never BLOCK. See config/default_config.toml.
+behavior_weight = 80.0
+protocol_signature_weight = 75.0
+
+[threat.behavior_pattern_points]
+scanning = 55.0
+repeated_failures = 45.0
+slow_rate_dos = 45.0
+flood = 80.0
+burst = 10.0
+high_frequency = 10.0
+repeated_connections = 5.0
+temporal_pattern = 10.0
+destination_diversity = 5.0
+persistence = 0.0
 
 [firewall]
 # ADDENDUM.md A1 — SHADOW logs what it would enforce and enforces nothing.

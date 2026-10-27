@@ -2,6 +2,9 @@
 
 from datetime import UTC, datetime
 
+import pytest
+from pydantic import ValidationError
+
 from pirewall.config.models import ThreatConfig
 from pirewall.core.enums import BehaviorPatternType
 from pirewall.core.models.behavior import BehaviorAssessment
@@ -9,7 +12,7 @@ from pirewall.core.models.evidence import AnomalyEvidence, KnownEvidence
 from pirewall.engine.scoring import score_evidence
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
-CONFIG = ThreatConfig()  # known_attack_weight=60, anomaly_weight=15, behavior_weight=25
+CONFIG = ThreatConfig()  # known_attack_weight=60, anomaly_weight=15, behavior cap 80
 
 
 def _known(predicted_class: str, confidence: float) -> KnownEvidence:
@@ -107,13 +110,61 @@ def test_confident_known_attack_alone_clears_medium_but_not_high() -> None:
 
 def test_known_attack_outweighs_anomaly_by_its_measured_reliability() -> None:
     """The ordering is the point: 0.9927 precision must outrank 0.5300."""
-    assert CONFIG.known_attack_weight > CONFIG.behavior_weight > CONFIG.anomaly_weight
+    assert CONFIG.known_attack_weight > CONFIG.anomaly_weight
 
 
-def test_weights_still_sum_to_a_full_score() -> None:
-    """All three firing at maximum reaches exactly 100 — no dead range."""
-    total = CONFIG.known_attack_weight + CONFIG.anomaly_weight + CONFIG.behavior_weight
-    assert total == 100.0
+# Observed pattern sets (docs/KNOWN_ISSUES.md #3 and #20,
+# benchmarks/2026-09-10-attack-lab/REPORT.md). The per-pattern points exist
+# to separate exactly these, so pin them here.
+_PAGE_LOAD = (
+    BehaviorPatternType.DESTINATION_DIVERSITY,
+    BehaviorPatternType.REPEATED_CONNECTIONS,
+    BehaviorPatternType.HIGH_FREQUENCY,
+    BehaviorPatternType.BURST,
+)
+_NMAP_SCAN = (BehaviorPatternType.SCANNING, BehaviorPatternType.BURST, BehaviorPatternType.HIGH_FREQUENCY)
+_SYN_FLOOD = (
+    BehaviorPatternType.SCANNING,
+    BehaviorPatternType.REPEATED_FAILURES,
+    BehaviorPatternType.SLOW_RATE_DOS,
+)
+
+
+def test_a_busy_page_load_stays_low_even_with_every_busy_pattern_firing() -> None:
+    breakdown = score_evidence(CONFIG, None, None, _behavior(_PAGE_LOAD))
+    assert breakdown.total < CONFIG.medium_threshold
+
+
+def test_a_page_load_plus_a_spurious_anomaly_flag_stays_low() -> None:
+    """Isolation Forest still flags ~10% of real benign flows (LIVE_AB.md); that alone
+    must not turn every busy browsing burst into MEDIUM threat events."""
+    breakdown = score_evidence(CONFIG, None, _anomaly(is_anomaly=True), _behavior(_PAGE_LOAD))
+    assert breakdown.total < CONFIG.medium_threshold
+
+
+def test_the_observed_port_scan_reaches_high_on_behavior_alone() -> None:
+    """KNOWN_ISSUES #20: this exact pattern set used to top out at LOW (8.3/100)."""
+    breakdown = score_evidence(CONFIG, None, None, _behavior(_NMAP_SCAN))
+    assert breakdown.total >= CONFIG.high_threshold
+
+
+def test_the_observed_floods_reach_high_on_behavior_alone() -> None:
+    breakdown = score_evidence(CONFIG, None, None, _behavior(_SYN_FLOOD))
+    assert breakdown.total >= CONFIG.high_threshold
+
+
+def test_behavior_alone_can_never_reach_critical() -> None:
+    """BLOCK (critical) must always need a second, independent kind of evidence."""
+    breakdown = score_evidence(CONFIG, None, None, _behavior(tuple(BehaviorPatternType)))
+    assert breakdown.behavior_contribution == CONFIG.behavior_weight
+    assert breakdown.total < CONFIG.critical_threshold
+
+
+def test_every_pattern_must_be_priced_explicitly() -> None:
+    points = dict(CONFIG.behavior_pattern_points)
+    del points[BehaviorPatternType.SCANNING]
+    with pytest.raises(ValidationError, match="scanning"):
+        ThreatConfig(behavior_pattern_points=points)
 
 
 def test_non_anomalous_evidence_contributes_nothing() -> None:
@@ -121,12 +172,11 @@ def test_non_anomalous_evidence_contributes_nothing() -> None:
     assert breakdown.anomaly_contribution == 0.0
 
 
-def test_behavior_contribution_scales_with_pattern_count() -> None:
+def test_behavior_contribution_is_the_patterns_own_points() -> None:
     breakdown = score_evidence(
         CONFIG, None, None, _behavior((BehaviorPatternType.SCANNING,))
     )
-    expected = 25.0 * (1 / 9)
-    assert round(breakdown.behavior_contribution, 6) == round(expected, 6)
+    assert breakdown.behavior_contribution == CONFIG.behavior_pattern_points[BehaviorPatternType.SCANNING]
 
 
 def test_multiple_corroborating_evidence_types_sum() -> None:
@@ -136,8 +186,8 @@ def test_multiple_corroborating_evidence_types_sum() -> None:
         _anomaly(is_anomaly=True),
         _behavior((BehaviorPatternType.SCANNING, BehaviorPatternType.HIGH_FREQUENCY)),
     )
-    expected = 50.0 + 25.0 + 25.0 * (2 / 9)
-    assert round(breakdown.total, 6) == round(expected, 6)
+    expected = 60.0 + 15.0 + 55.0 + 10.0
+    assert breakdown.total == min(100.0, expected)
 
 
 def test_score_is_clamped_to_100() -> None:

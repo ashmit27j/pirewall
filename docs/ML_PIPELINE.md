@@ -167,7 +167,51 @@ shell command. Evidence flows onward into `pirewall.engine.threat.assess_threat`
   accuracy on the real CICIDS2017 dataset is no longer environment-dependent
   — see "Current real-data results" below.
 
-## Current real-data results (CICIDS2017, model version 0.4.0)
+## Current real-data results (CICIDS2017, feature schema 2.0.0, model version 1.0.0)
+
+**Feature schema 2.0.0 refuses every earlier artifact** (`docs/FEATURE_SCHEMA.md`
+"Why 2.0.0"): sizes are now L4 payload as in the CSVs, std is sample std,
+the six unreproducible TCP flag-count features are gone, and runtime flows
+are segmented at CICFlowMeter's 120 s. Retrained 2026-10-15 in a Linux
+container on the development PC, same configuration as the shipped v0.4.0
+(flat multiclass, rare-class exclusion, no resampling / class weighting /
+threshold tuning, 100 rounds, `lambda_l2 = 1.0`), all 8 CSVs (2,830,628
+flows, 115 skipped for negative `Flow Duration`), identical split sizes:
+
+```sh
+uv run python -m scripts.train.train_lightgbm --dataset cicids     --dataset-path data/cicids2017/*.csv --model-version 1.0.0     --no-resampling --no-class-weighting --no-threshold-tuning
+uv run python -m scripts.train.train_isolation_forest --dataset cicids     --dataset-path data/cicids2017/*.csv --model-version 1.0.0     --contamination-sweep 0.05,0.1,0.15,0.2
+```
+
+| held-out test split | v0.4.0 (schema 1.0.0) | **v1.0.0 (schema 2.0.0)** |
+|---|---:|---:|
+| LightGBM accuracy | 0.997146 | 0.9967 |
+| LightGBM macro-F1 (12 classes) | 0.854589 | 0.8421 |
+| LightGBM binary precision / recall / FPR | 0.9930 / 0.9933 / 0.0017 | 0.9920 / 0.9922 / 0.0020 |
+| Isolation Forest precision / recall / FPR | 0.5300 / 0.4537 / 0.0987 (v0.2.0) | **0.6727 / 0.4170 / 0.0498** |
+| Isolation Forest contamination (validation sweep) | 0.10 | 0.05 |
+
+On the dataset itself LightGBM is effectively unchanged (the removed flag
+columns cost ~0.012 macro-F1); Isolation Forest halves its false-positive
+rate. **But the held-out split cannot show what 2.0.0 is for** — it is the
+same CSV distribution on both sides. What matters is behavior on real
+traffic: see `benchmarks/2026-10-15-native-capture/LIVE_AB.md`, which
+replays one real benign capture and one real attack capture through both
+pipelines (schema 1.0.0 with a same-configuration reproduction of v0.4.0,
+and 2.0.0 with v1.0.0).
+
+Artifacts remain gitignored; copy both `.txt`/`.joblib` files and their
+`.metadata.json` sidecars to the Pi (`docs/DEPLOYMENT.md` §3.2).
+
+**Out-of-domain protocols.** The CSVs have no protocol column, so the
+adapter can only infer TCP or UDP; an ICMP flow in the training data is
+labeled TCP, port 0. A runtime ICMP flow is therefore outside both models'
+domain by construction — on real benign traffic one was classified
+"DoS Slowhttptest" at 92% and BLOCKed. Since 2026-10-15
+`DetectionCoordinator` consults neither model for protocols outside
+`ML_DOMAIN_PROTOCOLS` (TCP, UDP); behavior analysis still covers them.
+
+## Previous real-data results (CICIDS2017, model version 0.4.0, schema 1.0.0)
 
 **Shipped.** `pirewall/ml/artifacts/lightgbm_model.txt` is model version
 **0.4.0** (4,039,527 bytes, 2026-08-30 02:28:07, `is_placeholder: false`),

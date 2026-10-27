@@ -65,6 +65,9 @@ class RuntimeCounters:
     # get a real `ThreatAssessment`, just without an Isolation Forest
     # score. Two different, separately observable failure modes, not one.
     anomaly_scores_dropped_for_backpressure: int = 0
+    # Source-level fast-path assessments (a still-open flow's snapshot
+    # assessed because its source's behavior already scored MEDIUM+).
+    source_snapshot_assessments: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def add(self, **deltas: float) -> None:
@@ -87,6 +90,7 @@ class RuntimeCounters:
                 rules_rejected=self.rules_rejected,
                 flows_dropped_for_backpressure=self.flows_dropped_for_backpressure,
                 anomaly_scores_dropped_for_backpressure=self.anomaly_scores_dropped_for_backpressure,
+                source_snapshot_assessments=self.source_snapshot_assessments,
             )
 
 

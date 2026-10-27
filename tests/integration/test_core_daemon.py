@@ -30,7 +30,7 @@ import pytest
 
 from pirewall.capture.fake import FakePacketCapture
 from pirewall.config.models import PirewallConfig
-from pirewall.core.enums import EnforcementMode
+from pirewall.core.enums import EnforcementMode, FirewallAction, ThreatLevel
 from pirewall.firewall.backend.fake import FakeFirewallBackend
 from pirewall.ipc.client import UnixSocketRpcClient
 from pirewall.runtime.core import CoreDaemon
@@ -420,8 +420,10 @@ def test_scanning_visible_through_a_completing_flow_while_scan_flows_stay_open(
 
         # Exactly one flow (the completing 4-packet session) ever finished —
         # the six scan flows are still open, proving they were never
-        # completed, only counted at creation.
-        assert len(client.list_flows()) == 1
+        # completed, only counted at creation. (`list_flows` may also hold
+        # a source-level fast-path snapshot of one still-open scan flow, so
+        # completion is read from the counter, not the list length.)
+        assert daemon._counters.flows_completed == 1  # pyright: ignore[reportPrivateUsage]
 
         assessments = client.list_threats()
         assert any(
@@ -549,3 +551,46 @@ def test_clean_shutdown_keeps_the_ruleset_when_failing_closed(socket_path: str) 
     daemon.stop()
 
     assert rule_id in backend.list_active_rule_ids()
+
+
+def test_a_scan_is_rate_limited_from_its_open_flows_without_waiting_for_any_to_complete(
+    socket_path: str,
+) -> None:
+    """Source-level fast path + per-pattern scoring, end to end (KNOWN_ISSUES #20).
+
+    Thirty SYNs to thirty ports on one host, none ever answered or closed,
+    and timeouts far beyond the test's deadline: no flow can complete. The
+    attack-lab run saw exactly this shape detected and then capped at LOW.
+    Now the source's behavior alone (SCANNING + BURST + HIGH_FREQUENCY)
+    scores HIGH, and the fast path assesses it from a snapshot of an open
+    flow, producing a RATE_LIMIT decision (shadowed, since SHADOW is the
+    default enforcement mode) while every scan flow is still open.
+    """
+    src, dst = "203.0.113.70", "192.168.1.10"
+    packets = [_tcp_packet(40000 + port, port, _SYN, src, dst) for port in range(7000, 7030)]
+    config = make_config(
+        api={"rpc_socket_path": socket_path, "history_size": 50},
+        firewall={"allowlist_store_path": str(Path(socket_path).parent / "allowlist.json")},
+        flow={"active_timeout_seconds": 3600, "inactive_timeout_seconds": 3600},
+    )
+    daemon = CoreDaemon(
+        config,
+        capture=FakePacketCapture("test0", packets),
+        backend=FakeFirewallBackend(),
+        notifier=SystemdNotifier(notify_socket=None),
+    )
+    daemon.start()
+    try:
+        client = UnixSocketRpcClient(socket_path)
+        _wait_for(
+            lambda: any(d.action is FirewallAction.RATE_LIMIT for d in client.list_decisions()),
+            "a RATE_LIMIT decision from the source-level fast path",
+        )
+        assert daemon._counters.flows_completed == 0  # pyright: ignore[reportPrivateUsage]
+        assert daemon._counters.source_snapshot_assessments >= 1  # pyright: ignore[reportPrivateUsage]
+        threats = [t for t in client.list_threats() if str(t.source_ip) == src]
+        assert threats and threats[0].threat_level is ThreatLevel.HIGH
+        # No ML ran on the half-open snapshot: the score is behavior alone.
+        assert threats[0].known_evidence is None and threats[0].anomaly_evidence is None
+    finally:
+        daemon.stop()

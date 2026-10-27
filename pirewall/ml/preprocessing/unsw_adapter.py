@@ -16,6 +16,13 @@ rather than something this adapter fabricates:
   mean and `std` to 0.0, since this format doesn't report per-packet
   distributions, only per-flow means.
 
+* `payload_stats` (feature schema 2.0.0) is an **approximation**: Argus
+  byte counts include IP and transport headers, and this format has no
+  header-length columns, so payload is estimated as bytes minus a fixed
+  40-byte (IPv4 + minimal TCP/UDP-ish) overhead per packet, clamped at 0.
+  CICIDS2017, whose columns *are* payload bytes, is the dataset the shipped
+  models train on; treat UNSW-trained 2.0.0 models as experimental.
+
 `dur` is already in seconds and `proto`/`service`/`state` are lowercase
 strings (unlike CICIDS2017's numeric protocol column) — see
 `pirewall.ml.preprocessing.cicids_adapter` for that dataset's own quirks.
@@ -47,6 +54,9 @@ _REQUIRED_COLUMNS = (
 
 _PLACEHOLDER_SOURCE_IP = "10.255.255.1"
 _PLACEHOLDER_DESTINATION_IP = "10.255.255.2"
+
+# See the module docstring: assumed per-packet header overhead, not measured.
+_ASSUMED_HEADER_BYTES_PER_PACKET = 40
 
 _PROTOCOL_BY_NAME = {"tcp": Protocol.TCP, "udp": Protocol.UDP, "icmp": Protocol.ICMP}
 
@@ -114,6 +124,10 @@ def _parse_row(raw_row: dict[str, str], header: dict[str, str], index: int) -> L
     )
     mean_inter_arrival_seconds = max(mean_inter_arrival_seconds, 0.0)
 
+    forward_payload = max(round(sbytes) - round(spkts) * _ASSUMED_HEADER_BYTES_PER_PACKET, 0)
+    backward_payload = max(round(dbytes) - round(dpkts) * _ASSUMED_HEADER_BYTES_PER_PACKET, 0)
+    mean_payload = max(mean_bytes - _ASSUMED_HEADER_BYTES_PER_PACKET, 0.0)
+
     attack_cat = get("attack_cat").strip()
     label = attack_cat if attack_cat else ("Attack" if get("label").strip() == "1" else "Normal")
 
@@ -138,6 +152,14 @@ def _parse_row(raw_row: dict[str, str], header: dict[str, str], index: int) -> L
                 "min_bytes": round(max(mean_bytes, 0.0)),
                 "max_bytes": round(max(mean_bytes, 0.0)),
                 "mean_bytes": max(mean_bytes, 0.0),
+                "std_bytes": 0.0,
+            },
+            "payload_stats": {
+                "forward_bytes": forward_payload,
+                "backward_bytes": backward_payload,
+                "min_bytes": round(mean_payload),
+                "max_bytes": round(mean_payload),
+                "mean_bytes": mean_payload,
                 "std_bytes": 0.0,
             },
             "inter_arrival_stats": {

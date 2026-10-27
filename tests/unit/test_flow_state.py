@@ -1,7 +1,10 @@
 """`FlowState`: packet accumulation, forward/backward attribution, `RunningStats`."""
 
+import statistics
 from datetime import UTC, datetime, timedelta
 from ipaddress import IPv4Address
+
+import pytest
 
 from pirewall.core.enums import Protocol
 from pirewall.core.models.common import TcpFlags
@@ -165,3 +168,40 @@ def test_icmp_packet_has_no_ports_and_no_tcp_flags() -> None:
     assert flow.source_port is None
     assert flow.destination_port is None
     assert flow.tcp_flags.syn == 0
+
+
+def test_payload_stats_track_l4_payload_not_ip_length() -> None:
+    """Feature schema 2.0.0: payload bytes, as CICFlowMeter measures them."""
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    state = _open_flow(make_packet(timestamp=start, total_length=52, payload_length=0))
+    state.observe(
+        make_packet(
+            source_ip="10.0.0.10",
+            destination_ip="10.0.0.5",
+            source_port=443,
+            destination_port=51234,
+            timestamp=start + timedelta(milliseconds=10),
+            total_length=1500,
+            payload_length=1448,
+        )
+    )
+    flow = state.to_flow("flow-1")
+    assert flow.byte_count == 1552
+    assert flow.payload_stats is not None
+    assert flow.payload_stats.forward_bytes == 0
+    assert flow.payload_stats.backward_bytes == 1448
+    assert flow.payload_stats.min_bytes == 0
+    assert flow.payload_stats.max_bytes == 1448
+    # Sample std (n - 1): sizes 0 and 1448 -> 1448 / sqrt(2).
+    assert flow.payload_stats.std_bytes == pytest.approx(1448 / 2**0.5)
+
+
+def test_running_stats_sample_std_matches_statistics_stdev() -> None:
+    values = [0.0, 7.0, 3.0, 12.5]
+    stats = RunningStats()
+    for value in values:
+        stats.add(value)
+    assert stats.sample_std == pytest.approx(statistics.stdev(values))
+    single = RunningStats()
+    single.add(5.0)
+    assert single.sample_std == 0.0

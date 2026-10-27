@@ -9,7 +9,7 @@ a human needs to do to verify it.
 import socket
 import struct
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from pirewall.capture.interfaces import CapturedPacket
 from pirewall.core.exceptions import CaptureError
@@ -29,6 +29,19 @@ _PACKET_STATISTICS = 6
 _PACKET_MREQ_FORMAT = "IHH8s"
 # struct tpacket_stats { unsigned int tp_packets, tp_drops; }
 _PACKET_STATS_FORMAT = "II"
+
+# <asm-generic/socket.h>. Not all are exposed by name in the stdlib either.
+# SO_RCVBUFFORCE (needs CAP_NET_ADMIN, which pirewall-core holds) is used in
+# preference to SO_RCVBUF because the latter is silently capped at
+# net.core.rmem_max — 208 KiB on a stock Raspberry Pi OS — so a configured
+# multi-megabyte buffer was quietly ~10x smaller than configured.
+_SO_RCVBUFFORCE = 33
+# SO_TIMESTAMPNS: the kernel attaches each packet's *receive* time as
+# ancillary data (SCM_TIMESTAMPNS == SO_TIMESTAMPNS, a `struct timespec`).
+_SO_TIMESTAMPNS = 35
+_SCM_TIMESTAMPNS = _SO_TIMESTAMPNS
+_TIMESPEC_FORMAT = "qq"  # 64-bit Linux (aarch64/x86_64): time_t + long
+_TIMESPEC_SIZE = struct.calcsize(_TIMESPEC_FORMAT)
 
 
 class AFPacketCapture:
@@ -74,7 +87,8 @@ class AFPacketCapture:
         try:
             sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(_ETH_P_ALL))
             sock.bind((self._interface, 0))
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self._buffer_size_bytes)
+            self._set_receive_buffer(sock)
+            sock.setsockopt(socket.SOL_SOCKET, _SO_TIMESTAMPNS, 1)
             if self._promiscuous:
                 self._enable_promiscuous(sock)
         except OSError as exc:
@@ -83,6 +97,14 @@ class AFPacketCapture:
             ) from exc
         self._socket = sock
         self._running = True
+
+    def _set_receive_buffer(self, sock: socket.socket) -> None:
+        """Request `buffer_size_bytes`, bypassing the `rmem_max` cap when privileged."""
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, _SO_RCVBUFFORCE, self._buffer_size_bytes)
+        except OSError:
+            # Unprivileged (tests, a dev box): fall back to the capped request.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self._buffer_size_bytes)
 
     def _enable_promiscuous(self, sock: socket.socket) -> None:
         try:
@@ -104,21 +126,30 @@ class AFPacketCapture:
     def read_packets(self) -> Iterator[CapturedPacket]:
         """Yield packets until `stop()` closes the socket.
 
+        `captured_at` is the **kernel's** receive timestamp (SO_TIMESTAMPNS),
+        not the moment Python got round to reading the packet. Inter-arrival
+        times are the model's most important features (47% of LightGBM gain,
+        docs/ML_DATA_AUDIT.md), and a userspace clock compresses every gap in
+        a socket backlog down to loop time — exactly under load, when it
+        matters. Falls back to the wall clock only if the kernel supplied no
+        timestamp for a packet.
+
         Raises `CaptureError` on a read failure that isn't simply the
         socket having been closed by a concurrent `stop()`.
         """
         if self._socket is None:
             raise CaptureError("cannot read packets before start() is called")
         sock = self._socket
+        ancillary_size = socket.CMSG_SPACE(_TIMESPEC_SIZE)
         while self._running:
             try:
-                raw = sock.recv(self._snap_len)
+                raw, ancillary, _flags, _address = sock.recvmsg(self._snap_len, ancillary_size)
             except OSError as exc:
                 if not self._running:
                     return
                 raise CaptureError(f"error reading from capture socket: {exc}") from exc
             self._packets_seen += 1
-            yield CapturedPacket(raw=raw, captured_at=datetime.now(UTC))
+            yield CapturedPacket(raw=raw, captured_at=_kernel_timestamp(ancillary))
 
     def record_malformed(self) -> None:
         self._packets_malformed += 1
@@ -160,3 +191,15 @@ class AFPacketCapture:
         _received, dropped_since_last_read = struct.unpack(_PACKET_STATS_FORMAT, raw)
         self._packets_dropped_cumulative += dropped_since_last_read
         return self._packets_dropped_cumulative
+
+
+def _kernel_timestamp(ancillary: list[tuple[int, int, bytes]]) -> datetime:
+    """The SCM_TIMESTAMPNS receive time from `recvmsg` ancillary data, else now()."""
+    for level, kind, data in ancillary:
+        if level == socket.SOL_SOCKET and kind == _SCM_TIMESTAMPNS and len(data) >= _TIMESPEC_SIZE:
+            seconds, nanoseconds = struct.unpack(_TIMESPEC_FORMAT, data[:_TIMESPEC_SIZE])
+            # Integer arithmetic, truncated to whole microseconds — exactly
+            # what the native ring does — rather than a float seconds value,
+            # which cannot hold nanoseconds at today's epoch magnitude.
+            return datetime.fromtimestamp(seconds, UTC) + timedelta(microseconds=nanoseconds // 1_000)
+    return datetime.now(UTC)

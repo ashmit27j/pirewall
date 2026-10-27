@@ -1,0 +1,27 @@
+[package]
+name = "pirewall-native"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "pirewall's packet hot path: AF_PACKET TPACKET_V3 capture, L3/L4 parsing and the flow table"
+publish = false
+
+[lib]
+name = "pirewall_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# abi3-py312: one build runs on every CPython >= 3.12 (the Pi has shipped both
+# 3.12 and 3.13). `extension-module` is enabled only by maturin's build (see
+# pyproject.toml) so that `cargo test` can link the pure-Rust unit tests.
+pyo3 = { version = "0.25", features = ["abi3-py312"] }
+libc = "0.2"
+
+[features]
+extension-module = ["pyo3/extension-module"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"

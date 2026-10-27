@@ -21,7 +21,7 @@ move to a new uplink network.
 |---|---|---|---|
 | 1 | ML models misclassify ordinary browsing as attacks | High | Observed |
 | 2 | Isolation Forest flags benign traffic as anomalous | High | Observed |
-| 3 | Behaviour thresholds still tuned for a quiet network | Medium | Observed |
+| 3 | Behaviour thresholds still tuned for a quiet network | Medium | Partly fixed (2026-10-15) |
 | 4 | Demo portal accounts are live on this deployment | High | Observed |
 | 5 | Enforcement is `assisted` without the recommended SHADOW soak | Medium | Fixed |
 | 6 | Wazuh and Netdata integrations never verified end to end | Medium | Fixed |
@@ -32,13 +32,13 @@ move to a new uplink network.
 | 11 | `AF_PACKET`, `nft` and systemd paths remain partly unverified | Medium | Deferred |
 | 12 | Dashboard JS is checked by a scanner, not a parser | Low | Deferred |
 | 13 | An unmerged branch predates this work | Low | Fixed |
-| 14 | `capture_stats.packets_seen` did not move during a live check | Low | Observed |
+| 14 | `capture_stats.packets_seen` did not move during a live check | Low | Fixed on native path |
 | 15 | `pirewall-api` cannot write its own log file | Low | Observed |
 | 16 | Moving the Pi to a new network silently staleness-rots the config | Medium | Fixed |
 | 17 | `security.session_timeout_seconds` is read by nothing | Low | Observed |
 | 18 | A TLS-only port answers plaintext HTTP with a bare teardown | Low | Observed |
 | 19 | Some tests depend on the host's real network addressing | Low | Observed |
-| 20 | Real floods/scans are detected but never scored above LOW | High | Observed |
+| 20 | Real floods/scans are detected but never scored above LOW | High | Fixed (2026-10-15) |
 | 21 | A flood evicts the bounded history buffers within seconds | Medium | Observed |
 | 22 | Restart button can't be built as `sudo` + sudoers under `NoNewPrivileges` | Low | Blocked |
 
@@ -196,6 +196,37 @@ that baseline-gathering window), and ideally made rate-based per source
 compared against that source's own recent history — the same principle
 just applied to `HIGH_FREQUENCY` above — rather than one absolute constant
 for every deployment.
+
+**Update 2026-10-15 — two root causes found and fixed; the threshold values
+themselves are unchanged.**
+
+1. **`behavior_window_seconds` was read by nothing.** Every per-source
+   counter (`destinations`, `failure_count`, ports, connections per
+   destination) was lifetime state that never decayed, so *any* device that
+   stayed online long enough accumulated its way past DESTINATION_DIVERSITY,
+   REPEATED_CONNECTIONS and REPEATED_FAILURES and stayed flagged until its
+   state was LRU-evicted. `SourceBehaviorState` is now a true sliding
+   window over `behavior_window_seconds` (packet time, so replay and tests
+   behave identically), with every counter decremented exactly as events
+   expire; PERSISTENCE measures an uninterrupted activity streak rather
+   than time since first sight; slow-connection snapshots expire too.
+   **Tested**: `tests/unit/test_behavior_window.py` (decay, an hour-long
+   trickle never crossing a burst threshold, bounded state under a flood).
+2. **REPEATED_FAILURES counted failures to *any* destination.** It now
+   reads the most unanswered attempts against a *single* destination — a
+   SYN flood or filtered-port scan concentrates on its target; a device
+   whose traffic is dropped (e.g. before captive-portal sign-in) fails
+   across dozens of unrelated hosts. Same principle as SCANNING's earlier
+   per-destination fix.
+
+And the *scoring* no longer lets these busy-client patterns add up to an
+action on their own: see #20. A page load firing all four of the table's
+patterns now scores 30 (LOW), and still LOW (45) with a spurious anomaly
+flag on top. Confirmed on real benign traffic, not only by
+construction: `benchmarks/2026-10-15-native-capture/LIVE_AB.md`.
+
+Still open: the absolute threshold values. They should still be set from a
+measured baseline of this network.
 
 ## 4. Demo portal accounts are live on this deployment
 
@@ -497,6 +528,15 @@ isolated this session.
 
 ---
 
+**Update 2026-10-15:** on the native capture path
+(`docs/ARCHITECTURE.md` "Native capture engine") `packets_seen` and
+`packets_malformed` are read live from the engine on every
+`statistics()` call, so the panel no longer lags a tick for those two;
+`packets_dropped` still comes from the kernel's `PACKET_STATISTICS` and is
+read at the same moment. The Python path is unchanged.
+
+---
+
 ## 15. `pirewall-api` cannot write its own log file
 
 **Status: Observed.** From `journalctl -u pirewall-api` on every start:
@@ -718,6 +758,60 @@ so a behavior-only signal with multiple concurrent patterns (as observed
 here — up to six firing at once) can reach RATE_LIMIT on its own, with the
 evidence-maturity gate (ADDENDUM_2.md B3) still guarding against a single
 weak signal doing so alone.
+
+**Fixed 2026-10-15.** Three changes, each tested:
+
+1. **Per-pattern scoring** (`threat.behavior_pattern_points`, capped at
+   `behavior_weight = 80`). The old `25 * patterns / 9` treated "loaded a
+   busy page" and "port scan" as equally diagnostic and capped
+   behavior-only evidence at 25 (+15 anomaly = 40 < `medium_threshold`
+   50) — arithmetic, not tuning, kept every flood at LOW. Points are
+   checked against the attack-lab's own observed pattern sets: the nmap
+   scan (scanning + burst + frequency) = 75 → HIGH → RATE_LIMIT; the floods
+   (scanning + failures + slow-rate) = 80 (capped) → HIGH; one phone loading
+   a page = 30 → LOW (45, still LOW, with a spurious anomaly flag). The cap sits below `critical_threshold`, so behavior
+   alone can RATE_LIMIT but never BLOCK. **Tested**:
+   `tests/unit/test_scoring.py` pins each of those pattern sets.
+2. **Source-level fast path.** Per-flow assessment only happens when a flow
+   *completes* — for half-open SYN-flood connections, at the inactive
+   timeout, 60–90 s in. Now, once new-connection signals push a source's
+   behavior score to MEDIUM+, that source is assessed immediately from a
+   snapshot of its newest open flow, through the normal decision →
+   validation → `FirewallManager` chain (cooldown
+   `detection.source_assessment_cooldown_seconds`). **Tested**:
+   `test_a_scan_is_rate_limited_from_its_open_flows_without_waiting_for_any_to_complete`
+   (both capture paths) — 30 unanswered SYNs produce a HIGH assessment and
+   a RATE_LIMIT decision with zero flows completed.
+3. **No ML on snapshots** (`DetectionCoordinator.analyze_snapshot`): a
+   half-open connection is not the complete-flow shape either model was
+   trained on. This also stopped B2's slow-connection snapshots being
+   counted as failed connections twice (once as a snapshot, again on real
+   completion).
+
+4. **FLOOD pattern** (found by the live A/B replay of real attack
+   traffic, `benchmarks/2026-10-15-native-capture/LIVE_AB.md`). Against a
+   *closed* port every SYN is answered by an RST, so nothing counts as an
+   unanswered attempt and a flood shows only as HIGH_FREQUENCY/BURST —
+   on/off patterns worth 10 points whether the rate is 3/s or 3,000/s. The
+   replay's SYN and UDP floods were never acted on. FLOOD fires at
+   `flood_connections_per_second_threshold` (100/s, over the burst window)
+   new connections from one source to *one* destination: the busiest benign
+   client measured peaked at 39 per 5 s, the floods at 21k–39k. Worth 80
+   points (HIGH → RATE_LIMIT alone; BLOCK still needs corroboration).
+5. **Only connection initiations count as connections.** A flow first seen
+   mid-conversation — a lone RST after its flow already closed, a SYN-ACK
+   whose SYN the capture dropped — used to be attributed to its *responder*
+   as a new connection. In the replay the flood's own victim was
+   rate-limited for "scanning" its attacker (60 stray RSTs to different
+   ports); with 94% capture loss on the Pi this is presumably what made the
+   2026-09-10 attack lab flag the Pi itself. Such flows now carry
+   `Flow.opened_by_initiation = False`, emit no new-flow signal and seed no
+   behavior state (both engines; parity-tested). **Tested**:
+   `tests/unit/test_flow_aggregator.py`, `test_behavior_window.py`.
+
+**Environment-dependent**: re-running the attack lab on the Pi is what
+confirms this against real floods (and, with the native engine, against
+what capture now delivers instead of 6% of the flood).
 
 ## 21. A flood evicts the bounded history buffers within seconds
 

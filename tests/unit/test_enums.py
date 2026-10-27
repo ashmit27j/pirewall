@@ -89,6 +89,7 @@ def test_behavior_pattern_type_values() -> None:
         "temporal_pattern",
         "scanning",
         "slow_rate_dos",
+        "flood",
     }
 
 

@@ -386,3 +386,21 @@ def test_is_routable_unicast_classification() -> None:
     lan = IPv4Network("192.168.100.0/24")
     assert is_routable_unicast(IPv4Address("192.168.100.255")) is True
     assert is_routable_unicast(IPv4Address("192.168.100.255"), lan) is False
+
+
+def test_only_connection_initiations_produce_new_flow_signals() -> None:
+    """A flow first seen at an RST/SYN-ACK is attributed to its responder: no signal for it."""
+    signals: list[NewFlowSignal] = []
+    aggregator = FlowAggregator(FlowConfig(), on_new_flow=signals.append)
+    syn = make_packet(source_port=1000, destination_port=80, tcp_flags=TcpFlags(syn=True))
+    aggregator.process_packet(syn)
+    lone_rst = aggregator.process_packet(
+        make_packet(source_ip="10.0.0.10", destination_ip="10.0.0.5", source_port=80,
+                    destination_port=2000, tcp_flags=TcpFlags(rst=True))
+    )
+    aggregator.process_packet(
+        make_packet(source_ip="10.0.0.10", destination_ip="10.0.0.5", source_port=80,
+                    destination_port=3000, tcp_flags=TcpFlags(syn=True, ack=True))
+    )
+    assert [signal.destination_port for signal in signals] == [80]
+    assert len(lone_rst) == 1 and lone_rst[0].opened_by_initiation is False

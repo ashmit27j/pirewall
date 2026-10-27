@@ -13,6 +13,15 @@ dependencies = [
     "imbalanced-learn>=0.12",
 ]
 
+[project.optional-dependencies]
+# The native packet hot path (native/, Rust via PyO3). Optional: without it
+# pirewall-core runs the pure-Python capture path. Building it needs a Rust
+# toolchain; see docs/ARCHITECTURE.md "Native capture engine".
+native = ["pirewall-native"]
+
+[tool.uv.sources]
+pirewall-native = { path = "native" }
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",

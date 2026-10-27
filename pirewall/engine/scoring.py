@@ -8,7 +8,7 @@ set from measured per-detector reliability rather than an even split:
 
     known-attack (LightGBM)     precision 0.9927, FPR 0.0018  -> weight 60
     anomaly (Isolation Forest)  precision 0.5300, FPR 0.0987  -> weight 15
-    behavior (deterministic)    no labelled ground truth      -> weight 25
+    behavior (deterministic)    per-pattern points, capped    -> cap 80
 
 The anomaly detector is correct roughly half the times it fires, at ~55x
 the classifier's false-positive rate; at 15 it cannot reach
@@ -36,9 +36,13 @@ configured weight:
 * **Anomaly** (`anomaly_weight`): the full weight if `is_anomaly`, else 0 —
   a flat contribution, not scaled by the raw (unbounded, model-specific)
   anomaly score.
-* **Behavior** (`behavior_weight`): `weight * (patterns detected / total
-  possible pattern types)` — more corroborating behavioral signals scale
-  the contribution up linearly.
+* **Behavior** (`behavior_weight`, `behavior_pattern_points`): the sum of
+  each detected pattern's own points, capped at `behavior_weight`. Replaced
+  `weight * patterns / 9`, which treated "loaded a busy web page" and "port
+  scan" as equally diagnostic and capped every behavior-only score far
+  below anything actionable (docs/KNOWN_ISSUES.md #20). The cap sits below
+  `critical_threshold`, so behavior alone can reach RATE_LIMIT but never
+  BLOCK.
 * **Protocol signature** (`protocol_signature_weight`, ADDENDUM_2.md
   B4/B5): `weight * confidence` — same shape as known-attack, but the
   evidence comes from a deterministic TLS structural match
@@ -54,12 +58,9 @@ The four contributions are summed and clamped to `[0, 100]`.
 from dataclasses import dataclass
 
 from pirewall.config.models import ThreatConfig
-from pirewall.core.enums import BehaviorPatternType
 from pirewall.core.models.behavior import BehaviorAssessment
 from pirewall.core.models.evidence import AnomalyEvidence, KnownEvidence, ProtocolSignatureEvidence
 from pirewall.ml.labels import is_attack_label
-
-_TOTAL_PATTERN_TYPES = len(BehaviorPatternType)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,8 +97,9 @@ def score_evidence(
 
     behavior_contribution = 0.0
     if behavior_assessment is not None and behavior_assessment.detected_patterns:
-        behavior_contribution = config.behavior_weight * (
-            len(behavior_assessment.detected_patterns) / _TOTAL_PATTERN_TYPES
+        behavior_contribution = min(
+            config.behavior_weight,
+            sum(config.behavior_pattern_points[pattern] for pattern in behavior_assessment.detected_patterns),
         )
 
     protocol_signature_contribution = 0.0

@@ -1,0 +1,58 @@
+#!/usr/sbin/nft -f
+# pirewall v2: adaptive enforcement sets (PLAN_v1 section 3.1)
+#
+# TEMPLATE. It is not applied automatically. Render it and load the rendered
+# copy by hand, or through pirewall-start.
+#
+# Every set below has exactly ONE writer: pirewall-core FirewallManager, after
+# the full validator chain. Core only ever adds and removes ELEMENTS. It never
+# edits rules. Every element carries a timeout of at most 3600 s, so a block
+# orphaned by a crash expires on its own.
+#
+# Kill switch (A8): flush block_mac, block4 and ratelimit_mac, and switch the
+#   static guards to observe. This table stays loaded.
+# Panic: `nft delete table inet pirewall_adaptive; nft delete table inet pirewall_static`.
+#   pirewall_base and pirewall_portal are left intact.
+#
+# Hooked at prerouting priority -299, i.e. immediately AFTER the static
+# anti-spoof chain (-300) and BEFORE conntrack (-200). A blocked device costs
+# neither conntrack entries nor any later rule evaluation. This covers both
+# the input path (to the Pi) and the forward path (through the Pi).
+
+table inet pirewall_adaptive {
+	set infra4 { type ipv4_addr; flags interval; }
+	chain prerouting_adaptive { type filter hook prerouting priority -299; policy accept; }
+}
+flush chain inet pirewall_adaptive prerouting_adaptive
+# infra4 is rendered from config, so a reload replaces it (no stale entries).
+# Every other set keeps its elements across a reload.
+flush set inet pirewall_adaptive infra4
+
+table inet pirewall_adaptive {
+	counter c_block_mac { }
+	counter c_block4 { }
+	counter c_ratelimit { }
+
+	# Never-target infrastructure: Pi addresses, upstream gateway, Admin PC.
+	# Rendered from config. The validator refuses these too.
+	set infra4 { type ipv4_addr; flags interval; elements = { ${INFRA4_ELEMENTS} }; }
+	# Copy of the A2 allowlist. Written in the same batch as
+	# pirewall_static's allow_bound.
+	set allow_bound { type ether_addr . ipv4_addr; size ${BINDING_SIZE}; }
+
+	set block_mac { type ether_addr; flags timeout; size ${ADAPTIVE_SIZE}; }
+	set block4 { type ipv4_addr; flags timeout; size ${ADAPTIVE_SIZE}; }
+	set ratelimit_mac { type ether_addr; flags timeout; size ${ADAPTIVE_SIZE}; }
+	set rl_meter { type ether_addr; flags dynamic,timeout; timeout 60s; size ${ADAPTIVE_SIZE}; }
+
+	chain prerouting_adaptive {
+		type filter hook prerouting priority -299; policy accept;
+		iifname != "${LAN_INTERFACE}" return
+		meta nfproto != ipv4 return
+		ip saddr @infra4 return
+		ether saddr . ip saddr @allow_bound return
+		ether saddr @block_mac counter name c_block_mac drop
+		ip saddr @block4 counter name c_block4 drop
+		ether saddr @ratelimit_mac add @rl_meter { ether saddr limit rate over ${RATELIMIT_PPS}/second burst ${RATELIMIT_BURST} packets } counter name c_ratelimit drop
+	}
+}

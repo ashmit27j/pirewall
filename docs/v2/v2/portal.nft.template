@@ -1,0 +1,110 @@
+#!/usr/sbin/nft -f
+# pirewall — captive portal gate (ADDENDUM_3.md C1, C2, C4)
+#
+# TEMPLATE — not applied automatically. Render it (see
+# ../network/README.md) and load the rendered copy by hand.
+#
+# A separate table from `pirewall_base` (static posture) and from the
+# `pirewall` table `NftablesBackend` manages at runtime (adaptive rules), so
+# that deleting or reloading any one of the three leaves the others
+# standing, and so a portal bug cannot corrupt the adaptive ruleset.
+#
+# ORDER OF EVALUATION at the `forward` hook — this is the whole design:
+#
+#   this file's `forward` chain     priority -10   (evaluated FIRST)
+#   pirewall's `adaptive` chain     priority 0
+#   pirewall_base's `forward` chain priority 10
+#
+# Portal gating is a *precondition*, not a threat response: an
+# unauthenticated client is rejected outright before anything else runs, and
+# an authenticated one falls through without a verdict so the adaptive chain
+# still gets its say. An authenticated device is not a trusted device.
+#
+# WHAT THIS DOES NOT GATE, deliberately: association, DHCP, DNS, and
+# reaching the portal itself all happen on the `input` hook and are
+# unaffected. Any device can always join the AP and be shown the login page.
+
+# Reloading must be idempotent. `nft -f` *appends* rules to an existing
+# chain rather than replacing them, so without the flushes below every
+# re-run (every `pirewall-start`) stacks another copy of every rule — the
+# chain grows without bound and each packet is matched against the same
+# rules repeatedly.
+#
+# Flushing the chains rather than deleting the table is deliberate: deleting
+# it would take the `authed` set with it and sign every LAN client out on
+# every reload.
+
+# First ensure table, set and chains exist, so the flushes cannot fail on a
+# first load. Redeclaring them is a no-op when they are already there.
+table inet pirewall_portal {
+	set authed {
+		type ipv4_addr . ether_addr
+		flags timeout
+		comment "captive portal: authenticated LAN clients"
+	}
+	chain forward {
+		type filter hook forward priority -10; policy accept;
+	}
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+	}
+}
+
+flush chain inet pirewall_portal forward
+flush chain inet pirewall_portal prerouting
+
+table inet pirewall_portal {
+	chain forward {
+		# Only the protected LAN is gated. Traffic that did not arrive
+		# on the LAN interface is none of this table's business.
+		iifname != "${LAN_INTERFACE}" return
+
+		# Established flows are not re-gated: a session that expires
+		# mid-download stops at the next new connection, not by having
+		# the current one severed. `authed` membership is re-checked for
+		# every *new* connection, which is where gating belongs.
+		ct state established,related return
+
+		ip saddr . ether saddr @authed return
+
+		# Rejected, not dropped. A reject makes the client's captive
+		# portal detection fail immediately and show the sign-in sheet;
+		# a silent drop leaves it retransmitting into a black hole,
+		# which is both a worse user experience and more work for the Pi.
+		reject with icmpx type admin-prohibited
+	}
+
+	chain prerouting {
+		iifname != "${LAN_INTERFACE}" return
+
+		# Already signed in: nothing to intercept.
+		ip saddr . ether saddr @authed return
+
+		# Let an unauthenticated client reach the Pi's own services, so
+		# it can resolve names, renew its lease, and actually load the
+		# page it is being sent to.
+		#
+		# Scoped to those specific ports rather than to the Pi's address
+		# as a whole. A blanket `ip daddr ${PIREWALL_LAN_IP} return`
+		# also exempts port 80 — and port 80 on the Pi is exactly what
+		# DHCP option 114 advertises (`http://${PIREWALL_LAN_IP}/portal`).
+		# Nothing listens on 80, so that URL would reach no DNAT, fall
+		# through to the base ruleset's `policy drop`, and hang: the
+		# primary discovery path for every modern client, dead.
+		ip daddr ${PIREWALL_LAN_IP} udp dport { 53, 67 } return
+		ip daddr ${PIREWALL_LAN_IP} tcp dport 53 return
+		ip daddr ${PIREWALL_LAN_IP} tcp dport ${PORTAL_PORT} return
+
+		# Everything else on port 80 lands on the portal, whatever URL
+		# was asked for and whoever it was addressed to — including the
+		# Pi itself. The portal answers every path with a redirect to
+		# /portal for exactly this reason.
+		#
+		# Port 443 is deliberately NOT redirected: intercepting TLS
+		# would present a certificate for the wrong name and produce a
+		# security warning instead of a sign-in page. Unauthenticated
+		# HTTPS is rejected by the forward chain above, which is what
+		# makes OS captive-portal detection fire.
+		tcp dport 80 redirect to :${PORTAL_PORT}
+	}
+}

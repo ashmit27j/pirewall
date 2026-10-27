@@ -1,0 +1,97 @@
+#!/usr/sbin/nft -f
+# pirewall v2 kernel data plane — DRAFT, parse-verified with nft 1.0.9 in a netns.
+# Bookworm ships nft 1.0.6 / kernel 6.6+ (Pi kernel 6.6/6.12): every construct below
+# exists since nft <=1.0.2 / kernel 5.x, but MUST be re-checked with `nft -c -f` on the Pi.
+#
+# Placement vs existing tables (all inet):
+#   pirewall_v2 prerouting  raw (-300)  anti-spoof + stateless flood meters, BEFORE conntrack
+#   pirewall_portal forward       -10   portal gate (unchanged)
+#   pirewall_v2 forward/input      -5   adaptive block/ratelimit sets (replaces `pirewall` adaptive chain)
+#   pirewall_base input 0 / forward 10   static posture, policy drop (unchanged)
+# A `drop` in any table is final; an `accept` only ends that table's chain.
+
+define LAN_IF = "wlan0"
+
+# Enforcement switch for the kernel meters. nft cannot put a verdict in a
+# `define` (Verified: "syntax error, unexpected drop"), so every meter hit does
+# `jump meter_verdict`. ACTIVE/ASSISTED: that chain holds `drop`. SHADOW: it is
+# empty, the jump returns, the hit is only counted + exported via @offenders.
+# pirewall-core flips modes at runtime with one atomic batch:
+#   flush chain inet pirewall_v2 meter_verdict ; add rule inet pirewall_v2 meter_verdict drop
+
+# Reload idiom (same as portal.nft.template): declare, then flush CHAINS only.
+# Never `delete table` on reload: it would wipe block/ratelimit/macbind elements.
+table inet pirewall_v2 {
+	chain prerouting_raw { type filter hook prerouting priority raw; policy accept; }
+	chain adaptive { }
+	chain meter_verdict { }
+	chain input { type filter hook input priority -5; policy accept; }
+	chain forward { type filter hook forward priority -5; policy accept; }
+}
+flush chain inet pirewall_v2 prerouting_raw
+flush chain inet pirewall_v2 adaptive
+flush chain inet pirewall_v2 meter_verdict
+flush chain inet pirewall_v2 input
+flush chain inet pirewall_v2 forward
+
+table inet pirewall_v2 {
+	# --- populated by pirewall-core (set elements only, never rules) ---
+	set allow_mac   { type ether_addr; comment "A2 allowlist (LAN devices)"; }
+	set allow4      { type ipv4_addr; flags interval; comment "A2 allowlist + Pi + gateway + admin"; }
+	set block_mac   { type ether_addr; flags timeout; size 4096; }
+	set ratelimit_mac { type ether_addr; flags timeout; size 4096; }
+	set block4      { type ipv4_addr; flags timeout; size 4096; }
+	# DHCP binding: populated from dnsmasq leases (dhcp-script -> core RPC)
+	set bound4      { type ipv4_addr; flags timeout; size 1024; }
+	set macbind     { type ipv4_addr . ether_addr; flags timeout; size 1024; }
+
+	# --- kernel-maintained dynamic sets (per-element token buckets) ---
+	set syn_meter   { type ether_addr; flags dynamic,timeout; timeout 60s; size 8192; }
+	set udp_meter   { type ether_addr; flags dynamic,timeout; timeout 60s; size 8192; }
+	set icmp_meter  { type ether_addr; flags dynamic,timeout; timeout 60s; size 8192; }
+	set dns_meter   { type ether_addr; flags dynamic,timeout; timeout 60s; size 8192; }
+	set dhcp_meter  { type ether_addr; flags dynamic,timeout; timeout 600s; size 8192; }
+	set rl_meter    { type ether_addr; flags dynamic,timeout; timeout 60s; size 8192; }
+	# exported evidence: core polls this (nft -j list set) every 1s
+	set offenders   { type ether_addr . inet_service; flags dynamic,timeout; timeout 120s; size 8192; }
+
+	chain prerouting_raw {
+		type filter hook prerouting priority raw; policy accept;
+		iifname != $LAN_IF return
+		# A5: v1/v2 adaptive pipeline is IPv4-only -> no unanalysed IPv6 from LAN
+		meta nfproto ipv6 counter drop
+		# DHCP: brake starvation (chaddr is client-chosen; NM shared mode caps leases at 50), then allow unconfigured clients
+		udp sport 68 udp dport 67 add @dhcp_meter { ether saddr limit rate over 10/minute burst 5 packets } update @offenders { ether saddr . 67 } counter jump meter_verdict
+		ip saddr 0.0.0.0 udp sport 68 udp dport 67 accept
+		# anti-spoof: a bound IP may only be used by its bound MAC
+		ip saddr @bound4 ip saddr . ether saddr != @macbind counter drop
+		ether saddr @allow_mac return
+		# stateless flood meters keyed on MAC (Wi-Fi SA is bound to the station's PTK)
+		tcp flags & (syn | ack) == syn add @syn_meter { ether saddr limit rate over 200/second burst 400 packets } update @offenders { ether saddr . 1 } counter jump meter_verdict
+		meta l4proto udp add @udp_meter { ether saddr limit rate over 3000/second burst 6000 packets } update @offenders { ether saddr . 2 } counter jump meter_verdict
+		# DNS to the Pi itself (the v1 UDP-flood target) gets a much tighter bucket
+		udp dport 53 add @dns_meter { ether saddr limit rate over 100/second burst 200 packets } update @offenders { ether saddr . 53 } counter jump meter_verdict
+		meta l4proto icmp add @icmp_meter { ether saddr limit rate over 50/second burst 100 packets } update @offenders { ether saddr . 3 } counter jump meter_verdict
+	}
+
+	chain meter_verdict {
+		drop
+	}
+
+	chain adaptive {
+		ether saddr @allow_mac return
+		ip saddr @allow4 return
+		ether saddr @block_mac counter drop
+		ip saddr @block4 counter drop
+		ether saddr @ratelimit_mac add @rl_meter { ether saddr limit rate over 20/second burst 40 packets } counter drop
+	}
+
+	chain input {
+		type filter hook input priority -5; policy accept;
+		iifname $LAN_IF jump adaptive
+	}
+	chain forward {
+		type filter hook forward priority -5; policy accept;
+		iifname $LAN_IF jump adaptive
+	}
+}

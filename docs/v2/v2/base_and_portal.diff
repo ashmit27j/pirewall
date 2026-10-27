@@ -1,0 +1,47 @@
+--- /home/claude/pirewall/deploy/firewall/base.nft.template	2026-10-27 15:55:51.532722168 +0000
++++ base.nft.template	2026-10-27 16:24:35.660035132 +0000
+@@ -76,12 +76,12 @@
+ 		# "Network exposure", §29, ADDENDUM.md — the control
+ 		# panel/API must not be reachable from the WAN or from other
+ 		# LAN clients, only from admin.admin_pc_ip).
+-		ip saddr ${ADMIN_PC_IP} tcp dport { 22, ${API_PORT} } accept
++		iifname "${ADMIN_INTERFACE}" ether saddr ${ADMIN_PC_MAC} ip saddr ${ADMIN_PC_IP} tcp dport { 22, ${API_PORT} } accept
+ 
+ 		# DNS for LAN clients. Safe to match on source address: a
+ 		# resolver query always comes from a leased address.
+-		ip saddr ${PROTECTED_NETWORK} udp dport 53 accept
+-		ip saddr ${PROTECTED_NETWORK} tcp dport 53 accept
++		iifname "${LAN_INTERFACE}" ip saddr ${PROTECTED_NETWORK} udp dport 53 accept
++		iifname "${LAN_INTERFACE}" ip saddr ${PROTECTED_NETWORK} tcp dport 53 accept
+ 
+ 		# DHCP *server* side, matched on interface rather than source
+ 		# address. A DHCPDISCOVER is sent from 0.0.0.0 before the client
+--- /home/claude/pirewall/deploy/firewall/portal.nft.template	2026-10-27 15:55:51.532722168 +0000
++++ portal.nft.template	2026-10-27 16:24:35.660486004 +0000
+@@ -38,7 +38,7 @@
+ # first load. Redeclaring them is a no-op when they are already there.
+ table inet pirewall_portal {
+ 	set authed {
+-		type ipv4_addr
++		type ipv4_addr . ether_addr
+ 		flags timeout
+ 		comment "captive portal: authenticated LAN clients"
+ 	}
+@@ -65,7 +65,7 @@
+ 		# every *new* connection, which is where gating belongs.
+ 		ct state established,related return
+ 
+-		ip saddr @authed return
++		ip saddr . ether saddr @authed return
+ 
+ 		# Rejected, not dropped. A reject makes the client's captive
+ 		# portal detection fail immediately and show the sign-in sheet;
+@@ -78,7 +78,7 @@
+ 		iifname != "${LAN_INTERFACE}" return
+ 
+ 		# Already signed in: nothing to intercept.
+-		ip saddr @authed return
++		ip saddr . ether saddr @authed return
+ 
+ 		# Let an unauthenticated client reach the Pi's own services, so
+ 		# it can resolve names, renew its lease, and actually load the

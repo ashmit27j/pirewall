@@ -1,0 +1,299 @@
+[
+ {
+  "id": "1a",
+  "name": "SYN flood -> Pi",
+  "pass": true,
+  "evidence": {
+   "sent": 30000,
+   "reached_router": 1318,
+   "dropped_verdict_raw": 28635,
+   "offender_codes": [
+    1,
+    8080
+   ],
+   "legit_portal_ok, legit_wan_ok": [
+    true,
+    true
+   ]
+  }
+ },
+ {
+  "id": "1b",
+  "name": "SYN flood -> WAN victim",
+  "pass": true,
+  "evidence": {
+   "sent": 30000,
+   "reached_victim_fwd": 341,
+   "offender_codes": [
+    1,
+    6,
+    7
+   ],
+   "legit_ok": [
+    true
+   ]
+  }
+ },
+ {
+  "id": "1c",
+  "name": "UDP flood -> WAN victim",
+  "pass": true,
+  "evidence": {
+   "sent": 30000,
+   "victim_received": 14291,
+   "offender_codes": [
+    8
+   ],
+   "dropped_verdict_forward": 15709,
+   "legit_ok": [
+    true
+   ]
+  }
+ },
+ {
+  "id": "1d",
+  "name": "ICMP flood -> Pi + victim",
+  "pass": true,
+  "evidence": {
+   "sent": 30000,
+   "dropped_verdict_raw": 29606,
+   "offender_codes": [
+    3
+   ],
+   "legit_ping_ok": true
+  }
+ },
+ {
+  "id": "2",
+  "name": "--rand-source flood",
+  "pass": true,
+  "evidence": {
+   "rand_source_sent": 20000,
+   "c_bogon": 20000,
+   "c_rpf": 0,
+   "reached_router": 0,
+   "in_subnet_scapy_sent": 3000,
+   "c_spoof_after": 23,
+   "c_verdict_raw": 2811,
+   "unbound_seen_entries": 250,
+   "syn_meter_keys": 1
+  }
+ },
+ {
+  "id": "3a",
+  "name": "spoof bound neighbour IP",
+  "pass": true,
+  "evidence": {
+   "sent": 2000,
+   "c_spoof": 2000,
+   "reached_router": 0,
+   "legit_mac_in_sets": []
+  }
+ },
+ {
+  "id": "3b",
+  "name": "ARP spoof of bound IP",
+  "pass": true,
+  "evidence": {
+   "c_arp_spoof": 20,
+   "router_neigh_for_legit": "192.168.100.10 dev lan0 lladdr 02:00:00:00:00:10 REACHABLE"
+  }
+ },
+ {
+  "id": "4",
+  "name": "allowlisted device unmetered; its IP unspoofable",
+  "pass": true,
+  "evidence": {
+   "allowlisted_sent": 20000,
+   "reached_router": 20000,
+   "allowlisted_mac_in_sets": [],
+   "spoof_allowlisted_ip_dropped": 2000
+  }
+ },
+ {
+  "id": "5",
+  "name": "admin path survives flood; LAN cannot spoof admin",
+  "pass": true,
+  "evidence": {
+   "admin_ok_during_flood": [
+    true,
+    true
+   ],
+   "spoof_admin_dropped_c_bogon": 1000,
+   "api8443_reached_from_lan": 0,
+   "lan_with_own_ip_reaches_api": false
+  }
+ },
+ {
+  "id": "6",
+  "name": "observe/enforce flip (atomic batch)",
+  "pass": true,
+  "evidence": {
+   "observe_reached": 10000,
+   "observe_offenders": [
+    1,
+    4,
+    8080
+   ],
+   "enforce_reached": 447,
+   "rules_in_verdict_chain": [
+    1,
+    1
+   ]
+  }
+ },
+ {
+  "id": "7",
+  "name": "kill switch and panic",
+  "pass": true,
+  "evidence": {
+   "blocked_before": true,
+   "c_block_mac": 3,
+   "ratelimit_ping_summary": [
+    "500 packets transmitted, 151 received, 69.8% packet loss, time 5595ms",
+    "rtt min/avg/max/mdev = 0.006/0.078/0.707/0.066 ms, ipg/ewma 11.213/0.090 ms"
+   ],
+   "attacker_ok_after_kill": true,
+   "tables_after_kill": [
+    "table",
+    "ip",
+    "nat_shared",
+    "table",
+    "inet",
+    "pirewall_base",
+    "table",
+    "inet",
+    "pirewall_static",
+    "table",
+    "arp",
+    "pirewall_static_arp",
+    "table",
+    "inet",
+    "pirewall_adaptive",
+    "table",
+    "inet",
+    "obs"
+   ],
+   "tables_after_panic": [
+    "table",
+    "ip",
+    "nat_shared",
+    "table",
+    "inet",
+    "pirewall_base",
+    "table",
+    "inet",
+    "obs"
+   ],
+   "legit_ok_after_panic": true,
+   "base_still_blocks_lan_to_api": true
+  }
+ },
+ {
+  "id": "8",
+  "name": "template reload x2 idempotent",
+  "pass": true,
+  "evidence": {
+   "elements_before": {
+    "bound4": 3,
+    "macbind": 3,
+    "allow_bound": 1,
+    "offenders": 2,
+    "block_mac": 1,
+    "infra4": 4
+   },
+   "elements_after": {
+    "bound4": 3,
+    "macbind": 3,
+    "allow_bound": 1,
+    "offenders": 2,
+    "block_mac": 1,
+    "infra4": 4
+   },
+   "rules_same": true
+  }
+ },
+ {
+  "id": "9",
+  "name": "established-flow UDP flood to responding :53",
+  "pass": true,
+  "evidence": {
+   "sent": 30000,
+   "service_received": 787,
+   "offender_codes": [
+    2,
+    53
+   ],
+   "conntrack_entry": "udp      17 29 src=192.168.100.20 dst=192.168.100.1 sport=40053 dport=53 src=192.168.100.1 dst=192.168.100.20 sport=53 dport=40053 mark=0 use=1",
+   "legit_dns_ok": true
+  }
+ },
+ {
+  "id": "10a",
+  "name": "IPv4 fragments from LAN dropped (pre-defrag chain at -450)",
+  "pass": true,
+  "evidence": {
+   "frag_ping_rc": 1,
+   "c_frag": 9,
+   "small_ping_ok": true
+  }
+ },
+ {
+  "id": "10b",
+  "name": "IPv6 from LAN dropped",
+  "pass": false,
+  "evidence": {
+   "status": "NOT TESTABLE HERE: sandbox kernel has no IPv6 stack (/proc/sys/net/ipv6 missing), so the inet hooks never see IPv6. The rule parses and loads; verify on the Pi.",
+   "c_ipv6": 0
+  }
+ },
+ {
+  "id": "11",
+  "name": "meter fill -> global backstop",
+  "pass": true,
+  "evidence": {
+   "distinct_macs_sent": 6000,
+   "meter_size": 64,
+   "meter_keys": {
+    "unbound_meter": 64,
+    "syn_meter": 64,
+    "pps_meter": 64
+   },
+   "c_bk_unbound": 4555,
+   "c_bk_syn": 0,
+   "reached_router": 1445
+  }
+ },
+ {
+  "id": "12",
+  "name": "DNS/DoT to WAN not via Pi blocked",
+  "pass": true,
+  "evidence": {
+   "victim_udp53_received": 0,
+   "victim_tcp853_accepts": 0,
+   "dot_connect_rc": 124,
+   "c_dns_bypass": 23,
+   "dns_via_pi_ok": true
+  }
+ },
+ {
+  "id": "13",
+  "name": "DHCP discover from 0.0.0.0 passes; per-MAC brake",
+  "pass": true,
+  "evidence": {
+   "first_client_discovers_reached": 3,
+   "burst_40_reached": 5,
+   "offender_codes_burst_mac": [
+    67
+   ]
+  }
+ },
+ {
+  "id": "3c",
+  "name": "legit MAC never entered any meter/offender set across all tests (t7 excluded)",
+  "pass": true,
+  "evidence": {
+   "legit_hits_per_test": []
+  }
+ }
+]

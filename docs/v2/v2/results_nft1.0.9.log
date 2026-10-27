@@ -1,0 +1,20 @@
+[PASS] 1a SYN flood -> Pi: {"sent": 30000, "reached_router": 1318, "dropped_verdict_raw": 28635, "offender_codes": [1, 8080], "legit_portal_ok, legit_wan_ok": [true, true]}
+[PASS] 1b SYN flood -> WAN victim: {"sent": 30000, "reached_victim_fwd": 341, "offender_codes": [1, 6, 7], "legit_ok": [true]}
+[PASS] 1c UDP flood -> WAN victim: {"sent": 30000, "victim_received": 14291, "offender_codes": [8], "dropped_verdict_forward": 15709, "legit_ok": [true]}
+[PASS] 1d ICMP flood -> Pi + victim: {"sent": 30000, "dropped_verdict_raw": 29606, "offender_codes": [3], "legit_ping_ok": true}
+[PASS] 2 --rand-source flood: {"rand_source_sent": 20000, "c_bogon": 20000, "c_rpf": 0, "reached_router": 0, "in_subnet_scapy_sent": 3000, "c_spoof_after": 23, "c_verdict_raw": 2811, "unbound_seen_entries": 250, "syn_meter_keys": 1}
+[PASS] 3a spoof bound neighbour IP: {"sent": 2000, "c_spoof": 2000, "reached_router": 0, "legit_mac_in_sets": []}
+[PASS] 3b ARP spoof of bound IP: {"c_arp_spoof": 20, "router_neigh_for_legit": "192.168.100.10 dev lan0 lladdr 02:00:00:00:00:10 REACHABLE"}
+[PASS] 4 allowlisted device unmetered; its IP unspoofable: {"allowlisted_sent": 20000, "reached_router": 20000, "allowlisted_mac_in_sets": [], "spoof_allowlisted_ip_dropped": 2000}
+[PASS] 5 admin path survives flood; LAN cannot spoof admin: {"admin_ok_during_flood": [true, true], "spoof_admin_dropped_c_bogon": 1000, "api8443_reached_from_lan": 0, "lan_with_own_ip_reaches_api": false}
+[PASS] 6 observe/enforce flip (atomic batch): {"observe_reached": 10000, "observe_offenders": [1, 4, 8080], "enforce_reached": 447, "rules_in_verdict_chain": [1, 1]}
+[PASS] 7 kill switch and panic: {"blocked_before": true, "c_block_mac": 3, "ratelimit_ping_summary": ["500 packets transmitted, 151 received, 69.8% packet loss, time 5595ms", "rtt min/avg/max/mdev = 0.006/0.078/0.707/0.066 ms, ipg/ewma 11.213/0.090 ms"], "attacker_ok_after_kill": true, "tables_after_kill": ["table", "ip", "nat_shared", "table", "inet", "pirewall_base", "table", "inet", "pirewall_static", "table", "arp", "pirewall_static_arp", "table", "inet", "pirewall_adaptive", "table", "inet", "obs"], "tables_after_panic": ["table", "ip", "nat_shared", "table", "inet", "pirewall_base", "table", "inet", "obs"], "legit_ok_after_panic": true, "base_still_blocks_lan_to_api": true}
+[PASS] 8 template reload x2 idempotent: {"elements_before": {"bound4": 3, "macbind": 3, "allow_bound": 1, "offenders": 2, "block_mac": 1, "infra4": 4}, "elements_after": {"bound4": 3, "macbind": 3, "allow_bound": 1, "offenders": 2, "block_mac": 1, "infra4": 4}, "rules_same": true}
+[PASS] 9 established-flow UDP flood to responding :53: {"sent": 30000, "service_received": 787, "offender_codes": [2, 53], "conntrack_entry": "udp      17 29 src=192.168.100.20 dst=192.168.100.1 sport=40053 dport=53 src=192.168.100.1 dst=192.168.100.20 sport=53 dport=40053 mark=0 use=1", "legit_dns_ok": true}
+[PASS] 10a IPv4 fragments from LAN dropped (pre-defrag chain at -450): {"frag_ping_rc": 1, "c_frag": 9, "small_ping_ok": true}
+[FAIL] 10b IPv6 from LAN dropped: {"status": "NOT TESTABLE HERE: sandbox kernel has no IPv6 stack (/proc/sys/net/ipv6 missing), so the inet hooks never see IPv6. The rule parses and loads; verify on the Pi.", "c_ipv6": 0}
+[PASS] 11 meter fill -> global backstop: {"distinct_macs_sent": 6000, "meter_size": 64, "meter_keys": {"unbound_meter": 64, "syn_meter": 64, "pps_meter": 64}, "c_bk_unbound": 4555, "c_bk_syn": 0, "reached_router": 1445}
+[PASS] 12 DNS/DoT to WAN not via Pi blocked: {"victim_udp53_received": 0, "victim_tcp853_accepts": 0, "dot_connect_rc": 124, "c_dns_bypass": 23, "dns_via_pi_ok": true}
+[PASS] 13 DHCP discover from 0.0.0.0 passes; per-MAC brake: {"first_client_discovers_reached": 3, "burst_40_reached": 5, "offender_codes_burst_mac": [67]}
+[PASS] 3c legit MAC never entered any meter/offender set across all tests (t7 excluded): {"legit_hits_per_test": []}
+18/19 passed

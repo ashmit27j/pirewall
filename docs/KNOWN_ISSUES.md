@@ -12,7 +12,7 @@ deliberate choice with a stated reason, not an oversight.
 
 Last reviewed: **2026-09-10**, after the first real client session and the
 move to a new uplink network. Items 1, 2 and 23 updated 2026-10-28 (v2
-phase 14b).
+phase 14b). Items 12, 18, 19 and 21 updated 2026-10-28 (final pass).
 
 ---
 
@@ -31,16 +31,16 @@ phase 14b).
 | 9 | `make_certs.sh` writes only one SAN | Low | Fixed (2026-10-28) |
 | 10 | Runtime allowlist additions are not persisted | Medium | Fixed |
 | 11 | `AF_PACKET`, `nft` and systemd paths remain partly unverified | Medium | Deferred |
-| 12 | Dashboard JS is checked by a scanner, not a parser | Low | Deferred |
+| 12 | Dashboard JS is checked by a scanner, not a parser | Low | Fixed where `node` is on PATH (2026-10-28) |
 | 13 | An unmerged branch predates this work | Low | Fixed |
 | 14 | `capture_stats.packets_seen` did not move during a live check | Low | Fixed on native path |
 | 15 | `pirewall-api` cannot write its own log file | Low | Fixed (2026-10-28) |
 | 16 | Moving the Pi to a new network silently staleness-rots the config | Medium | Fixed |
 | 17 | `security.session_timeout_seconds` is read by nothing | Low | Fixed (2026-10-28) |
-| 18 | A TLS-only port answers plaintext HTTP with a bare teardown | Low | Observed |
-| 19 | Some tests depend on the host's real network addressing | Low | Observed |
+| 18 | A TLS-only port answers plaintext HTTP with a bare teardown | Low | Observed; documented (2026-10-28) |
+| 19 | Some tests depend on the host's real network addressing | Low | Fixed (2026-10-28) |
 | 20 | Real floods/scans are detected but never scored above LOW | High | Fixed (2026-10-15) |
-| 21 | A flood evicts the bounded history buffers within seconds | Medium | Observed |
+| 21 | A flood evicts the bounded history buffers within seconds | Medium | Fixed for single-source floods (2026-10-28); spoofed-source floods still evict |
 | 22 | Restart button can't be built as `sudo` + sudoers under `NoNewPrivileges` | Low | Blocked |
 | 23 | Identity keyed on source IP; blocking weaponisable by spoofing (audit #12, #16) | High | Fixed in code (2026-10-28); kernel half live with phase 16; Pi `ether saddr` Environment-dependent |
 
@@ -515,6 +515,14 @@ project emits. It is not a substitute for a real parse. If `node` is ever
 available on a CI host, `node --check` on the emitted block is strictly
 better and should replace the scanner.
 
+**Update 2026-10-28: fixed where `node` is available.**
+`test_every_script_block_parses_under_a_real_javascript_engine` writes
+every emitted `<script>` block to a file and runs `node --check` on it.
+node is a host tool, not a project dependency, so the test skips when node
+is not on PATH. The scanner stays as the floor everywhere. **Tested** on
+the Windows dev host (node 22.14.0: all three pages parse). The WSL suite
+has no node, so it skips there.
+
 ## 13. An unmerged branch predates this work
 
 **Status: Fixed (2026-09-10).** `fix/ap-uplink-and-detection-false-positives`
@@ -756,6 +764,14 @@ should give the panel URL with an explicit `https://` every time it appears,
 and this symptom belongs in a troubleshooting section so the next person
 recognises it in one step instead of thirty.
 
+**Update 2026-10-28: documented.** Every panel URL in `docs/SETUP.md` and
+`setup-new-network.md` already carried `https://`. `docs/SETUP.md`'s
+troubleshooting table now has a row for this symptom, with the `curl -v`
+that tells the two causes apart, and `setup-new-network.md` §8.2 says to
+type the scheme and why. The server behaviour is unchanged, deliberately:
+a second, plain-HTTP listener on the management interface is not worth the
+attack surface.
+
 ---
 
 ## 19. Tests that submit a candidate rule without pinning `local_addresses` depend on the host's real addressing
@@ -795,6 +811,16 @@ way `validate_candidate_rule` already has, so tests can pin
 touches `FirewallManager`'s public signature and the only concrete failure
 found was one test, fixed at the point of failure. Worth doing before this
 bites again.
+
+**Update 2026-10-28: fixed.** `FirewallManager` takes an optional,
+keyword-only `local_addresses: LocalAddresses | None`, passed to the safety
+stage on both the v1 rule path and the v2 set path. `None`, which is what
+`pirewall-core` passes, still reads the kernel's table. **Tested**:
+`tests/unit/test_manager_local_addresses.py` makes the kernel view and the
+pinned view disagree in both directions, on both paths, and the pinned view
+wins every time. The older suites' `monkeypatch` of
+`validator.cached_local_addresses` still works, and new tests should prefer
+the constructor argument.
 
 ## 20. Real floods/scans are detected but never scored above LOW
 
@@ -934,6 +960,29 @@ secrets-adjacent data would live, so not undertaken lightly), or raising
 the cap (only delays the same problem at a larger flood size). Not
 attempted this session; recorded here because it was directly observed,
 not merely theorized.
+
+**Update 2026-10-28: fixed for the observed case.** The flow, detection
+and threat buffers are now `pirewall.ipc.history.FairShareHistory`, keyed
+by source IP, instead of a plain `deque`. The bound is unchanged. When the
+buffer is full, the entry evicted is the oldest one from whichever source
+holds the most entries. A single-source flood therefore pushes out only
+its own older records once it is the largest holder, and the port-scan
+records from before it survive. **Tested**:
+`tests/unit/test_fair_share_history.py`, including 40 scan records
+surviving a 10,000-record flood into a 500-entry buffer, and
+`CoreStateStore` keeping a scanner's detections and threats through a
+5,000-record flood. With one source, or with equal shares, eviction is
+oldest-first as before, so `tests/security/test_resource_exhaustion.py` is
+unchanged.
+
+**Still open.** A flood that spoofs a fresh source address per packet
+gives every source one entry, so eviction degrades to oldest-first and the
+earlier records still go. The Wazuh copy (#6) is the only cover for that
+case. Decisions and events remain plain oldest-first deques: a decision
+carries no source, and events are low-volume. Not verified on the Pi
+(**Environment-dependent**): rerunning the 2026-09-10 attack-lab scan →
+flood sequence and checking `list_threats` for the scan's records would
+confirm it.
 
 ## 22. A "restart pirewall" control-panel button cannot be built as `sudo` + a sudoers grant
 

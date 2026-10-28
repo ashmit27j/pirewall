@@ -14,12 +14,15 @@ and a raw newline inside a JavaScript string literal is a syntax error. The
 fix is to write `\\\\n`; these tests are what makes the mistake loud instead
 of silent.
 
-There is no JS engine available in this environment, so rather than shell out
-to one that may not exist, this scans the emitted script for the specific
-structural faults that break a whole block.
+The scanner below needs no JS engine, so it runs everywhere and looks for the
+specific structural faults that break a whole block. Where `node` is on PATH,
+the last test also runs a real parse over every block.
 """
 
+import shutil
+import subprocess
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -255,3 +258,21 @@ def test_every_control_attribute_the_markup_emits_has_a_handler() -> None:
     assert emitted, "expected the dashboard to emit control attributes"
     for attribute in emitted:
         assert f'button[data-{attribute}]' in script, f"markup emits data-{attribute} with no handler"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not on PATH; the scanner above still runs")
+@pytest.mark.parametrize("page", PAGE_NAMES)
+def test_every_script_block_parses_under_a_real_javascript_engine(page: str, tmp_path: Path) -> None:
+    """`node --check` is a real parse, strictly better than the scanner (KNOWN_ISSUES.md #12).
+
+    node is a host tool here, not a project dependency: the test runs when a
+    developer or CI host has it and skips otherwise, so the scanner stays
+    the floor everywhere.
+    """
+    node = shutil.which("node")
+    assert node is not None
+    for number, script in enumerate(_scripts(_page(page))):
+        source = tmp_path / f"{page}-{number}.js"
+        source.write_text(script, encoding="utf-8")
+        checked = subprocess.run([node, "--check", str(source)], capture_output=True, text=True, check=False)
+        assert checked.returncode == 0, f"{page} block {number}: {checked.stderr}"

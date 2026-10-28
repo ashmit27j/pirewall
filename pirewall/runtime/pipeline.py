@@ -265,7 +265,7 @@ class FlowPipeline:
         decision = decide(assessment, now, self._maturity_tracker)
 
         with self._lock:
-            self._state.record_detection(outcome.record)
+            self._state.record_detection(outcome.record, flow.source_ip)
             self._state.record_threat(assessment)
             self._state.record_decision(decision)
         self._counters.add(detections=1)

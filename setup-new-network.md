@@ -428,6 +428,11 @@ https://192.168.101.1:8443/control-panel        # Layout B
 https://192.168.100.1:8443/control-panel        # Layout A
 ```
 
+Type the `https://`. Without a scheme the browser sends plain HTTP to this
+TLS-only port, and the Pi closes the connection without a reply. Firefox
+calls that "the connection was reset", which looks exactly like a firewall
+drop. It isn't one, and nothing reaches the access log (KNOWN_ISSUES.md #18).
+
 The certificate is self-signed, so the browser warns once. Accept and pin
 it. If the browser refuses outright rather than warning, the certificate has
 no matching SAN — regenerate it per §5.2.

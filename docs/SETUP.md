@@ -749,6 +749,7 @@ HTTP would make one stolen session equivalent to owning the firewall
 | `pirewall-core` won't start | `journalctl -u pirewall-core -n 50`, then `--check-config`. |
 | `pirewall-api` won't start | Almost always TLS material or a `CHANGE_ME` credential — `--check-config` names the exact problem. |
 | Control panel says "core unreachable" | `pirewall-core` is down or the socket is missing. That page is expected behaviour, not a crash (ADDENDUM.md A6) — `systemctl status pirewall-core`. |
+| Browser says "the connection was reset" on `:8443`, and the access log shows nothing | You typed the address without a scheme, so the browser sent plain HTTP to a TLS-only port and uvicorn closed it without a reply (KNOWN_ISSUES.md #18). Type `https://` explicitly. Same symptom when the client cannot do `security.min_tls_version`: `curl -v --insecure https://<pi>:8443/api/v1/health` shows which. Nothing is wrong with nftables. |
 | 403 from the Admin PC | `admin.admin_pc_ip` doesn't match the address you're connecting from. Check with `ip -j neigh show` on the Pi, then `--set-admin-pc`. |
 | `capture_error` at startup | `capture.interface` is wrong or `CAP_NET_RAW` is missing. Compare against `--detect`. |
 | LAN clients get no DHCP lease | The base ruleset must accept DHCP by *interface* (`iifname "<lan>" udp dport 67`), not by source address — a DISCOVER comes from `0.0.0.0`. Re-render the template if yours predates that fix. |

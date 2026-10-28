@@ -1,6 +1,7 @@
 """pirewall-api endpoints, end to end via `TestHarness` (spec §28, §29, ADDENDUM.md A2/A7/A8)."""
 
 from datetime import UTC, datetime
+from ipaddress import IPv4Address
 
 from fastapi.routing import APIRoute
 
@@ -294,7 +295,9 @@ def test_dashboard_renders_network_statistics_and_detections() -> None:
     harness.state.record_capture_stats(
         CaptureStatistics(interface="eth0", packets_seen=42, packets_dropped=1, packets_malformed=0)
     )
-    harness.state.record_detection(DetectionRecord(flow_id="flow-1", recorded_at=NOW))
+    harness.state.record_detection(
+        DetectionRecord(flow_id="flow-1", recorded_at=NOW), IPv4Address("203.0.113.5")
+    )
 
     panel_response = harness.get("/control-panel", headers=auth_headers(token))
 

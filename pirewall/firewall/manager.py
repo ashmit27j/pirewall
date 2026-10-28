@@ -75,6 +75,7 @@ from pirewall.core.models.rule import CandidateRule, FirewallRule
 from pirewall.firewall.allowlist_store import AllowlistStore
 from pirewall.firewall.guards import ALL_OBSERVE
 from pirewall.firewall.interface import FirewallBackend, PortalGrant
+from pirewall.firewall.local_addresses import LocalAddresses
 from pirewall.firewall.rate_limiter import RuleCreationRateLimiter
 from pirewall.firewall.sets import (
     ElementKey,
@@ -242,6 +243,7 @@ class FirewallManager:
         *,
         set_backend: SetBackend | None = None,
         mac_resolver: Callable[[IPv4Address], str | None] | None = None,
+        local_addresses: LocalAddresses | None = None,
     ) -> None:
         """`set_backend` switches adaptive enforcement to the v2 set path (module docstring).
 
@@ -250,8 +252,14 @@ class FirewallManager:
         bound MAC (core passes `LeaseBindingTable.resolve_mac`). Without one,
         a v2 target has a MAC only if its candidate's `target` carried one,
         and the C4 checks match by IP alone.
+
+        `local_addresses` pins the safety stage's view of this host's own
+        addresses. `None` (production) reads the kernel's table. Tests pin
+        it so that whether a candidate is safe never depends on which
+        addresses the test machine happens to hold (KNOWN_ISSUES.md #19).
         """
         self._config = config
+        self._local_addresses = local_addresses
         self.__backend = backend
         # Same discipline as `__backend`: the only reference to the kernel's
         # adaptive sets lives here (CLAUDE.md single deploy path).
@@ -657,6 +665,7 @@ class FirewallManager:
             allowlist=self._allowlist,
             rate_limiter=self._rate_limiter,
             now=now,
+            local_addresses=self._local_addresses,
             bound_mac=self._bound_mac_of(candidate),
         )
         if not outcome.approved or outcome.priority is None:
@@ -773,6 +782,7 @@ class FirewallManager:
             allowlist=self._allowlist,
             rate_limiter=self._rate_limiter,
             now=now,
+            local_addresses=self._local_addresses,
         )
         if not outcome.approved or target is None:
             rejection = outcome.rejection

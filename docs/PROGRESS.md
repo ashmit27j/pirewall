@@ -37,6 +37,7 @@ are regression evidence and are labelled as such.
 | 13 | Kernel data plane, set backend, guard modes, kill switch, panic | Complete | See "Phase 13 details" below. Built beside v1, not wired into core (phase 16). Netns tier 24/24 passed, env=sandbox only. Pi nft 1.0.6 is Environment-dependent. |
 | 14 | MAC identity end to end, bindings, anti-spoof, portal binding | Complete | See "Phase 14 details" below. Lease sync runs in core now. Its kernel writes happen only with a set backend, which phase 16 makes the default. Netns tier 31/31 passed, env=sandbox only. `ether saddr` on brcmfmac `wlan0` is Environment-dependent. |
 | 14b | Interim: four live risks on today's v1 Pi (fail-open guards, ML ceiling, lease-file path, portal migration) | Complete | See "Phase 14b details" below. Not a planned phase; approved by the human 2026-10-28. Edits two phase 16 files (deviation 1). Netns tier 31/31, env=sandbox only. Nothing ran on the Pi. |
+| — | Known-issues pass: KNOWN_ISSUES #12, #18, #19, #21 | Complete | See "Known-issues pass (2026-10-28)" below. Not a planned phase. No nft, native or config change. Nothing ran on the Pi. |
 | 15 | Native hardening, pcap reader, replay capture backend | Not started | Prompt: `phase-15-native-hardening-replay.md`. Can run in parallel with 12 and 13. Also implements `pirewall/flow/connection_start.py` (V2_CONTRACTS §11). |
 | 16 | `pirewall-start` v2, deployment templates, systemd, data modes, lab victim | Not started | Prompt: `phase-16-startup-deploy.md`. Depends on 13, 14, 15. Marks **v2.0 deployable**. |
 | 17 | D1 detectors, kernel offender poller, policy engine | Not started | Prompt: `phase-17-detection-policy.md`. Depends on 16. Marks **v2.1 (engine)**. |
@@ -682,6 +683,36 @@ phase 15 or 16 forward:
 - calibrating the Isolation Forest threshold, which needs a Pi baseline;
 - KNOWN_ISSUES #6 (demo portal accounts), the operator's step on the Pi;
 - any Pi run.
+
+### Known-issues pass (2026-10-28)
+
+**Scope.** The open KNOWN_ISSUES items that can be fixed in code or docs
+without the Pi and without pulling a later phase forward. Phases 14 and 14b
+were committed and pushed first (`0d6efb2`).
+
+| Item | Label | Evidence |
+|---|---|---|
+| #19: `FirewallManager(local_addresses=...)`, a keyword-only optional argument passed to the safety stage on the v1 rule path and the v2 set path. `None` (production) still reads the kernel. | Tested | `tests/unit/test_manager_local_addresses.py` (4 tests): the kernel view and the pinned view disagree in both directions, on both paths, and the pinned view wins. |
+| #21: flow, detection and threat history are `pirewall/ipc/history.py`'s `FairShareHistory`, keyed by source IP. The bound is unchanged. Eviction takes the oldest entry of the largest holder. `CoreStateStore.record_detection` now takes the flow's source IP, since a `DetectionRecord` carries none. | Tested; Pi rerun **Environment-dependent** | `tests/unit/test_fair_share_history.py` (7 tests), including 40 scan records surviving a 10,000-record flood into 500 slots, and `CoreStateStore` keeping a scanner's records through a 5,000-record flood. `test_resource_exhaustion.py` is unchanged and still passes: with one source, eviction is oldest-first. Spoofed-source floods still degrade to oldest-first (KNOWN_ISSUES #21, "Still open"). |
+| #12: `node --check` over every emitted `<script>` block, when `node` is on PATH | Tested (Windows dev host, node 22.14.0); skipped in WSL (no node) | `test_every_script_block_parses_under_a_real_javascript_engine`, 3 pages. node is a host tool, not a dependency. The scanner stays the floor. |
+| #18: troubleshooting row in `docs/SETUP.md`, scheme note in `setup-new-network.md` §8.2 | Implemented (documentation) | Every panel URL already carried `https://`. Server behaviour is unchanged on purpose. |
+
+**Gate.** `ruff check .` clean, `pyright` 0 errors, `pytest` 1449 passed /
+34 skipped as `pw` in WSL (env=sandbox), netns tier 31/31 as root
+(env=sandbox).
+
+**Deviations.**
+1. `pirewall/firewall/manager.py` belongs to the integrator phase
+   (V2_CONTRACTS §12). The change is one additive keyword argument, with no
+   behaviour change when it is omitted. Phase 16 builds on it.
+2. `pirewall/runtime/pipeline.py` passes `flow.source_ip` to
+   `record_detection`. That is a one-line call-site change, forced by the
+   new signature.
+
+**Left open, with reasons** (KNOWN_ISSUES carries each in full): #3, the
+threshold values, which need a measured Pi baseline; #7 and #8, deferred by
+design; #11, the Pi-only paths; #22, blocked on `NoNewPrivileges`, which
+needs a human decision.
 
 ### Detection-quality and native capture overhaul (2026-10-15)
 

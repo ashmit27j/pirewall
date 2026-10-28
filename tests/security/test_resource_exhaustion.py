@@ -60,7 +60,7 @@ def test_core_state_store_every_buffer_stays_bounded_under_flood() -> None:
 
     for i in range(count):
         state.record_flow(make_flow(flow_id=f"flow-{i}"))
-        state.record_detection(DetectionRecord(flow_id=f"flow-{i}", recorded_at=NOW))
+        state.record_detection(DetectionRecord(flow_id=f"flow-{i}", recorded_at=NOW), IPv4Address("10.0.0.5"))
         state.record_threat(
             ThreatAssessment(
                 id=f"threat-{i}",

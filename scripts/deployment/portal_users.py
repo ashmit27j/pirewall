@@ -4,6 +4,7 @@
     python -m scripts.deployment.portal_users add <username> [--note TEXT]
     python -m scripts.deployment.portal_users passwd <username>
     python -m scripts.deployment.portal_users remove <username>
+    python -m scripts.deployment.portal_users remove-demo
     python -m scripts.deployment.portal_users seed-demo --i-understand-these-are-insecure
 
 Writes one JSON file and nothing else. It never starts a service, never
@@ -34,11 +35,12 @@ _DEFAULT_CONFIG_PATHS = (Path("config/local_config.toml"), Path("config/default_
 EXIT_OK = 0
 EXIT_FAILURE = 1
 
-# Fixed, published, obviously-fake credentials. These are documented in
-# docs/SETUP.md on purpose, which is precisely why they must never be
-# secrets: a generated password written into a git-tracked file would be a
-# committed credential (CLAUDE.md), while these are non-secret by
-# construction and exist only to be deleted.
+# Fixed, public, obviously-fake credentials. They are readable here on
+# purpose, which is precisely why they must never be secrets: a generated
+# password written into a git-tracked file would be a committed credential
+# (CLAUDE.md), while these are non-secret by construction and exist only to
+# be deleted (`remove-demo`). pirewall-core refuses ASSISTED/ACTIVE while
+# any of them exists (`pirewall.portal.demo_policy`).
 DEMO_ACCOUNTS: tuple[tuple[str, str], tuple[str, str], tuple[str, str], tuple[str, str], tuple[str, str]] = (
     ("demo-alice", "pirewall-demo-1"),
     ("demo-bob", "pirewall-demo-2"),
@@ -75,12 +77,17 @@ def build_parser() -> argparse.ArgumentParser:
     remove = sub.add_parser("remove", help="delete an account")
     remove.add_argument("username")
 
+    sub.add_parser(
+        "remove-demo",
+        help="delete every demo-* account (and any account still using a demo password)",
+    )
+
     seed = sub.add_parser("seed-demo", help="create the five documented demo accounts")
     seed.add_argument(
         "--i-understand-these-are-insecure",
         action="store_true",
         dest="acknowledged",
-        help="required: these passwords are published in docs/SETUP.md",
+        help="required: these passwords are public (they are in this script's source)",
     )
     return parser
 
@@ -135,8 +142,8 @@ def _run(args: argparse.Namespace, store: PortalUserStore) -> int:
             )
         if store.has_demo_accounts():
             print(
-                "\nWARNING: demo accounts are present. Their passwords are published in "
-                "docs/SETUP.md — remove them before production use.",
+                "\nWARNING: demo accounts are present. Their passwords are public — remove "
+                "them before production use: portal_users remove-demo",
                 file=sys.stderr,
             )
         return EXIT_OK
@@ -160,12 +167,23 @@ def _run(args: argparse.Namespace, store: PortalUserStore) -> int:
         print(f"Removed portal account {args.username!r}.")
         return EXIT_OK
 
+    if args.command == "remove-demo":
+        removed = store.remove_demo_accounts()
+        if not removed:
+            print(f"No demo accounts in {store.path}; nothing to do.")
+            return EXIT_OK
+        print(f"Removed {len(removed)} demo account(s) from {store.path}:")
+        for username in removed:
+            print(f"  {username}")
+        print("pirewall-core picks this up at its next restart.")
+        return EXIT_OK
+
     if args.command == "seed-demo":
         if not args.acknowledged:
             print(
                 "portal_users: refusing to seed demo accounts without "
                 "--i-understand-these-are-insecure.\n"
-                "These five accounts use fixed passwords published in docs/SETUP.md. "
+                "These five accounts use fixed, public passwords (in this script's source). "
                 "They exist to prove the portal works, and must be removed before "
                 "this network carries real traffic.",
                 file=sys.stderr,
@@ -182,9 +200,9 @@ def _run(args: argparse.Namespace, store: PortalUserStore) -> int:
         else:
             print("All demo accounts already exist; nothing to do.")
         print(
-            "\nWARNING: these passwords are published in docs/SETUP.md. Remove these "
-            "accounts before production use:\n"
-            "  python -m scripts.deployment.portal_users remove <username>",
+            "\nWARNING: these passwords are public. Remove these accounts before "
+            "production use (pirewall-core refuses ASSISTED/ACTIVE while they exist):\n"
+            "  python -m scripts.deployment.portal_users remove-demo",
             file=sys.stderr,
         )
         return EXIT_OK

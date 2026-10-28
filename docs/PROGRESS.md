@@ -33,7 +33,7 @@ are regression evidence and are labelled as such.
 | # | Phase | Status | Notes |
 |---|-------|--------|-------|
 | 11 | v2 contracts, project rules, additive config, `migrate_config.py` | Complete | See "Phase 11 details" below. No runtime behaviour changed. |
-| 12 | Access hardening and hygiene (P0) | Not started | Prompt: `phase-12-access-hygiene.md`. Can run in parallel with 13 and 15. |
+| 12 | Access hardening and hygiene (P0) | Complete | See "Phase 12 details" below. Wazuh forwarding of API-reported events is handed to phase 16. |
 | 13 | Kernel data plane, set backend, guard modes, kill switch, panic | Not started | Prompt: `phase-13-kernel-data-plane.md`. Integrator for `firewall/manager.py`. |
 | 14 | MAC identity end to end, bindings, anti-spoof, portal binding | Not started | Prompt: `phase-14-mac-identity-antispoof.md`. Depends on 13. Integrator for `runtime/core.py` and `firewall/manager.py`. |
 | 15 | Native hardening, pcap reader, replay capture backend | Not started | Prompt: `phase-15-native-hardening-replay.md`. Can run in parallel with 12 and 13. Also implements `pirewall/flow/connection_start.py` (V2_CONTRACTS §11). |
@@ -184,6 +184,120 @@ the Pi: nft 1.0.6 compatibility of the templates, `ether saddr` being the
 station MAC on brcmfmac `wlan0`, IPv6 drop (RESULTS.md 10b), and all
 throughput figures. The sandbox results in `docs/v2/v2/RESULTS.md` are
 `env=sandbox`.
+
+
+### Phase 12 details
+
+**Scope.** The PLAN_FINAL §4.9 access fixes that v2 doesn't otherwise touch.
+No nft changes, no MAC binding of portal sessions (phase 14), and none of
+the integrator files (`runtime/core.py`, `firewall/manager.py`,
+`ipc/dispatcher.py`).
+
+| Deliverable | Label | Evidence |
+|---|---|---|
+| 1. Admin login throttle, per IP and global (`[authentication] max_failed_logins_per_ip` = 5, `max_failed_logins_global` = 20, `failed_login_window_seconds` = 300); 429 + `Retry-After`; an `AUTHENTICATION_FAILURE` event per lockout | Tested | `tests/unit/test_throttle.py` (window, global vs per-IP, `Retry-After` rounding); `tests/unit/test_api_access_hardening.py` (429 + header over HTTP, global trips before per-IP, one event per lockout and none per refused attempt, success clears the IP) |
+| 2. Portal throttle per account and global, beside the existing per-IP one (`[portal] max_failed_logins_per_account` = 10, `max_failed_logins_global` = 50) | Tested | `tests/unit/test_throttle.py`; `tests/unit/test_demo_accounts.py` drives `PortalService.login` across addresses until the account locks; the existing per-IP portal tests pass unchanged |
+| 3. Allowlist re-authentication: password again in the body, a `/32` plus an optional MAC, mandatory non-blank reason, WARNING event | Tested (API side); **Wazuh forwarding not done** | Wrong password → 403 and counted as a failed login; missing password or reason, blank reason, `/24`, `/31` → 422; a 422 never echoes the password; success emits a WARNING `FIREWALL_ALLOW` event into core's audit trail. Not forwarded to Wazuh: see deviation 4. A MAC is validated (`UnicastMacAddress`) and then refused with 422 until `AllowlistEntry` gains a MAC in phase 14 (deviation 5). |
+| 4. Demo accounts: `portal_users remove-demo`; core refuses ASSISTED/ACTIVE while they exist unless `portal.allow_demo_accounts = true`; passwords out of `docs/SETUP.md` | Tested | `remove-demo` removal set and idempotency; the refusal in both modes, SHADOW allowed, the opt-in, a disabled portal not opening the store, and through `pirewall.main` on POSIX. The passwords are also gone from `setup-new-network.md`, the startup warning, the CLI messages and the control-panel notice. **The removal on the Pi is still the operator's step** (KNOWN_ISSUES #4). |
+| 5. `make_certs.sh` takes several IPs and DNS names, all written as SANs | Tested (POSIX) | `tests/unit/test_make_certs.py` parses the certificate with `openssl x509 -text` (OpenSSL 3.5.5 on WSL Ubuntu), checks the key mode, refuses injection-shaped and malformed names, and refuses the old positional form. Skipped on Windows, with the reason given. |
+| 6. `[api] log_dir` (default `/var/log/pirewall-api`), used by pirewall-api | Tested; Environment-dependent on the Pi | `test_pirewall_api_logs_into_its_own_directory`. The Pi's journal hasn't been checked (KNOWN_ISSUES #15). |
+| 7. `security.session_timeout_seconds` as a real idle timeout, separate from `token_expiry_seconds` | Tested | `SessionStore` idle and absolute tests, plus the wiring through `create_app` |
+| 8. Optional admin interface check (`security.admin_server_address`) on `enforce_admin_pc_ip`, documented as defence in depth only | Tested | Match, mismatch, off by default, local-console exemption, and the HTTP wiring (403) |
+| KNOWN_ISSUES 4 (tooling), 9, 15, 17 | Updated | Each marked fixed, with its evidence |
+
+**Verification (2026-10-28).** `ruff check .` clean; `pyright --strict`
+0 errors.
+
+* **POSIX (WSL2 Ubuntu 26.04, Python 3.12.16, run as root, `env=sandbox`):**
+  1106 passed, 10 skipped, 1 failed. The 10 skips are the unbuilt
+  `pirewall_native` tests. The failure is the same root-only
+  `test_a_socket_in_the_wrong_group_is_refused` recorded under phase 11;
+  run as an unprivileged user, its file passes in full (10 passed). The
+  phase's 54 new tests all pass on POSIX, the openssl and entry-point
+  cases included.
+* **Windows:** the new and touched test files pass, with 9 POSIX-only skips.
+  The full-suite baseline is unchanged: the same 3 file-mode failures and 8
+  `fcntl` collection errors.
+
+**Deviations and choices made where the prompt was ambiguous.**
+
+1. **Edits outside phase 12's files, approved by the human first.** None
+   collides with phases 13 and 15, which run in parallel, and 14 and 16 run
+   after 12. No integrator file was touched.
+   * `pirewall/ipc/portal_service.py` (phase 14's): the throttle needs the
+     username for the per-account limit, and the demo warning text changed.
+   * `pirewall/main.py` (no owner): the demo-account refusal, called before
+     anything privileged opens. `core.py` would only have run it later.
+   * `docs/SETUP.md` and `pirewall/web/render.py` (phase 16's): the passwords
+     came out of SETUP.md. The dashboard's allowlist form gained the
+     password field, without which every allowlist add from the panel would
+     have started failing with 422.
+   * `setup-new-network.md` (phase 16's) published the same passwords and
+     got the same fix. This was beyond the approved list, in the same
+     category.
+2. **New shared module `pirewall/core/throttle.py`** (`FailureWindow`,
+   `ScopedThrottle`, `LockoutScope`, `Lockout`). The admin and portal
+   throttles share one implementation, rather than two copies of the
+   sliding-window code. It sits in `core` because `api` and `portal` must
+   not depend on each other. The portal's `LoginThrottle` keeps its old
+   per-IP constructor and methods, so its existing tests pass unchanged.
+3. **"Every lockout emits an AUTHENTICATION_FAILURE event"** means one event
+   when a lockout starts, plus the existing one per failed login. Attempts
+   refused during a lockout are logged locally, not sent as events.
+   Otherwise a client hammering a locked endpoint would push real entries
+   out of core's bounded event history. The portal keeps its existing
+   per-refused-attempt event, which predates this phase.
+4. **Wazuh forwarding of the allowlist WARNING is handed to phase 16.**
+   Events pirewall-api reports go through `RECORD_EVENT`, which
+   `CoreRpcDispatcher._record_event` stores in `CoreStateStore` only. It
+   never reaches `EventForwarder`. So no API-reported event reaches Wazuh
+   today: not this one, and not the existing login failures either.
+   Fixing that is a one-line change in `ipc/dispatcher.py`, whose owner is
+   phase 16.
+5. **An allowlist MAC is accepted by the schema, then refused with 422.**
+   `AllowlistEntry` has no MAC field until phase 14 (D3), and accepting one
+   silently would record an entry less specific than the admin asked for.
+   Phase 14 drops the refusal and passes the MAC through.
+6. **Status codes.** A wrong re-confirmation password returns 403, not 401,
+   because the session itself is valid and a 401 would read as "log in
+   again". A wrong confirmation counts as a failed login, so a stolen
+   session cookie cannot be used to guess the password.
+7. **Invented defaults** (the prompt gives none): admin 5 per IP and 20
+   global over 300 s; portal 10 per account and 50 global over the
+   existing 300 s. The account and global limits are looser than per-IP
+   on purpose, because whoever trips them locks out other people. A global
+   admin lockout also refuses the real admin until the window lapses; the
+   local console shares that counter. Both trade-offs are stated in the
+   config comments.
+8. **Portal per-account keys are case-folded and capped at 64 characters**,
+   so `Alice` and `alice` share one count and an attacker cannot grow a
+   key with a huge submitted username.
+9. **`remove-demo` removes `demo-*` names and anything still flagged
+   `is_demo`.** The startup refusal looks only at `is_demo` (a public
+   password), so a `demo-*` account whose password was rotated does not
+   block startup. `remove-demo` removes it anyway, because the prompt says
+   `demo-*`.
+10. **The demo refusal is startup-only.** That covers every way in: nothing
+    at runtime moves the enforcement mode out of SHADOW (the kill switch
+    only moves it to SHADOW). A disabled portal is not checked; its
+    accounts can't log in.
+11. **`make_certs.sh` interface change.** The output directory and days
+    became `-o`/`-d`, so that every positional argument can be a SAN. Every
+    documented caller passes one IP, so they keep working. The old
+    three-positional form is refused with a hint rather than guessed at.
+12. **`admin_server_address` is an address, not an interface name.** The
+    server socket reports the local address a connection arrived on, not
+    the interface. The interface + MAC pin is phase 16's nft rule.
+13. **The idle timeout changes behaviour on existing deployments.**
+    `session_timeout_seconds = 1800` was already in every config, so admin
+    sessions now end after 30 idle minutes.
+14. **KNOWN_ISSUES item 23 doesn't exist.** The prompt lists it, but the
+    file ends at 22. Nothing was invented for it.
+
+**Not done here:** no nft or portal-MAC work (phases 13, 14 and 16); no
+PMF, startup self-checks, dnsmasq lease cap or ARCHITECTURE.md dependency
+note from PLAN_FINAL §4.9. The phase-12 prompt doesn't include them. They
+belong to phase 16's deployment work.
 
 
 ### Detection-quality and native capture overhaul (2026-10-15)

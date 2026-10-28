@@ -16,7 +16,7 @@ from pirewall.ipc.dispatcher import CoreRpcDispatcher
 from pirewall.ipc.loopback import LoopbackRpcClient
 from pirewall.ipc.state import CoreStateStore
 from tests.helpers.api import auth_headers, login, make_harness
-from tests.helpers.config import make_config
+from tests.helpers.config import TEST_ADMIN_PASSWORD, make_config
 from tests.helpers.rules import make_candidate
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
@@ -145,7 +145,7 @@ def test_allowlist_add_list_remove_through_http() -> None:
 
     created = harness.post(
         "/api/v1/allowlist",
-        json={"target": "192.168.1.77/32", "reason": "protected device"},
+        json={"target": "192.168.1.77/32", "reason": "protected device", "password": TEST_ADMIN_PASSWORD},
         headers=auth_headers(token),
     )
     assert created.status_code == 200

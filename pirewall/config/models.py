@@ -382,13 +382,28 @@ class APIConfig(PirewallModel):
     # misdiagnosis rather than a delay.
     rpc_timeout_seconds: float = Field(default=20.0, gt=0.0)
 
+    # pirewall-api's own log directory (KNOWN_ISSUES.md #15). Not
+    # `logging.log_dir`: that is pirewall-core's directory, and
+    # `deploy/systemd/pirewall-api.service` grants write access only here,
+    # the same per-process arrangement as `portal.log_dir`.
+    log_dir: str = Field(default="/var/log/pirewall-api", min_length=1)
+
 
 class AuthenticationConfig(PirewallModel):
     """Single-admin username/password authentication (spec §29: no RBAC beyond one role)."""
 
     admin_username: str = Field(min_length=1)
     admin_password_hash: str = Field(min_length=1)
+    # Absolute session lifetime, counted from login. The idle timeout is
+    # `security.session_timeout_seconds`; a session ends at whichever comes first.
     token_expiry_seconds: int = Field(default=3600, gt=0)
+
+    # Admin login throttle (PLAN_FINAL §4.9), the same sliding-window shape
+    # as the portal's. Failed password re-confirmations count too, so a
+    # stolen session cookie cannot be used to guess the password.
+    max_failed_logins_per_ip: int = Field(default=5, gt=0)
+    max_failed_logins_global: int = Field(default=20, gt=0)
+    failed_login_window_seconds: int = Field(default=300, gt=0)
 
 
 class AdminConfig(PirewallModel):
@@ -483,7 +498,19 @@ class PortalConfig(PirewallModel):
     # can associate with the AP; scrypt alone only slows it down.
     max_failed_logins_per_ip: int = Field(default=5, gt=0)
     failed_login_window_seconds: int = Field(default=300, gt=0)
+    # Per-account and global limits over the same window (PLAN_FINAL §4.9).
+    # Per-account catches guessing spread across many source addresses;
+    # global caps the total guessing rate. Both are deliberately looser than
+    # the per-IP limit, because whoever trips them locks out *other* people:
+    # the account's owner, or every user.
+    max_failed_logins_per_account: int = Field(default=10, gt=0)
+    max_failed_logins_global: int = Field(default=50, gt=0)
     max_sessions: int = Field(default=512, gt=0)
+
+    # pirewall-core refuses to start in ASSISTED or ACTIVE while any demo
+    # account exists (their passwords are public), unless this is set. SHADOW
+    # is always allowed, with the startup warning.
+    allow_demo_accounts: bool = False
 
     # Shown on the login page so users know who to contact when a block
     # notice appears (ADDENDUM_3.md C4).
@@ -495,7 +522,14 @@ class SecurityConfig(PirewallModel):
 
     min_tls_version: str = Field(default="TLSv1.3", min_length=1)
     restrict_to_admin_pc: bool = True
+    # Admin-session idle timeout (KNOWN_ISSUES.md #17): a session unused for
+    # this long ends, even inside `authentication.token_expiry_seconds`.
     session_timeout_seconds: int = Field(default=1800, gt=0)
+
+    # Optional: the local address admin requests must arrive on (the Pi's
+    # address on the admin interface). Unset, no check. Defence in depth
+    # only: the real admin pin is the interface + MAC + IP rule in nft.
+    admin_server_address: IPv4Address | None = None
 
 
 class FailureConfig(PirewallModel):

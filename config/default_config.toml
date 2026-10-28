@@ -211,6 +211,9 @@ rpc_socket_path = "/run/pirewall/core.sock"   # ADDENDUM.md A4 — pirewall-core
 # behind one lock, so this must exceed the slowest thing core can be doing
 # (a portal login's scrypt), or a healthy system reports 503.
 rpc_timeout_seconds = 20.0
+# pirewall-api's own log directory, not logging.log_dir (pirewall-core's).
+# pirewall-api.service may write only here (KNOWN_ISSUES.md #15).
+log_dir = "/var/log/pirewall-api"
 
 [authentication]
 admin_username = "CHANGE_ME"
@@ -221,7 +224,19 @@ admin_username = "CHANGE_ME"
 #       import getpass; print(hash_password(getpass.getpass()))"
 # (getpass keeps the password out of your shell history.)
 admin_password_hash = "CHANGE_ME"
+# Absolute admin-session lifetime from login. The idle timeout is
+# security.session_timeout_seconds; a session ends at whichever comes first.
 token_expiry_seconds = 3600
+
+# Admin login throttle (PLAN_FINAL §4.9): failures per client IP and in
+# total over the window. A locked-out attempt gets 429 with Retry-After, and
+# each lockout emits an AUTHENTICATION_FAILURE event. A wrong password on
+# an allowlist addition counts as a failed login. A global lockout also
+# refuses the real admin until the window lapses; that is the price of
+# stopping guessing from rotating or spoofed sources.
+max_failed_logins_per_ip = 5
+max_failed_logins_global = 20
+failed_login_window_seconds = 300
 
 [admin]
 # The single PC allowed to reach administrative endpoints (spec §29).
@@ -299,10 +314,21 @@ rpc_socket_group = "pirewall-portal-ipc"
 rpc_timeout_seconds = 20.0
 
 # Online password guessing against a login anything on the AP can reach is
-# cheap; scrypt alone only slows it down.
+# cheap; scrypt alone only slows it down. Throttled per source IP, per
+# account (guessing one account from many addresses) and globally, all over
+# the same window. The per-account and global limits are looser than the
+# per-IP one because whoever trips them locks out other people too.
 max_failed_logins_per_ip = 5
 failed_login_window_seconds = 300
+max_failed_logins_per_account = 10
+max_failed_logins_global = 50
 max_sessions = 512
+
+# pirewall-core refuses to start in ASSISTED or ACTIVE while any demo
+# account (portal_users seed-demo) exists, because their passwords are
+# public. Remove them with `portal_users remove-demo`. Set true only to keep
+# them on purpose, e.g. in a lab. SHADOW starts either way.
+allow_demo_accounts = false
 
 # Shown on the sign-in page and appended to the block notice a device sees
 # when adaptive enforcement has suspended it (ADDENDUM_3.md C4).
@@ -311,9 +337,15 @@ contact_message = "Please contact your network administrator."
 [security]
 min_tls_version = "TLSv1.3"
 restrict_to_admin_pc = true
-# NOTE: not currently read by any code path — the admin session lifetime is
-# governed by `authentication.token_expiry_seconds`. Change that one.
+# Admin-session idle timeout (KNOWN_ISSUES.md #17): a session with no
+# authenticated request for this long ends, even before
+# authentication.token_expiry_seconds (the absolute lifetime). An open
+# control-panel tab that keeps refreshing counts as activity.
 session_timeout_seconds = 1800
+# Optional: the Pi's address on the admin interface. When set, admin
+# requests must also arrive on that local address. Defence in depth only;
+# the real Admin-PC pin is the interface + MAC + IP rule in nftables.
+# admin_server_address = "10.0.0.1"
 
 [failure]
 # ADDENDUM.md A6 — fail-open by default for home use, with a systemd

@@ -31,6 +31,9 @@ from pirewall.core.passwords import hash_password, verify_password
 _FILE_MODE = 0o600
 _DIR_MODE = 0o700
 
+# The name every seeded demo account has (`portal_users.py seed-demo`).
+DEMO_USERNAME_PREFIX = "demo-"
+
 
 class PortalUserStore:
     """Load/save `PortalUser` records, keyed by username.
@@ -75,6 +78,31 @@ class PortalUserStore:
     def has_demo_accounts(self) -> bool:
         """True while any seeded demo account survives (drives the startup warning + login banner)."""
         return any(user.is_demo for user in self._users.values())
+
+    def demo_usernames(self) -> list[str]:
+        """Accounts whose password is still the published demo one (`is_demo`), sorted."""
+        return sorted(user.username for user in self._users.values() if user.is_demo)
+
+    def remove_demo_accounts(self) -> list[str]:
+        """Delete every demo account in one write. Returns the usernames removed, sorted.
+
+        Removes every `demo-*` account, and every account still flagged
+        `is_demo` whatever its name. A `demo-*` account whose password was
+        rotated is no longer a public credential, but it is still a sample
+        account nobody provisioned on purpose, so it goes too. Idempotent:
+        with nothing to remove, nothing is written and the list is empty.
+        """
+        doomed = sorted(
+            username
+            for username, user in self._users.items()
+            if user.is_demo or username.startswith(DEMO_USERNAME_PREFIX)
+        )
+        if not doomed:
+            return []
+        for username in doomed:
+            del self._users[username]
+        self._persist()
+        return doomed
 
     def verify(self, username: str, password: str) -> bool:
         """Verify a credential without revealing whether the username exists.

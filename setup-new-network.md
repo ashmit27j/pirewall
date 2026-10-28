@@ -357,21 +357,21 @@ sudo -u pirewall-core uv run python -m scripts.deployment.portal_users \
      seed-demo --i-understand-these-are-insecure
 ```
 
-That creates `demo-alice` … `demo-erin` with passwords `pirewall-demo-1` …
-`pirewall-demo-5`.
+That creates `demo-alice` … `demo-erin`. Their passwords are fixed and
+public (`DEMO_ACCOUNTS` in `scripts/deployment/portal_users.py`); this guide
+does not reprint them.
 
 > ### ⚠ Delete these before production
 >
-> **These passwords are published — they are printed in this file, in the
-> repository, and in the script's source.** They are fixed and non-secret on
-> purpose: a *generated* password written into a git-tracked document would
-> be a committed credential. Anyone who can read this repository, or who has
-> simply seen it, can join your protected network while they exist.
+> **These passwords are public — they are in the repository, in the
+> script's source.** They are fixed and non-secret on purpose: a *generated*
+> password written into a git-tracked document would be a committed
+> credential. Anyone who can read this repository can join your protected
+> network while they exist, and pirewall-core refuses to start in ASSISTED
+> or ACTIVE mode until they are gone (or `portal.allow_demo_accounts = true`).
 >
 > ```sh
-> for u in demo-alice demo-bob demo-carol demo-dave demo-erin; do
->   sudo -u pirewall-core uv run python -m scripts.deployment.portal_users remove "$u"
-> done
+> sudo -u pirewall-core uv run python -m scripts.deployment.portal_users remove-demo
 > ```
 >
 > While any of them exists, pirewall tells you so in three places: a

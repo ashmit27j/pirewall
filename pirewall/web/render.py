@@ -131,7 +131,7 @@ function confirmKillSwitch() {
 function addAllowlistEntry(event) {
   event.preventDefault();
   const form = event.target;
-  const body = {target: form.target.value, reason: form.reason.value};
+  const body = {target: form.target.value, reason: form.reason.value, password: form.password.value};
   if (form.port.value) body.port = parseInt(form.port.value, 10);
   if (form.protocol.value) body.protocol = form.protocol.value;
   if (form.portal_username.value) body.portal_username = form.portal_username.value;
@@ -533,8 +533,12 @@ def _render_allowlist_section(allowlist: list[AllowlistEntry]) -> str:
       <input name="protocol" placeholder="tcp/udp/icmp (optional)">
       <input name="reason" placeholder="reason" required>
       <input name="portal_username" placeholder="portal username (optional)">
+      <input name="password" type="password" placeholder="admin password"
+             autocomplete="current-password" required>
       <button type="submit">Add</button>
     </form>
+    <p class="hint">An entry names one device (a /32) and outranks every adaptive
+    rule, so adding one asks for the admin password again.</p>
     <p class="hint">Filling in a portal username also creates a captive-portal
     account for this entry and shows its generated password once. Leave it empty
     for devices that cannot sign in \u2014 a gateway, a printer, a server.</p>
@@ -558,8 +562,9 @@ def _render_portal_users_section(users: list[PortalUser]) -> str:
     if any(user.is_demo for user in users):
         warning = (
             '<p class="hint error"><strong>Demo accounts are active.</strong> '
-            "Their passwords are published in docs/SETUP.md. Delete them before this network "
-            "carries real traffic.</p>"
+            "Their passwords are public. Delete them (portal_users remove-demo) before this "
+            "network carries real traffic; pirewall-core will not start in ASSISTED or ACTIVE "
+            "while they exist.</p>"
         )
     return f"""
     {warning}

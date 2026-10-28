@@ -20,8 +20,10 @@ anything is bound:
    control panel that quietly came up on plain HTTP, or with
    `admin_password_hash = "CHANGE_ME"`, would be worse than one that
    refuses to start and says why.
-3. Configure logging into `<log_dir>/api.log` — a *different* file from
-   pirewall-core's, because the two run as different users.
+3. Configure logging into `<[api] log_dir>/api.log` (default
+   `/var/log/pirewall-api`) — a *different* directory from pirewall-core's,
+   because the two run as different users and the api unit's
+   `ReadWritePaths` grants only its own (KNOWN_ISSUES.md #15).
 4. Build the RPC client, the FastAPI app, and serve it over TLS.
 
 **pirewall-core being down is not a startup failure.** A4's whole point is
@@ -215,7 +217,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"pirewall-api: configuration at {config_path} is valid")
         return EXIT_OK
 
-    log_path = configure_logging(config.logging, _COMPONENT)
+    # `[api] log_dir`, not core's `logging.log_dir` (KNOWN_ISSUES.md #15):
+    # the api unit may write only its own directory.
+    api_logging = config.logging.model_copy(update={"log_dir": config.api.log_dir})
+    log_path = configure_logging(api_logging, _COMPONENT)
     logger = logging.getLogger(__name__)
     logger.info("pirewall-api starting with config %s (log: %s)", config_path, log_path or "stderr")
     logger.info(

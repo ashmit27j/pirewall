@@ -13,25 +13,80 @@
 # writes two files and stops (spec §21, CLAUDE.md).
 #
 # Usage:
-#   scripts/deployment/make_certs.sh <pi-lan-ip> [output-dir] [days]
-# Example:
+#   scripts/deployment/make_certs.sh [-o output-dir] [-d days] <ip-or-dns-name>...
+# Examples:
 #   scripts/deployment/make_certs.sh 192.168.100.1
+#   scripts/deployment/make_certs.sh 192.168.100.1 10.0.0.2 pirewall.lan
 #
-# The IP goes into the certificate's subjectAltName. Modern browsers and
-# curl ignore the legacy Common Name entirely, so a certificate without a
-# matching SAN fails verification even when you accept the warning — this
-# is the single most common way a hand-rolled cert ends up unusable.
+# Every name goes into the certificate's subjectAltName (KNOWN_ISSUES.md #9):
+# IPv4/IPv6 addresses as IP entries, anything else as a DNS entry. List every
+# address the Admin PC may connect to, e.g. the LAN and the admin-interface
+# addresses on a three-interface Pi. Modern browsers and curl ignore the
+# legacy Common Name entirely, so a certificate without a matching SAN fails
+# verification even when you accept the warning — this is the single most
+# common way a hand-rolled cert ends up unusable.
+#
+# The old positional form `<ip> [output-dir] [days]` is refused with a hint
+# rather than guessed at: an output directory must never end up as a SAN.
 
 set -euo pipefail
 
+usage() {
+  echo "usage: $0 [-o output-dir] [-d days] <ip-or-dns-name>..." >&2
+  exit 64
+}
+
+OUT_DIR="deploy/certificates"
+DAYS="825"   # 825 days: the maximum lifetime browsers accept for a leaf cert
+
+while getopts ":o:d:h" opt; do
+  case "${opt}" in
+    o) OUT_DIR="${OPTARG}" ;;
+    d) DAYS="${OPTARG}" ;;
+    h) usage ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+
 if [[ $# -lt 1 ]]; then
-  echo "usage: $0 <pi-lan-ip> [output-dir] [days]" >&2
+  usage
+fi
+
+if ! [[ "${DAYS}" =~ ^[1-9][0-9]{0,4}$ ]]; then
+  echo "error: days must be a positive integer, got '${DAYS}'" >&2
   exit 64
 fi
 
-LAN_IP="$1"
-OUT_DIR="${2:-deploy/certificates}"
-DAYS="${3:-825}"   # 825 days: the maximum lifetime browsers accept for a leaf cert
+IPV4_RE='^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
+IPV6_RE='^[0-9A-Fa-f:]*:[0-9A-Fa-f:.]*$'
+LABEL='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+DNS_RE="^${LABEL}(\\.${LABEL})*\$"
+
+# Each name is checked against a strict pattern before it reaches openssl:
+# a comma or a stray keyword in one would otherwise add extensions to the
+# certificate, because `-addext` parses the joined string.
+SANS=()
+for name in "$@"; do
+  if [[ "${name}" =~ ${IPV4_RE} ]]; then
+    SANS+=("IP:${name}")
+  elif [[ "${name}" =~ ${IPV6_RE} ]]; then
+    SANS+=("IP:${name}")
+  elif [[ "${name}" == */* ]]; then
+    echo "error: '${name}' looks like a path. The output directory is now -o: $0 -o ${name} <names>..." >&2
+    exit 64
+  elif [[ "${name}" =~ ^[0-9.]+$ ]]; then
+    echo "error: '${name}' is neither a valid IPv4 address nor a DNS name (days are now -d)" >&2
+    exit 64
+  elif [[ "${name}" =~ ${DNS_RE} ]] && [[ ${#name} -le 253 ]]; then
+    SANS+=("DNS:${name}")
+  else
+    echo "error: '${name}' is neither an IP address nor a valid DNS name" >&2
+    exit 64
+  fi
+done
+SAN_LIST="$(IFS=,; echo "${SANS[*]}")"
+FIRST_NAME="$1"
 
 CERT_PATH="${OUT_DIR}/pirewall.crt"
 KEY_PATH="${OUT_DIR}/pirewall.key"
@@ -61,7 +116,7 @@ mkdir -p "${OUT_DIR}"
     -keyout "${KEY_PATH}" \
     -out "${CERT_PATH}" \
     -subj "/CN=pirewall/O=pirewall" \
-    -addext "subjectAltName=IP:${LAN_IP}" \
+    -addext "subjectAltName=${SAN_LIST}" \
     -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
     -addext "extendedKeyUsage=serverAuth" \
     -addext "basicConstraints=critical,CA:FALSE"
@@ -75,6 +130,7 @@ cat <<EOF
 Wrote:
   ${CERT_PATH}  (mode 644)
   ${KEY_PATH}  (mode 600)
+  subjectAltName: ${SAN_LIST}
 
 Both are gitignored (.gitignore "Secrets / certificates") — never commit them.
 
@@ -90,5 +146,5 @@ Then confirm pirewall-api accepts them:
 
 And from the Admin PC (expect a self-signed warning, hence --insecure):
 
-  curl --insecure https://${LAN_IP}:8443/api/v1/health
+  curl --insecure https://${FIRST_NAME}:8443/api/v1/health
 EOF

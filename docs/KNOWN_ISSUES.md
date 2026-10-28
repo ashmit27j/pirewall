@@ -22,20 +22,20 @@ move to a new uplink network.
 | 1 | ML models misclassify ordinary browsing as attacks | High | Observed |
 | 2 | Isolation Forest flags benign traffic as anomalous | High | Observed |
 | 3 | Behaviour thresholds still tuned for a quiet network | Medium | Partly fixed (2026-10-15) |
-| 4 | Demo portal accounts are live on this deployment | High | Observed |
+| 4 | Demo portal accounts are live on this deployment | High | Tooling fixed (2026-10-28); removal on the Pi is the operator's step |
 | 5 | Enforcement is `assisted` without the recommended SHADOW soak | Medium | Fixed |
 | 6 | Wazuh and Netdata integrations never verified end to end | Medium | Fixed |
 | 7 | Portal serves plaintext HTTP | Medium | Deferred |
 | 8 | Portal sessions do not survive a core restart | Low | Deferred |
-| 9 | `make_certs.sh` writes only one SAN | Low | Observed |
+| 9 | `make_certs.sh` writes only one SAN | Low | Fixed (2026-10-28) |
 | 10 | Runtime allowlist additions are not persisted | Medium | Fixed |
 | 11 | `AF_PACKET`, `nft` and systemd paths remain partly unverified | Medium | Deferred |
 | 12 | Dashboard JS is checked by a scanner, not a parser | Low | Deferred |
 | 13 | An unmerged branch predates this work | Low | Fixed |
 | 14 | `capture_stats.packets_seen` did not move during a live check | Low | Fixed on native path |
-| 15 | `pirewall-api` cannot write its own log file | Low | Observed |
+| 15 | `pirewall-api` cannot write its own log file | Low | Fixed (2026-10-28) |
 | 16 | Moving the Pi to a new network silently staleness-rots the config | Medium | Fixed |
-| 17 | `security.session_timeout_seconds` is read by nothing | Low | Observed |
+| 17 | `security.session_timeout_seconds` is read by nothing | Low | Fixed (2026-10-28) |
 | 18 | A TLS-only port answers plaintext HTTP with a bare teardown | Low | Observed |
 | 19 | Some tests depend on the host's real network addressing | Low | Observed |
 | 20 | Real floods/scans are detected but never scored above LOW | High | Fixed (2026-10-15) |
@@ -230,13 +230,29 @@ measured baseline of this network.
 
 ## 4. Demo portal accounts are live on this deployment
 
-**Status: Observed.** `demo-alice` … `demo-erin` still exist, with the
-passwords published in `docs/SETUP.md` and in this repository.
+**Status: tooling fixed (v2 phase 12, 2026-10-28); the removal itself is
+still the operator's step on the Pi.** `demo-alice` … `demo-erin` still
+existed on the deployment when this was last checked, with passwords that
+are public in this repository.
+
+What phase 12 changed:
+
+* `portal_users remove-demo` removes every `demo-*` account in one write,
+  prints what it removed, and is idempotent
+  (`tests/unit/test_demo_accounts.py::test_remove_demo_command_is_idempotent`).
+* pirewall-core refuses to start in ASSISTED or ACTIVE while any demo
+  account exists, unless `portal.allow_demo_accounts = true`. SHADOW still
+  starts, with the existing warning (`pirewall/portal/demo_policy.py`, called
+  from `pirewall/main.py` before anything privileged; tested in
+  `tests/unit/test_demo_accounts.py`, including through the entry point on
+  POSIX).
+* `docs/SETUP.md` and `setup-new-network.md` no longer print the passwords.
+
+The step that remains, on the Pi:
 
 ```sh
-for u in demo-alice demo-bob demo-carol demo-dave demo-erin; do
-  sudo -u pirewall-core uv run python -m scripts.deployment.portal_users remove "$u"
-done
+sudo -u pirewall-core uv run python -m scripts.deployment.portal_users remove-demo
+sudo systemctl restart pirewall-core
 ```
 
 Anyone who has read the repository can join the protected network until this
@@ -356,7 +372,16 @@ restarts turn out to be frequent in practice.
 
 ## 9. `make_certs.sh` writes only one SAN
 
-**Status: Observed.** It accepts a single IP. A three-interface deployment
+**Status: Fixed (v2 phase 12, 2026-10-28).** `make_certs.sh [-o dir] [-d days]
+<ip-or-dns>...` writes every argument as a SAN: IPv4/IPv6 as `IP:`, names
+as `DNS:`. Each name is checked against a strict pattern first, because
+`-addext` parses the joined string and a comma would add extensions. The
+old positional `<ip> [output-dir] [days]` form is refused with a hint
+rather than guessed at. Evidence: `tests/unit/test_make_certs.py` runs the
+script and parses the result with `openssl x509 -text` (OpenSSL 3.5.5,
+WSL Ubuntu; skipped on Windows). What follows is the original report.
+
+It accepted a single IP. A three-interface deployment
 where the Admin PC connects on a different address than the LAN needs both,
 and the script cannot express that — `setup-new-network.md` §5.2 works around
 it with a hand-written `openssl` command.
@@ -539,7 +564,16 @@ read at the same moment. The Python path is unchanged.
 
 ## 15. `pirewall-api` cannot write its own log file
 
-**Status: Observed.** From `journalctl -u pirewall-api` on every start:
+**Status: Fixed (v2 phase 12, 2026-10-28)**, the way recommended below: new
+key `[api] log_dir`, default `/var/log/pirewall-api`, the directory the unit
+already grants. pirewall-api now logs to `<api.log_dir>/api.log`; core's
+`logging.log_dir` is untouched. Evidence:
+`tests/unit/test_api_access_hardening.py::test_pirewall_api_logs_into_its_own_directory`.
+Not yet observed on the Pi (Environment-dependent): check
+`journalctl -u pirewall-api` no longer shows the read-only error and
+`/var/log/pirewall-api/api.log` exists. What follows is the original report.
+
+From `journalctl -u pirewall-api` on every start:
 
 ```
 pirewall: could not open log file /var/log/pirewall/api.log
@@ -618,7 +652,19 @@ missing default route reported without crashing. Full suite: 886 passed;
 
 ## 17. `security.session_timeout_seconds` is read by nothing
 
-**Status: Observed (2026-09-10).** `grep -rn "security\.session_timeout_seconds"
+**Status: Fixed (v2 phase 12, 2026-10-28)** by giving it the meaning its name
+implies: it is now the admin-session **idle** timeout, and
+`authentication.token_expiry_seconds` stays the absolute lifetime. A
+session ends at whichever comes first. Every authenticated request counts as
+activity, so an open control-panel tab that keeps refreshing stays signed in
+until the absolute limit. Behaviour change to note: deployments already had
+`session_timeout_seconds = 1800`, so admin sessions now end after 30 idle
+minutes. Evidence: `SessionStore` idle/absolute tests and
+`test_the_api_applies_security_session_timeout_as_the_idle_limit` in
+`tests/unit/test_api_access_hardening.py`. What follows is the original
+report.
+
+**Originally observed (2026-09-10).** `grep -rn "security\.session_timeout_seconds"
 pirewall/ tests/` returns nothing. The field is declared in
 `SecurityConfig` and set in both `config/default_config.toml` and the
 deployment's `local_config.toml`, but no code path reads it. The admin

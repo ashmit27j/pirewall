@@ -43,11 +43,26 @@ class Session:
 
 
 class SessionStore:
-    """In-memory session-token table. No cross-restart persistence needed for a single admin."""
+    """In-memory session-token table. No cross-restart persistence needed for a single admin.
 
-    def __init__(self, token_expiry_seconds: int) -> None:
+    Two limits, and a session ends at whichever comes first
+    (KNOWN_ISSUES.md #17):
+
+    * `token_expiry_seconds` (`authentication.token_expiry_seconds`): the
+      absolute lifetime from login. It is what `Session.expires_at` and the
+      cookie carry.
+    * `idle_timeout_seconds` (`security.session_timeout_seconds`): the
+      longest gap between two authenticated requests. Every successful
+      `validate` counts as activity, including the control panel's own
+      periodic refreshes, so an open dashboard tab keeps its session alive
+      until the absolute limit. `None` disables the idle limit.
+    """
+
+    def __init__(self, token_expiry_seconds: int, idle_timeout_seconds: int | None = None) -> None:
         self._token_expiry_seconds = token_expiry_seconds
+        self._idle_timeout = None if idle_timeout_seconds is None else timedelta(seconds=idle_timeout_seconds)
         self._sessions: dict[str, Session] = {}
+        self._last_used: dict[str, datetime] = {}
 
     def create(self, username: str, now: datetime) -> Session:
         token = secrets.token_urlsafe(_SESSION_TOKEN_BYTES)
@@ -58,19 +73,25 @@ class SessionStore:
             expires_at=now + timedelta(seconds=self._token_expiry_seconds),
         )
         self._sessions[token] = session
+        self._last_used[token] = now
         return session
 
     def validate(self, token: str, now: datetime) -> Session | None:
+        """The live session for `token`, refreshing its idle clock; None if absent, expired or idle."""
         session = self._sessions.get(token)
         if session is None:
             return None
-        if session.expires_at <= now:
-            del self._sessions[token]
+        last_used = self._last_used.get(token, session.issued_at)
+        idle_expired = self._idle_timeout is not None and now - last_used >= self._idle_timeout
+        if session.expires_at <= now or idle_expired:
+            self.invalidate(token)
             return None
+        self._last_used[token] = now
         return session
 
     def invalidate(self, token: str) -> None:
         self._sessions.pop(token, None)
+        self._last_used.pop(token, None)
 
 
 class Authenticator:
@@ -89,6 +110,16 @@ class Authenticator:
             raise AuthenticationError("invalid username or password")
         return self._sessions.create(username, now)
 
+    def confirm_password(self, password: str) -> bool:
+        """True if `password` is the admin password: re-authentication for sensitive changes.
+
+        A valid session proves someone logged in once; asking for the
+        password again proves the person holding the session knows it now
+        (`POST /api/v1/allowlist`). Callers count a False here as a failed
+        login (`pirewall.api.throttle`).
+        """
+        return verify_password(password, self._admin_password_hash)
+
     def authenticate(self, token: str, now: datetime) -> Session:
         session = self._sessions.validate(token, now)
         if session is None:
@@ -104,8 +135,25 @@ def enforce_admin_pc_ip(
     admin_pc_ip: str,
     restrict: bool,
     allow_local_console: bool = False,
+    server_host: str | None = None,
+    expected_server_address: str | None = None,
 ) -> None:
     """Raise `AuthenticationError` if `client_host` isn't the configured Admin PC (spec §29).
+
+    **Defence in depth only.** A source IP is the weakest of the three
+    things that identify the Admin PC, because anything on the segment can
+    claim it. The real pin is the nft rule that admits the admin port only
+    on the admin interface, from the Admin PC's MAC and IP (ADDENDUM_4.md,
+    `base.nft.template`); this check exists so a mistake in that rule is
+    not the only thing between the LAN and the control panel.
+
+    `expected_server_address` (`security.admin_server_address`) adds an
+    optional interface check: when set, the connection must also have
+    arrived on that local address (`server_host`, the address the server
+    socket accepted it on). With `api.host` bound to a wildcard, this stops a
+    request that reaches the panel through the LAN address. Unset, nothing
+    is checked. The local-console exemption below skips it, because a
+    loopback connection always arrives on loopback.
 
     `restrict` lets `config.security.restrict_to_admin_pc` disable this for
     local-network-only deployments; `client_host` being `None` (no
@@ -126,13 +174,17 @@ def enforce_admin_pc_ip(
         raise AuthenticationError(
             f"administrative access is restricted to the configured Admin PC ({admin_pc_ip})"
         )
-    if client_host == admin_pc_ip:
-        return
     if allow_local_console and _is_loopback(client_host):
         return
-    raise AuthenticationError(
-        f"administrative access is restricted to the configured Admin PC ({admin_pc_ip})"
-    )
+    if client_host != admin_pc_ip:
+        raise AuthenticationError(
+            f"administrative access is restricted to the configured Admin PC ({admin_pc_ip})"
+        )
+    if expected_server_address is not None and server_host != expected_server_address:
+        raise AuthenticationError(
+            "administrative access is restricted to the admin interface "
+            f"({expected_server_address})"
+        )
 
 
 def _is_loopback(client_host: str) -> bool:

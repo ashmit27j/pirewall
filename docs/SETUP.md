@@ -473,37 +473,34 @@ table alone is enough to restore forwarding in an emergency.
 
 ## The five demo accounts
 
-`seed-demo` creates five accounts so you can prove the portal works before
-provisioning anyone real:
+`seed-demo` creates five accounts (`demo-alice` … `demo-erin`) so you can
+prove the portal works before provisioning anyone real:
 
 ```sh
 sudo -u pirewall-core uv run python -m scripts.deployment.portal_users \
      seed-demo --i-understand-these-are-insecure
 ```
 
-| Username | Password |
-|---|---|
-| `demo-alice` | `pirewall-demo-1` |
-| `demo-bob` | `pirewall-demo-2` |
-| `demo-carol` | `pirewall-demo-3` |
-| `demo-dave` | `pirewall-demo-4` |
-| `demo-erin` | `pirewall-demo-5` |
+Their passwords are fixed and public: they are in
+`scripts/deployment/portal_users.py` (`DEMO_ACCOUNTS`), and this guide no
+longer reprints them. They are non-secret on purpose, since a *generated*
+password in a git-tracked file would be a committed credential. Anyone who
+can read the repository can join your protected network while they exist.
 
 > ### ⚠ Delete these before production
 >
-> **These passwords are published — they are printed in this file, in the
-> repository, and in the script's source.** They are fixed and non-secret on
-> purpose: a *generated* password written into a git-tracked document would
-> be a committed credential. Anyone who can read this repository, or who has
-> simply seen it, can join your protected network while they exist.
->
 > ```sh
-> for u in demo-alice demo-bob demo-carol demo-dave demo-erin; do
->   sudo -u pirewall-core uv run python -m scripts.deployment.portal_users remove "$u"
-> done
+> sudo -u pirewall-core uv run python -m scripts.deployment.portal_users remove-demo
 > ```
 >
-> While any of them exists, pirewall tells you so in three places: a
+> `remove-demo` removes every `demo-*` account, prints what it removed, and
+> is safe to run again. Restart `pirewall-core` afterwards.
+>
+> **pirewall-core refuses to start in ASSISTED or ACTIVE mode while any demo
+> account exists.** SHADOW still starts. To keep them on purpose (a lab, a
+> demo), set `portal.allow_demo_accounts = true`.
+>
+> While any of them exists, pirewall also tells you so in three places: a
 > `SYSTEM_WARNING` event at every `pirewall-core` startup, a banner on the
 > sign-in page, and a red notice on the control panel's portal panel. If you
 > see those, this step has not been done.

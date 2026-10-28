@@ -11,13 +11,17 @@ that tracks per-source state carries a cap (`max_tracked_sources`,
 both of these structures, so they get the same discipline.
 """
 
-from collections import deque
+from collections.abc import Hashable
 from datetime import datetime, timedelta
 from ipaddress import IPv4Address
 
 from pirewall.core.models.portal import PortalSession
+from pirewall.core.throttle import Lockout, LockoutScope, ScopedThrottle
 
 _SESSION_TOKEN_BYTES = 32
+# The longest username `PortalUserStore` accepts; a longer submitted name
+# can match no account, and must not make a throttle key bigger than one.
+_MAX_USERNAME_KEY_LENGTH = 64
 
 
 class PortalSessionRegistry:
@@ -101,17 +105,29 @@ class PortalSessionRegistry:
 
 
 class LoginThrottle:
-    """Per-source-IP failed-login limiter (ADDENDUM_3.md C3).
+    """Failed-login limiter per source IP, per account and globally (ADDENDUM_3.md C3, PLAN_FINAL §4.9).
 
-    The admin panel never needed this — ADDENDUM.md A4 and spec §29 keep it
-    reachable only from the Admin PC. The portal is deliberately reachable
-    by anything that can associate with the AP, so an online password-
-    guessing attack against it is a real, cheap attack that scrypt alone
-    only slows down.
+    The portal is deliberately reachable by anything that can associate
+    with the AP, so an online password-guessing attack against it is a
+    real, cheap attack that scrypt alone only slows down.
 
-    Sliding window over recorded failure timestamps, capped in both
-    dimensions: at most `max_tracked_sources` addresses, and at most
-    `max_failures` timestamps per address.
+    * **Per source IP** (`max_failures`): one device guessing is stopped
+      without affecting anyone else.
+    * **Per account** (`max_failures_per_account`): guessing one account's
+      password from many addresses (or spoofed ones) is stopped too.
+    * **Global** (`max_failures_global`): caps the total guessing rate.
+
+    The per-account and global limits are opt-in here (None disables them)
+    so this class keeps its per-IP meaning when built with only the first
+    two arguments; `PortalService` always sets all three from config. A
+    locked account or a global lockout refuses the *right* password too,
+    which is what makes it a throttle and also why its limits are looser
+    than the per-IP one: whoever trips them locks out other people.
+
+    Sliding windows over recorded failure timestamps, capped in both
+    dimensions (`pirewall.core.throttle.FailureWindow`): at most
+    `max_tracked_sources` keys per scope, and at most the scope's limit of
+    timestamps per key.
     """
 
     def __init__(
@@ -119,42 +135,49 @@ class LoginThrottle:
         max_failures: int,
         window_seconds: int,
         max_tracked_sources: int = 4096,
+        *,
+        max_failures_per_account: int | None = None,
+        max_failures_global: int | None = None,
     ) -> None:
-        self._max_failures = max_failures
-        self._window_seconds = window_seconds
-        self._max_tracked_sources = max_tracked_sources
-        self._failures: dict[IPv4Address, deque[datetime]] = {}
+        limits = {LockoutScope.SOURCE: max_failures}
+        if max_failures_per_account is not None:
+            limits[LockoutScope.ACCOUNT] = max_failures_per_account
+        if max_failures_global is not None:
+            limits[LockoutScope.GLOBAL] = max_failures_global
+        self._throttle = ScopedThrottle(limits, window_seconds, max_tracked_sources)
+
+    def lockout(self, client_ip: IPv4Address, username: str | None, now: datetime) -> Lockout | None:
+        """The lockout refusing a login from `client_ip` as `username`, or None."""
+        return self._throttle.lockout(_keys(client_ip, username), now)
 
     def is_locked_out(self, client_ip: IPv4Address, now: datetime) -> bool:
-        recent = self._recent(client_ip, now)
-        return len(recent) >= self._max_failures
+        """Per-IP (and global) lockout only, ignoring accounts."""
+        return self.lockout(client_ip, None, now) is not None
 
     def seconds_until_unlocked(self, client_ip: IPv4Address, now: datetime) -> int:
-        recent = self._recent(client_ip, now)
-        if len(recent) < self._max_failures:
-            return 0
-        unlock_at = recent[0] + timedelta(seconds=self._window_seconds)
-        return max(0, int((unlock_at - now).total_seconds()))
+        lockout = self.lockout(client_ip, None, now)
+        return 0 if lockout is None else lockout.retry_after_seconds
 
-    def record_failure(self, client_ip: IPv4Address, now: datetime) -> None:
-        if client_ip not in self._failures and len(self._failures) >= self._max_tracked_sources:
-            # Bounded: evict the address whose most recent failure is oldest.
-            stalest = min(self._failures, key=lambda key: self._failures[key][-1])
-            del self._failures[stalest]
-        recent = self._failures.setdefault(client_ip, deque(maxlen=self._max_failures))
-        recent.append(now)
+    def record_failure(
+        self, client_ip: IPv4Address, now: datetime, username: str | None = None
+    ) -> tuple[LockoutScope, ...]:
+        """Record one failed login. Returns the scopes this failure newly locked."""
+        return self._throttle.record_failure(_keys(client_ip, username), now)
 
-    def clear(self, client_ip: IPv4Address) -> None:
-        """Forget an address's failures — called on a successful login."""
-        self._failures.pop(client_ip, None)
+    def clear(self, client_ip: IPv4Address, username: str | None = None) -> None:
+        """Forget an address's (and account's) failures — called on a successful login."""
+        self._throttle.clear(LockoutScope.SOURCE, client_ip)
+        if username is not None:
+            self._throttle.clear(LockoutScope.ACCOUNT, _account_key(username))
 
-    def _recent(self, client_ip: IPv4Address, now: datetime) -> deque[datetime]:
-        recent = self._failures.get(client_ip)
-        if recent is None:
-            return deque()
-        cutoff = now - timedelta(seconds=self._window_seconds)
-        while recent and recent[0] <= cutoff:
-            recent.popleft()
-        if not recent:
-            del self._failures[client_ip]
-        return recent
+
+def _account_key(username: str) -> str:
+    """Case-folded, so `Alice` and `alice` share one count; capped like a stored username."""
+    return username.casefold()[:_MAX_USERNAME_KEY_LENGTH]
+
+
+def _keys(client_ip: IPv4Address, username: str | None) -> dict[LockoutScope, Hashable]:
+    keys: dict[LockoutScope, Hashable] = {LockoutScope.SOURCE: client_ip}
+    if username is not None:
+        keys[LockoutScope.ACCOUNT] = _account_key(username)
+    return keys

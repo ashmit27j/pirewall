@@ -7,7 +7,9 @@ deliberately thin. Everything it does is:
 1. Parse arguments (just a config path).
 2. Load and validate `PirewallConfig` — a `ConfigurationError` here exits
    non-zero *before* any privileged resource is touched, so an invalid
-   config can never leave a half-started firewall behind.
+   config can never leave a half-started firewall behind. The same goes for
+   demo portal accounts surviving into ASSISTED/ACTIVE
+   (`pirewall.portal.demo_policy`).
 3. Configure logging (`pirewall.core.logging`).
 4. Build a `pirewall.runtime.core.CoreDaemon` and run it.
 
@@ -37,6 +39,7 @@ from pirewall.config.loader import load_config
 from pirewall.config.models import PirewallConfig
 from pirewall.core.exceptions import ConfigurationError, PirewallError
 from pirewall.core.logging import configure_logging
+from pirewall.portal.demo_policy import refuse_demo_accounts_when_enforcing
 from pirewall.runtime.core import CoreDaemon
 
 _COMPONENT = "core"
@@ -88,6 +91,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config_path = args.config if args.config is not None else default_config_path()
     config = load(config_path)
+    try:
+        # Before anything privileged opens, like a bad config (PLAN_FINAL §4.9).
+        refuse_demo_accounts_when_enforcing(config)
+    except ConfigurationError as exc:
+        print(f"pirewall-core: {exc}", file=sys.stderr)
+        return EXIT_FAILURE
 
     if args.check_config:
         print(f"pirewall-core: configuration at {config_path} is valid")

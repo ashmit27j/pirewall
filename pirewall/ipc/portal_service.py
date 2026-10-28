@@ -78,7 +78,10 @@ class PortalService:
             config.portal.session_timeout_seconds, max_sessions=config.portal.max_sessions
         )
         self._throttle = LoginThrottle(
-            config.portal.max_failed_logins_per_ip, config.portal.failed_login_window_seconds
+            config.portal.max_failed_logins_per_ip,
+            config.portal.failed_login_window_seconds,
+            max_failures_per_account=config.portal.max_failed_logins_per_account,
+            max_failures_global=config.portal.max_failed_logins_global,
         )
 
     # ---------------------------------------------------------------- client
@@ -102,12 +105,16 @@ class PortalService:
         """
         now = self._now_fn()
 
-        if self._throttle.is_locked_out(client_ip, now):
-            wait = self._throttle.seconds_until_unlocked(client_ip, now)
+        # Per IP, per account and global (PLAN_FINAL §4.9). Checked before
+        # the password, so a locked attempt costs no scrypt and reveals nothing.
+        lockout = self._throttle.lockout(client_ip, username, now)
+        if lockout is not None:
+            wait = lockout.retry_after_seconds
             self._emit(
                 EventSeverity.WARNING,
                 SecurityEventType.AUTHENTICATION_FAILURE,
-                f"portal login throttled for {client_ip} ({wait}s remaining)",
+                f"portal login throttled for {client_ip} as {username!r} "
+                f"({lockout.scope.value} lockout, {wait}s remaining)",
             )
             raise PortalLoginError(f"Too many failed attempts. Try again in {wait} seconds.")
 
@@ -120,12 +127,19 @@ class PortalService:
             raise PortalLoginError(_BLOCKED_MESSAGE + " " + self._config.portal.contact_message)
 
         if not self._store.verify(username, password):
-            self._throttle.record_failure(client_ip, now)
+            newly_locked = self._throttle.record_failure(client_ip, now, username)
             self._emit(
                 EventSeverity.WARNING,
                 SecurityEventType.AUTHENTICATION_FAILURE,
                 f"portal login failed for username {username!r} from {client_ip}",
             )
+            for scope in newly_locked:
+                self._emit(
+                    EventSeverity.WARNING,
+                    SecurityEventType.AUTHENTICATION_FAILURE,
+                    f"portal login lockout started ({scope.value}) after a failed login "
+                    f"for {username!r} from {client_ip}",
+                )
             raise PortalLoginError("Invalid username or password.")
 
         token = secrets.token_urlsafe(_SESSION_TOKEN_BYTES)
@@ -146,7 +160,7 @@ class PortalService:
             )
             raise PortalLoginError("Could not grant network access. Please try again.") from exc
 
-        self._throttle.clear(client_ip)
+        self._throttle.clear(client_ip, username)
         self._emit(
             EventSeverity.INFO,
             SecurityEventType.FIREWALL_ALLOW,
@@ -345,7 +359,8 @@ class PortalService:
             EventSeverity.WARNING,
             SecurityEventType.SYSTEM_WARNING,
             f"portal demo accounts are still present ({', '.join(demo)}) — their passwords are "
-            "published in docs/SETUP.md and must be removed before production use",
+            "public (scripts/deployment/portal_users.py) and they must be removed before "
+            "production use: portal_users remove-demo",
         )
 
     def _revoke(self, client_ip: IPv4Address, reason: str) -> None:

@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.requests import HTTPConnection
 
 from pirewall.api.auth import Authenticator, Session, SessionStore, enforce_admin_pc_ip
+from pirewall.api.throttle import AdminLoginThrottle
 from pirewall.config.models import PirewallConfig
 from pirewall.core.exceptions import AuthenticationError, RpcError
 from pirewall.ipc.client import BaseRpcClient
@@ -45,20 +46,32 @@ def get_authenticator(connection: HTTPConnection) -> Authenticator:
     return authenticator
 
 
+def get_login_throttle(connection: HTTPConnection) -> AdminLoginThrottle:
+    throttle = connection.app.state.pirewall_login_throttle
+    assert isinstance(throttle, AdminLoginThrottle)
+    return throttle
+
+
 ConfigDep = Annotated[PirewallConfig, Depends(get_config)]
 RpcClientDep = Annotated[BaseRpcClient, Depends(get_rpc_client)]
 AuthenticatorDep = Annotated[Authenticator, Depends(get_authenticator)]
+LoginThrottleDep = Annotated[AdminLoginThrottle, Depends(get_login_throttle)]
 
 
 def require_admin_pc(request: Request, config: ConfigDep) -> None:
     """Spec §29: restrict administrative access to the configured Admin PC IP."""
     client_host = request.client.host if request.client else None
+    server = request.scope.get("server")
+    server_host = str(server[0]) if server else None
+    expected_server = config.security.admin_server_address
     try:
         enforce_admin_pc_ip(
             client_host,
             str(config.admin.admin_pc_ip),
             config.security.restrict_to_admin_pc,
             config.admin.allow_local_console,
+            server_host=server_host,
+            expected_server_address=None if expected_server is None else str(expected_server),
         )
     except AuthenticationError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -126,8 +139,12 @@ def create_app(
     app.state.pirewall_authenticator = authenticator or Authenticator(
         config.authentication.admin_username,
         config.authentication.admin_password_hash,
-        SessionStore(config.authentication.token_expiry_seconds),
+        SessionStore(
+            config.authentication.token_expiry_seconds,
+            idle_timeout_seconds=config.security.session_timeout_seconds,
+        ),
     )
+    app.state.pirewall_login_throttle = AdminLoginThrottle(config.authentication)
 
     if config.api.cors_origins:
         app.add_middleware(

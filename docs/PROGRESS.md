@@ -34,7 +34,7 @@ are regression evidence and are labelled as such.
 |---|-------|--------|-------|
 | 11 | v2 contracts, project rules, additive config, `migrate_config.py` | Complete | See "Phase 11 details" below. No runtime behaviour changed. |
 | 12 | Access hardening and hygiene (P0) | Complete | See "Phase 12 details" below. Wazuh forwarding of API-reported events is handed to phase 16. |
-| 13 | Kernel data plane, set backend, guard modes, kill switch, panic | Not started | Prompt: `phase-13-kernel-data-plane.md`. Integrator for `firewall/manager.py`. |
+| 13 | Kernel data plane, set backend, guard modes, kill switch, panic | Complete | See "Phase 13 details" below. Built beside v1, not wired into core (phase 16). Netns tier 24/24 passed, env=sandbox only. Pi nft 1.0.6 is Environment-dependent. |
 | 14 | MAC identity end to end, bindings, anti-spoof, portal binding | Not started | Prompt: `phase-14-mac-identity-antispoof.md`. Depends on 13. Integrator for `runtime/core.py` and `firewall/manager.py`. |
 | 15 | Native hardening, pcap reader, replay capture backend | Not started | Prompt: `phase-15-native-hardening-replay.md`. Can run in parallel with 12 and 13. Also implements `pirewall/flow/connection_start.py` (V2_CONTRACTS §11). |
 | 16 | `pirewall-start` v2, deployment templates, systemd, data modes, lab victim | Not started | Prompt: `phase-16-startup-deploy.md`. Depends on 13, 14, 15. Marks **v2.0 deployable**. |
@@ -299,6 +299,190 @@ PMF, startup self-checks, dnsmasq lease cap or ARCHITECTURE.md dependency
 note from PLAN_FINAL §4.9. The phase-12 prompt doesn't include them. They
 belong to phase 16's deployment work.
 
+
+### Phase 13 details
+
+**Scope.** The v2 kernel data plane, built beside the v1 path: templates,
+the set backend (real and fake), guard modes, the manager's set path, the
+v2 validator, the invariant helpers and the netns tier. **No runtime
+wiring.** `pirewall-core` still builds `FirewallManager` without a
+`set_backend` and still runs the v1 `forward`-chain backend. Phase 16 moves
+it onto `NftablesSetBackend`. No MAC plumbing through capture (phase 14),
+no detection changes, no `pirewall-start` changes.
+
+**Sandbox environment for every `netns` result below** (env=sandbox,
+**never Pi results**): WSL2 kernel 6.18.33.2, nft 1.1.6, hping3 3.0.0-alpha-2,
+system Python 3.14.4 with scapy 2.7.01, run as root on 2026-10-28.
+
+| Deliverable | Label | Evidence |
+|---|---|---|
+| 1a. `pirewall_static.nft.template` ported to `deploy/firewall/` | Tested (unit); sandbox-tested (netns); Environment-dependent on the Pi | Byte-identical to `docs/v2/v2/`. No test forced a change. |
+| 1a. `pirewall_adaptive.nft.template` ported, with three changes | Tested (unit); sandbox-tested (netns) | Deviations 2–4. `test_v2_contracts.py` pins that it only *adds* to the sandbox-tested copy's sets, chains and counters. |
+| 1b. `base.nft.template`: admin pinned to `iifname` + MAC + IP, DNS pinned to the LAN interface | Tested (unit); sandbox-tested (netns 5) | `test_base_pins_admin_access_and_lan_dns`; netns 5: the admin survives a flood and a spoofed admin IP is dropped. The portal set change is left to phase 14. |
+| 1c. `render_templates.py`: LAN/WAN/admin interfaces, admin MAC, Pi addresses, `infra4`, every `[guards]` rate, burst, size and verdict; refuses to render with any variable missing | Tested | `test_render_templates.py`, `test_every_deployed_firewall_template_renders_completely`, `test_rendering_refuses_without_the_admin_identity`. All-or-nothing: no file is written if any template fails. |
+| 2. `NftablesSetBackend` (`backend/nftables_sets.py`) over libnftables or `nft -j -f -` (`backend/nft_transport.py`), with `transport` and `metrics()` | sandbox-tested (netns); Environment-dependent on the Pi | Every netns test drives it. `test_both_transports_write_the_same_kernel_state` runs both transports against one kernel (libnftables was the one selected). |
+| 2. Operations: `apply` (atomic batch), `add_element`, `delete_element` (idempotent), `flush_set(s)`, `list_set`, `set_fill`, `set_guard_mode(s)`, `guard_mode`, `table_exists`, `panic`, `snapshot` | sandbox-tested (netns); Tested (fake) | `delete table` appears only in `panic`, and only for `nft_names.PANIC_TABLES`. `pirewall_base` and `pirewall_portal` are never touched (netns 7, `test_d1_…`). |
+| 2. `FakeSetBackend` (`backend/fake_sets.py`): clock-driven element timeouts, set sizes with a failing add when full, guard chains, atomic batches, panic, reload | Tested | `tests/unit/test_firewall_sets.py`. |
+| 3. `FirewallManager` set path: BLOCK → `block_mac`/`block4`, RATE_LIMIT → `ratelimit_mac`/`ratelimit4`; lifecycle, A3 counting element insertions, A7 approval, A1 SHADOW writing nothing | Tested (fake); sandbox-tested (netns 7, C4, reconcile) | `tests/unit/test_manager_sets.py`. A port scan is one element (`test_a_scan_of_many_ports_is_one_element_not_one_rule_per_port`). |
+| 3. Upgrade (RATE_LIMIT → BLOCK) as one atomic delete + add | Tested (fake); sandbox-tested (`test_d1_…`) | `test_a_block_upgrades_a_rate_limit_in_one_atomic_batch` checks the single batch. |
+| 3. Reconcile on start from live set contents, never recreating a table | Tested (fake); sandbox-tested (netns) | `test_reconcile_adopts_retires_and_reports`, `test_reconcile_never_recreates_a_missing_table`, netns `test_reconcile_adopts_live_elements_from_a_previous_run`. |
+| 3. `revert_to_base` (kill switch): SHADOW, flush the four enforcement sets, **every** guard to observe, audit | Tested (fake); sandbox-tested (netns 7) | After it, the blocked client reaches the victim again, both v2 tables and base stay loaded, and all three verdict chains read back as observe. |
+| 3. `fail_open_shutdown`: flushes the adaptive sets only, guards untouched | Tested (fake); sandbox-tested (netns) | `test_fail_open_shutdown_leaves_the_guards_enforcing`: after it, a SYN flood to the Pi is still dropped by the static guard. |
+| 3. `panic(actor)` → `PanicResult` (the RPC stub; phase 16 wires the dispatcher and `--panic`) | Tested (fake); sandbox-tested (netns 7, `test_d1_…`) | Deletes `inet pirewall_static`, `arp pirewall_static_arp`, `inet pirewall_adaptive`. `pirewall_base` stays and still refuses LAN → API. All rules go to REMOVED and the mode to SHADOW. |
+| 3. `set_guard_mode` / `guard_modes`, audited | Tested (fake); sandbox-tested (netns 6) | netns 6 is the observe/enforce flip through the manager. Observe still records `@offenders`, enforce drops, and each verdict chain holds exactly one rule in either mode. |
+| 4. Validator v2 (`validate_set_candidate`), stage order schema → network → allowlist → safety → conflict → duplicate → rate-cap → escalation → expiration → authorization | Tested | `tests/unit/test_manager_sets.py` covers each stage: UNENFORCEABLE targets, Pi/gateway/admin IP and admin MAC refused, port-scoped allowlist entries protecting the whole device, the conflict, the duplicate, NO_NEW_EVIDENCE and EXPIRATION_TOO_LONG. The v1 chain is unchanged. |
+| 5a. Ruleset-diff helper (`tests/helpers/ruleset_diff.py`) | Tested (fake); sandbox-tested (real `nft -j list ruleset`) | `test_every_manager_operation_stays_inside_d1s_allowance` (fake) and netns `test_d1_every_manager_operation_changes_only_what_d1_allows` (real kernel: RATE_LIMIT, upgrade, BLOCK, guard flip, kill switch, then panic). |
+| 5b. No rule reads `@offenders` in a verdict | Tested | `test_offenders_is_only_ever_written_never_matched`. |
+| 5c. Every LAN chain is guarded by `iifname` | Tested | `test_every_hooked_chain_is_guarded_by_the_lan_interface`, `test_hookless_chains_are_only_reached_by_jumps_from_guarded_chains`. |
+| 6. Netns tier: `test_ruleset.py` assertions 1–13 through `NftablesSetBackend` + `FirewallManager` | sandbox-tested: **24/24 passed** | Assertions 1a–1d, 2, 3a–3c, 4, 5, 6, 7, 8, 9, 10a, 10b, 11, 12, 13. |
+| 6. Phase-13 additions: blocked MAC still reaches DHCP, DNS and the portal; kill switch → panic; reload idempotency with live elements; fail-open leaves guards active | sandbox-tested | `test_c4_…` (also checks that the DHCP exemption does not reach an outside host), `test_7_…`, `test_8_…`, `test_fail_open_…`. |
+| 7. `docs/FIREWALL.md` v2 section; `deploy/firewall/README.md` (load order, `nftables.service` flush hazard, panic one-liner) | Implemented (documentation) | |
+| nft 1.0.6 on the Pi, libnftables through phase 16's `.pth`, `ether saddr` on `wlan0` in AP mode | **Environment-dependent** | Nothing here ran on the Pi. To verify: load the rendered templates with `sudo nft -c -f` and then `sudo nft -f` on the Pi's nft 1.0.6, then run `sudo -E uv run pytest tests/netns` on the Pi, or a Pi-side equivalent. The idempotent-delete and panic idioms were checked on nft 1.1.6 only. |
+
+**Audit flaws closed in code** (`docs/v2/audit_new_main.md` §1, the table
+the prompt calls "KNOWN_ISSUES v1 items"; see deviation 1). Each is fixed
+on the set path. Each becomes live only when phase 16 wires
+`NftablesSetBackend` into core.
+
+| Audit # | Flaw | Status |
+|---|---|---|
+| 13 | Adaptive chain only on `forward` | **Fixed in code.** Tested; sandbox-tested. `pirewall_adaptive` hooks prerouting -299, so it covers input and forward. netns 7 blocks a client toward the victim, and C4 shows the exemptions toward the Pi are the only path left. |
+| 14 | Rules are src→dst:dport tuples | **Fixed in code.** Tested. One element per device. Duplicate and conflict checks key on the device. |
+| 15 | One `nft` subprocess per rule | **Fixed in code.** sandbox-tested. One batch per operation over libnftables, with the batched subprocess as fallback. Latency stays the sandbox figure from `docs/v2/v2/RESULTS.md` (env=sandbox). No Pi number. |
+| 17 | Fail-open plus a crash is an off switch | **Fixed in the manager.** Tested; sandbox-tested. `fail_open_shutdown` leaves the guards enforcing. Still live in core until phase 16: `runtime/core.py` calls `revert_to_base` when it fails open, and phase 13 may not edit that file. The crash-loop CRITICAL is phase 16's too. |
+
+**Deviations and choices where the prompt was ambiguous:**
+
+1. **"KNOWN_ISSUES v1 items 13, 14 and 15".** `docs/KNOWN_ISSUES.md` §13–15
+   are about an unmerged branch, a capture counter and the API log, none of
+   them phase 13's. The numbers match the audit's flaw table
+   (`audit_new_main.md` §1: #13 forward-only, #14 port tuples, #15
+   subprocess per rule), so they are read that way. `KNOWN_ISSUES.md` is
+   not edited.
+2. **`ratelimit4`, `rl4_meter`, `c_ratelimit4` added to the adaptive
+   template**, as the prompt asks, with matching `nft_names` constants
+   (`SET_RATELIMIT4`, `SET_RL4_METER`, `ADAPTIVE_BLOCK_SETS`). This is an
+   addition to a contract, pinned by `test_v2_contracts.py`.
+   `ADAPTIVE_ENFORCEMENT_SETS` gained `ratelimit4`, so the kill switch
+   flushes four sets, not three. `docs/V2_CONTRACTS.md` §7 still lists three
+   enforcement sets in its table (it names `ratelimit4` only under "planned
+   names"). That file is phase 11's, so it is not edited here.
+3. **C4 exemptions in the adaptive table** (ADDENDUM_4 "What this addendum
+   changes"). Before any block rule, it returns:
+   * DHCP to the broadcast address or the Pi;
+   * DNS (udp/tcp 53) to the Pi;
+   * tcp 80 and the portal port to the Pi. Port 80 is the DHCP option-114
+     URL, which the portal table DNATs, and DNAT happens after -299.
+
+   The first port of this exemption was an unscoped `udp sport 68 udp dport
+   67 return`. That let a blocked device reach *any* host on UDP 67. It was
+   tightened this session, and the netns C4 test now checks that a blocked
+   device's 68→67 packet to an outside host is dropped. The static guards'
+   meters still police every exempt packet.
+4. **The `ip saddr @infra4 return` is removed** (PLAN_FINAL §4.2,
+   critique_round2 item 1). `infra4` stays as the rendered never-target
+   list. The validator mirrors it, from config plus the host's live
+   addresses.
+5. **The raw guard's source-validation drops stay bare `drop`s**, as tested
+   (ADDENDUM_4 D2). PLAN_FINAL §4.2 has them jump to `guard_verdict_raw`.
+   No test forced a change: netns 2, 3a and 5 pass with the bare drops, and
+   with no bindings seeded the mismatch rule cannot match. Outcome: the
+   tested behaviour is kept, so an observe-mode raw guard still drops true
+   martians and spoofed bound addresses.
+6. **`pi_addrs` was not added.** PLAN_FINAL lists it in the adaptive table,
+   but nothing in the phase-13 prompt needs it. The static template's bogon
+   rule already drops the Pi's own address as a LAN source (netns 5).
+7. **The set backend's location.** It is a new module,
+   `backend/nftables_sets.py`, not a new class inside `backend/nftables.py`,
+   so the v1 file stays untouched until phase 16 removes it. The JSON
+   transport (`nft_transport.py`) and the fake (`fake_sets.py`) are
+   separate modules too. All of it is under `pirewall/firewall/backend/**`,
+   which this phase owns. The Protocol, `SetOp` and the rule → element
+   translation live in `pirewall/firewall/sets.py`; the guard batches live
+   in `guards.py`.
+8. **Idempotent writes on nft 1.0.6,** which has no `destroy`. Deleting an
+   element is `add` (timeout 1 s) then `delete` in one transaction. Panic
+   is `add table` then `delete table` for each panic table. One edge case:
+   deleting an absent element from a *full* set fails. The kill switch and
+   fail-open flush rather than delete, so neither hits it.
+9. **A verdict chain keeps its named counter in both modes.** A flip is
+   `flush chain` + `counter name c_verdict_<guard>` (+ `drop`), as in the
+   sandbox's `set_mode`. Dropping the counter would silence the per-guard
+   hit count the phase-17 poller reads.
+10. **The v2 network stage needs a LAN device.** A rule whose source is not
+    a `/32` inside `network.protected_network` (a WAN source, or a range) is
+    rejected as `UNENFORCEABLE`, because v2 enforces per device at LAN
+    ingress. Under the v1 adapter in phase 16, v1 decisions against WAN
+    sources therefore deploy nothing on the set path.
+11. **The allowlist stage is per device.** Any allowlist entry covering the
+    target IP refuses it, whatever port the entry names, because an element
+    acts on the whole device.
+12. **Escalation means "evidence ids not already on the active rule".**
+    Repeated evidence never upgrades or lengthens an action. TTL
+    multiplication is the policy engine's job (phase 17). The manager only
+    caps at `policy.max_ttl_seconds`.
+13. **Reconcile.** It adopts IP-keyed elements left by a previous run as
+    ACTIVE rules (id `reconciled:<set>:<ip>`, expiring with the element). It
+    retires ACTIVE rules whose element is gone. MAC-keyed elements it
+    cannot attribute are reported and left to expire (≤ 1 h): core never
+    deletes enforcement it cannot explain. Phase 14 can attribute them
+    through the binding table.
+14. **A refused add is CRITICAL** (`FIREWALL_ERROR`; PLAN_FINAL §4.2), and
+    the rule goes to REJECTED. PLAN_FINAL's "falls back to a coarser
+    action" and its 80%-full alert are not built. `set_fill` is exposed for
+    the phase 16/17 poller.
+15. **New config keys are optional, and rendering refuses without them.**
+    `network.admin_interface` and `admin.admin_pc_mac` default to unset, so
+    a 1.x config still loads. `render_templates.py` refuses to render
+    `base.nft` until both are set. **Consequence for an existing Pi:**
+    `pirewall-start` stops at its render step until both keys are added to
+    `config/local_config.toml` by hand (`configure.py` collects them in
+    phase 16). `migrate_config.py` is not extended, because it cannot invent
+    a MAC or an interface name.
+16. **Re-authentication for a guard flip to ENFORCE is the API's job**
+    (V2_CONTRACTS §9, phase 16). `FirewallManager.set_guard_mode` audits
+    every flip whoever calls it.
+17. **`tests/security/test_backend_isolation.py`** now also refuses the
+    set-backend method names outside the manager. `panic` and
+    `set_guard_mode` are left off the list, because they are also
+    `FirewallManager`'s public names.
+18. **Netns tier mechanics.**
+    * The test process enters `pw_r` (`setns`) so that both transports hit
+      the namespace's kernel, and never the host's.
+    * The rulesets are rendered by our renderer from a real
+      `PirewallConfig`, with the sandbox's lowered test thresholds.
+    * When the venv cannot import Debian's `python3-nftables`, a one-entry
+      shim exposes only that package to the test process.
+    * Client-side helpers run on `/usr/bin/python3`, because under
+      `uv run` a bare `python3` is the venv's and has no scapy. Fixed this
+      session: the tier had been skipping everything.
+    * The scapy helper now fails loudly. Its quoting had silently turned
+      every scapy program into a syntax error, which is how 3b first
+      failed.
+    * The tier skips unless the host has root, `ip`, `nft`, `hping3`,
+      `curl`, `conntrack` and a system python with scapy.
+19. **Files edited outside the prompt's "Owns" list**, all additive and
+    allowed by V2_CONTRACTS §12 or CLAUDE.md:
+    * `pirewall/core/enums.py`: `RuleRejectionReason.UNENFORCEABLE`,
+      `EXPIRATION_TOO_LONG` and `NO_NEW_EVIDENCE`, and `NftTransportKind`.
+    * `pirewall/config/models.py`: the two optional keys in deviation 15.
+    * `pirewall/core/nft_names.py` (deviation 2).
+    * The related tests: `test_v2_contracts.py`, `test_render_templates.py`
+      and `test_backend_isolation.py`.
+    * `docs/FIREWALL.md`, which the prompt asks for.
+
+**Not done here, by design:**
+
+* `runtime/core.py` wiring, the dispatcher's panic and guard RPCs,
+  `pirewall-start --panic`, the `nftables.service` preflight, the
+  one-second table check and crash-loop CRITICAL (all phase 16).
+* `sync_bindings`, MAC resolution from leases, the portal `(ip, mac)` set
+  and `blocking_rules_matching` by MAC (all phase 14).
+* The Pi run (Environment-dependent).
+
+**Referenced but not yet written:** `docs/v2/RUNBOOK_PI.md`, the phase
+18–20 prompts, and `lab/` with its mock outputs. Nothing was invented for
+them.
 
 ### Detection-quality and native capture overhaul (2026-10-15)
 

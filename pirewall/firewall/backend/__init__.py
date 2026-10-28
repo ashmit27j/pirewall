@@ -7,6 +7,8 @@ enforced by `tests/security/test_backend_isolation.py`.
 """
 
 from pirewall.firewall.backend.fake import FakeFirewallBackend
+from pirewall.firewall.backend.fake_sets import FakeSetBackend
 from pirewall.firewall.backend.nftables import NftablesBackend
+from pirewall.firewall.backend.nftables_sets import NftablesSetBackend
 
-__all__ = ["FakeFirewallBackend", "NftablesBackend"]
+__all__ = ["FakeFirewallBackend", "FakeSetBackend", "NftablesBackend", "NftablesSetBackend"]

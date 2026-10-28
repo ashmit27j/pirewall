@@ -214,3 +214,120 @@ access in a *separate* nftables table (`inet pirewall_base`), evaluated
 *after* the adaptive table's `forward` chain (priority `10` vs. the
 adaptive chain's `0`) — so a narrow, evidence-driven adaptive block always
 gets first say over the broader static policy.
+
+## v2: the set-based kernel data plane (ADDENDUM_4.md D1, D2, D4, D5; phase 13)
+
+Everything above describes the v1 path, which is still what
+`pirewall-core` runs until phase 16 wires the set backend in. Phase 13
+built the v2 path beside it. `FirewallManager` takes it when it is
+constructed with a `set_backend`; without one, nothing above changes.
+
+### Two kernel tables, loaded by `pirewall-start`
+
+| Table | Hook / priority | Holds | Written at runtime by |
+|---|---|---|---|
+| `inet pirewall_static` (+ `arp pirewall_static_arp`) | prerouting -450 / -300, input and forward -5 | anti-spoof, per-MAC flood meters, the three `guard_verdict_*` chains | core changes only the verdict chains' contents (`set_guard_mode`), plus panic |
+| `inet pirewall_adaptive` | prerouting -299 (before conntrack) | `block_mac`, `block4`, `ratelimit_mac`, `ratelimit4`, `allow_bound`, `infra4` | `FirewallManager` writes set **elements** only, never rules |
+| `inet pirewall_base` | input 0, forward 10 | static posture, `policy drop` | nothing in v2 |
+| `inet pirewall_portal` | forward -10 | C2 portal sessions | the existing C2 path only |
+
+Core never creates or deletes a table, except panic. The templates live in
+`deploy/firewall/`; see `deploy/firewall/README.md` for the load order.
+
+Because `pirewall_adaptive` hooks prerouting, it sees traffic **to** the Pi
+as well as traffic **through** it (audit flaw #13: v1's adaptive chain sat
+on `forward` only). It returns DHCP, DNS and the portal toward the Pi
+before any block rule, so a blocked device still renews its lease and can
+read the C4 block notice.
+
+### From a validated rule to a set element
+
+```text
+CandidateRule
+   |  pirewall.firewall.sets.device_target   (the rule's LAN /32 source; MAC from the resolver)
+   v
+pirewall.firewall.validator.validate_set_candidate   <-- v2 chain, per device
+   |
+   v
+FirewallManager: SHADOW -> nothing written | ASSISTED BLOCK >= threshold -> PENDING_APPROVAL
+   |
+   v
+SetBackend.apply([SetOp(...)])   one atomic batch, element timeout = min(TTL, policy.max_ttl_seconds, 3600 s)
+```
+
+| Action | MAC known | IP only (all targets until phase 14) |
+|---|---|---|
+| BLOCK | `block_mac` | `block4` |
+| RATE_LIMIT | `ratelimit_mac` | `ratelimit4` |
+| MONITOR / ALLOW | no element | no element |
+
+* **One device, one element.** A port scan is one `block4` element, not one
+  rule per destination port (audit flaw #14). Duplicate and conflict checks
+  key on the device, not the port tuple.
+* **Upgrades are atomic.** A BLOCK on a device with an active RATE_LIMIT
+  deletes the rate-limit element and adds the block element in one batch.
+  The RATE_LIMIT rule goes to REMOVED. It needs evidence the active rule did
+  not already carry.
+* **Batched writes, no per-rule subprocess** (audit flaw #15).
+  `NftablesSetBackend` sends one nft JSON document per operation through
+  libnftables (`python3-nftables`), or through one `nft -j -f -` call when
+  libnftables cannot be imported. `transport` and `metrics()` say which one
+  is in use.
+* **A3 counts element insertions.** The rule lifecycle, A7 approval and A1
+  SHADOW work as on the v1 path.
+* **A refused add is CRITICAL.** The rule goes to REJECTED with a
+  `FIREWALL_ERROR` event. The usual cause is a full set.
+
+### v2 validator chain (`validate_set_candidate`)
+
+```text
+schema -> network -> allowlist -> safety -> conflict -> duplicate
+       -> rate-cap -> escalation -> expiration -> authorization
+```
+
+| Stage | Rejects when... |
+|---|---|
+| `network` | there is no single LAN device to key on (source not a `/32` inside `network.protected_network`): `UNENFORCEABLE` |
+| `allowlist` | any allowlist entry covers the device's IP, whatever port it names (an element acts on the whole device) |
+| `safety` | the IP is one of this host's addresses, the Pi's LAN address, the gateway, the Admin PC, or the network/broadcast address, or the MAC is the Admin PC's. Multicast, broadcast and zero MACs cannot be a `RuleTarget` at all |
+| `conflict` | a RATE_LIMIT on a device that is already blocked (block outranks rate limit) |
+| `duplicate` | the device already has an element for the same action |
+| `rate_cap` | A3's budget is spent |
+| `escalation` | an upgrade to BLOCK repeats only evidence the active RATE_LIMIT already had: `NO_NEW_EVIDENCE` |
+| `expiration` | no `expires_at`, or one more than `policy.max_ttl_seconds` away: `EXPIRATION_TOO_LONG` |
+| `authorization` | the decision was not registered (as v1) |
+
+Every backend also runs `pirewall.firewall.sets.validate_element` before
+writing. It refuses any set outside `MANAGER_WRITABLE_SETS` (D1's
+single-writer table), an enforcement element without a timeout or with one
+over 3600 s, and any key that is not a normalised IPv4 address or unicast
+MAC.
+
+### Guard modes, kill switch, fail-open and panic
+
+| Operation | Adaptive sets | Guards | Tables | Mode |
+|---|---|---|---|---|
+| `set_guard_mode(guard, mode)` | unchanged | that guard's verdict chain flipped in one batch (`flush chain` + counter, + `drop` to enforce) | unchanged | unchanged |
+| `revert_to_base` (kill switch, A8 + D5) | flushed, rules -> REMOVED | **all three set to observe** | both stay loaded | SHADOW |
+| `fail_open_shutdown` (A6 narrowed) | flushed, rules -> REMOVED | **left as they were** | unchanged | unchanged |
+| `panic(actor)` | gone with the table | gone with the table | `pirewall_static`, `pirewall_static_arp`, `pirewall_adaptive` deleted; `pirewall_base`, `pirewall_portal` kept | SHADOW |
+| `reconcile` (startup) | read; unknown IP-keyed elements adopted as ACTIVE rules, vanished ones -> REMOVED, unattributable MAC elements reported | unchanged | never recreated; missing ones reported | unchanged |
+
+Fail-open shutdown leaves the static guards protecting while core is down,
+so a crash loop is no longer an off switch (audit flaw #17). Core still
+calls `revert_to_base` when it fails open until phase 16 moves it onto
+`fail_open_shutdown`. Panic restores with `sudo pirewall-start`. Its RPC and
+`--panic` wiring is phase 16's.
+
+### Verification
+
+* **Tested** with `FakeSetBackend`: `tests/unit/test_firewall_sets.py`,
+  `tests/unit/test_manager_sets.py`, `tests/unit/test_v2_template_invariants.py`.
+  This includes the ruleset-diff invariant (`tests/helpers/ruleset_diff.py`).
+* **Sandbox** (env=sandbox, never Pi results): `tests/netns/` runs the
+  templates and `FirewallManager` + `NftablesSetBackend` against real nft
+  in network namespaces. Run it as root on a Linux host with `nft`,
+  `hping3`, `curl`, `conntrack` and a system `python3` with scapy:
+  `sudo -E uv run pytest tests/netns`.
+* **Environment-dependent**: nft 1.0.6 on the Pi, libnftables through the
+  phase 16 `.pth`, and `ether saddr` on `wlan0` in AP mode.

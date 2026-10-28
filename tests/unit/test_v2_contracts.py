@@ -402,14 +402,28 @@ def test_static_names_match_the_static_template(path: Path) -> None:
     assert arp.counters == nft_names.ARP_COUNTERS
 
 
-@pytest.mark.parametrize("path", _template_paths("pirewall_adaptive"), ids=str)
-def test_adaptive_names_match_the_adaptive_template(path: Path) -> None:
-    tables = _parse_template(path)
+_DEPLOYED_ADAPTIVE = REPO_ROOT / "deploy" / "firewall" / "pirewall_adaptive.nft.template"
+_SANDBOX_ADAPTIVE = REPO_ROOT / "docs" / "v2" / "v2" / "pirewall_adaptive.nft.template"
+
+
+def test_adaptive_names_match_the_deployed_adaptive_template() -> None:
+    """The deployed copy is the source of truth; phase 13 changed it (see its header)."""
+    tables = _parse_template(_DEPLOYED_ADAPTIVE)
     assert set(tables) == {("inet", nft_names.ADAPTIVE_TABLE)}
     adaptive = tables[("inet", nft_names.ADAPTIVE_TABLE)]
     assert adaptive.chains == nft_names.ADAPTIVE_CHAINS
     assert set(adaptive.sets) == nft_names.ADAPTIVE_SETS
     assert adaptive.counters == nft_names.ADAPTIVE_COUNTERS
+
+
+def test_the_deployed_adaptive_template_only_adds_to_the_sandbox_tested_one() -> None:
+    """Phase 13 added ratelimit4 / rl4_meter / c_ratelimit4 and removed nothing (sets, chains, counters)."""
+    sandbox = _parse_template(_SANDBOX_ADAPTIVE)[("inet", nft_names.ADAPTIVE_TABLE)]
+    deployed = _parse_template(_DEPLOYED_ADAPTIVE)[("inet", nft_names.ADAPTIVE_TABLE)]
+    assert set(deployed.sets) - set(sandbox.sets) == {nft_names.SET_RATELIMIT4, nft_names.SET_RL4_METER}
+    assert set(sandbox.sets) <= set(deployed.sets)
+    assert deployed.chains == sandbox.chains
+    assert deployed.counters - sandbox.counters == {"c_ratelimit4"}
 
 
 def test_panic_deletes_exactly_the_v2_tables() -> None:

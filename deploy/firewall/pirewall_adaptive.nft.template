@@ -1,0 +1,82 @@
+#!/usr/sbin/nft -f
+# pirewall v2: adaptive enforcement sets (ADDENDUM_4.md D1, D5)
+#
+# TEMPLATE. It is not applied automatically. Render it and load the rendered
+# copy by hand, or through pirewall-start.
+#
+# Ported from docs/v2/v2/pirewall_adaptive.nft.template (sandbox-tested,
+# RESULTS.md) with three changes, each recorded in docs/PROGRESS.md phase 13:
+#   1. ratelimit4 / rl4_meter: an IP-keyed rate limit for targets whose MAC
+#      is not known yet (until phase 14 resolves bindings, that is all of them).
+#   2. DHCP (broadcast or to the Pi), DNS and the portal toward the Pi are
+#      exempt BEFORE any block rule (ADDENDUM_4.md "C4"): this table now sees
+#      the input path too, and a blocked device must still renew its lease and
+#      reach the block notice.
+#      The static guards' meters still police those exempt packets.
+#   3. No `ip saddr @infra4 return`. An infrastructure SOURCE accept on a LAN
+#      chain is a spoofing bypass (PLAN_FINAL §4.2, critique_round2.md item 1).
+#      infra4 stays as the rendered never-target list the validator mirrors.
+#
+# Every enforcement set below has exactly ONE writer: pirewall-core
+# FirewallManager, after the full validator chain. Core only ever adds and
+# removes ELEMENTS. It never edits rules. Every element carries a timeout of
+# at most 3600 s, so a block orphaned by a crash expires on its own.
+#
+# Kill switch (A8): flush block_mac, block4, ratelimit_mac and ratelimit4, and
+#   switch the static guards to observe. This table stays loaded.
+# Panic: delete inet pirewall_adaptive, inet pirewall_static and
+#   arp pirewall_static_arp. pirewall_base and pirewall_portal are left intact.
+#
+# Hooked at prerouting priority -299, i.e. immediately AFTER the static
+# anti-spoof chain (-300) and BEFORE conntrack (-200). A blocked device costs
+# neither conntrack entries nor any later rule evaluation. This covers both
+# the input path (to the Pi) and the forward path (through the Pi).
+
+table inet pirewall_adaptive {
+	set infra4 { type ipv4_addr; flags interval; }
+	chain prerouting_adaptive { type filter hook prerouting priority -299; policy accept; }
+}
+flush chain inet pirewall_adaptive prerouting_adaptive
+# infra4 is rendered from config, so a reload replaces it (no stale entries).
+# Every other set keeps its elements across a reload.
+flush set inet pirewall_adaptive infra4
+
+table inet pirewall_adaptive {
+	counter c_block_mac { }
+	counter c_block4 { }
+	counter c_ratelimit { }
+	counter c_ratelimit4 { }
+
+	# Never-target infrastructure: Pi addresses, upstream gateway, Admin PC.
+	# Rendered from config. The validator refuses these as targets. No rule
+	# accepts traffic because its SOURCE is in here (change 3 above).
+	set infra4 { type ipv4_addr; flags interval; elements = { ${INFRA4_ELEMENTS} }; }
+	# Copy of the A2 allowlist. Written in the same batch as
+	# pirewall_static's allow_bound.
+	set allow_bound { type ether_addr . ipv4_addr; size ${BINDING_SIZE}; }
+
+	set block_mac { type ether_addr; flags timeout; size ${ADAPTIVE_SIZE}; }
+	set block4 { type ipv4_addr; flags timeout; size ${ADAPTIVE_SIZE}; }
+	set ratelimit_mac { type ether_addr; flags timeout; size ${ADAPTIVE_SIZE}; }
+	set ratelimit4 { type ipv4_addr; flags timeout; size ${ADAPTIVE_SIZE}; }
+	set rl_meter { type ether_addr; flags dynamic,timeout; timeout 60s; size ${ADAPTIVE_SIZE}; }
+	set rl4_meter { type ipv4_addr; flags dynamic,timeout; timeout 60s; size ${ADAPTIVE_SIZE}; }
+
+	chain prerouting_adaptive {
+		type filter hook prerouting priority -299; policy accept;
+		iifname != "${LAN_INTERFACE}" return
+		meta nfproto != ipv4 return
+		ether saddr . ip saddr @allow_bound return
+		# C4: a blocked device still gets a lease, a resolver and the block
+		# notice. Only toward the Pi itself (or the DHCP broadcast), never
+		# toward anything else: an unscoped `udp sport 68 udp dport 67`
+		# would let a blocked device reach any host on UDP 67.
+		ip daddr { 255.255.255.255, ${PIREWALL_LAN_IP} } udp sport 68 udp dport 67 return
+		ip daddr ${PIREWALL_LAN_IP} udp dport 53 return
+		ip daddr ${PIREWALL_LAN_IP} tcp dport { 53, 80, ${PORTAL_PORT} } return
+		ether saddr @block_mac counter name c_block_mac drop
+		ip saddr @block4 counter name c_block4 drop
+		ether saddr @ratelimit_mac add @rl_meter { ether saddr limit rate over ${RATELIMIT_PPS}/second burst ${RATELIMIT_BURST} packets } counter name c_ratelimit drop
+		ip saddr @ratelimit4 add @rl4_meter { ip saddr limit rate over ${RATELIMIT_PPS}/second burst ${RATELIMIT_BURST} packets } counter name c_ratelimit4 drop
+	}
+}

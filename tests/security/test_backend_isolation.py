@@ -32,7 +32,24 @@ _BACKEND_PREFIX = "pirewall/firewall/backend/"
 
 # Every method on the `FirewallBackend` Protocol. Calling any of them from
 # outside `FirewallManager` would bypass the validated rule lifecycle.
-_BACKEND_METHODS = frozenset({"apply_rule", "remove_rule", "list_active_rule_ids", "health_check"})
+_BACKEND_METHODS = frozenset(
+    {
+        "apply_rule",
+        "remove_rule",
+        "list_active_rule_ids",
+        "health_check",
+        # v2 `SetBackend` methods the manager does not also expose (phase 13).
+        # `panic`/`set_guard_mode` are left out on purpose: they are also
+        # FirewallManager's public names, which the composition root may call.
+        "add_element",
+        "delete_element",
+        "flush_sets",
+        "flush_set",
+        "list_set",
+        "set_guard_modes",
+        "table_exists",
+    }
+)
 
 
 def _imports_backend(tree: ast.Module) -> bool:

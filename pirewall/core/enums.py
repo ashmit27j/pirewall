@@ -156,6 +156,13 @@ class RuleRejectionReason(StrEnum):
     SHADOWED = "shadowed"
     MISSING_EXPIRATION = "missing_expiration"
     UNAUTHORIZED = "unauthorized"
+    # v2 set path (ADDENDUM_4.md D1, D4), added by phase 13.
+    UNENFORCEABLE = "unenforceable"
+    """The rule names no LAN device the adaptive sets can key on (v2 enforces per device)."""
+    EXPIRATION_TOO_LONG = "expiration_too_long"
+    """The TTL exceeds `policy.max_ttl_seconds` (every adaptive element expires within 1 h)."""
+    NO_NEW_EVIDENCE = "no_new_evidence"
+    """An escalation (RATE_LIMIT -> BLOCK) without evidence the active rule did not already carry."""
 
 
 class AddressFamily(StrEnum):
@@ -228,3 +235,14 @@ class D1Detector(StrEnum):
     NEW_MAC_RATE = "new_mac_rate"
     NEW_LEASE_RATE = "new_lease_rate"
     PORTAL_AUTH_FAILURES = "portal_auth_failures"
+
+
+class NftTransportKind(StrEnum):
+    """How a set backend reaches the kernel (phase 13; V2_CONTRACTS.md §7, CLAUDE.md v2 dependencies)."""
+
+    LIBNFTABLES = "libnftables"
+    """`python3-nftables` (ctypes over the system libnftables): ~0.36 ms per set update (sandbox)."""
+    SUBPROCESS = "subprocess"
+    """`nft -j -f -`, one process per batch: the fallback, ~10 ms per call (sandbox)."""
+    FAKE = "fake"
+    """`FakeSetBackend`: in memory, for tests."""

@@ -1,10 +1,10 @@
 """Names of every v2 nftables object, copied exactly from the reviewed templates (ADDENDUM_4.md D1).
 
-The source of truth is `docs/v2/v2/pirewall_static.nft.template` and
-`docs/v2/v2/pirewall_adaptive.nft.template` (ported into `deploy/firewall/`
-by phase 13). `tests/unit/test_v2_contracts.py` parses those templates as
-text and fails if a name here drifts from them, so code never spells a set
-or chain name inline.
+The source of truth is `deploy/firewall/pirewall_static.nft.template` and
+`deploy/firewall/pirewall_adaptive.nft.template`, ported by phase 13 from
+the sandbox-tested copies in `docs/v2/v2/`. `tests/unit/test_v2_contracts.py`
+parses the deployed templates as text and fails if a name here drifts from
+them, so code never spells a set or chain name inline.
 
 This lives in `pirewall.core`, not `pirewall.firewall`, because two layers
 need it: the firewall backend writes these objects, and the phase-17 kernel
@@ -178,13 +178,20 @@ SET_BLOCK_MAC: Final = "block_mac"
 SET_BLOCK4: Final = "block4"
 SET_RATELIMIT_MAC: Final = "ratelimit_mac"
 SET_RL_METER: Final = "rl_meter"
+# Added by phase 13: the IP-keyed rate limit for targets with no resolved MAC
+# (phase-13 prompt; until phase 14 every target is IP-only).
+SET_RATELIMIT4: Final = "ratelimit4"
+SET_RL4_METER: Final = "rl4_meter"
 
-ADAPTIVE_ENFORCEMENT_SETS: Final = frozenset({SET_BLOCK_MAC, SET_BLOCK4, SET_RATELIMIT_MAC})
+ADAPTIVE_ENFORCEMENT_SETS: Final = frozenset({SET_BLOCK_MAC, SET_BLOCK4, SET_RATELIMIT_MAC, SET_RATELIMIT4})
 """Written only by `FirewallManager` after the validator chain. The kill switch flushes exactly these (D5)."""
 
-ADAPTIVE_SETS: Final = ADAPTIVE_ENFORCEMENT_SETS | {SET_INFRA4, SET_ALLOW_BOUND, SET_RL_METER}
+ADAPTIVE_BLOCK_SETS: Final = frozenset({SET_BLOCK_MAC, SET_BLOCK4})
+"""The enforcement sets that cut a device off (block-over-ratelimit precedence, D4)."""
 
-ADAPTIVE_COUNTERS: Final = frozenset({"c_block_mac", "c_block4", "c_ratelimit"})
+ADAPTIVE_SETS: Final = ADAPTIVE_ENFORCEMENT_SETS | {SET_INFRA4, SET_ALLOW_BOUND, SET_RL_METER, SET_RL4_METER}
+
+ADAPTIVE_COUNTERS: Final = frozenset({"c_block_mac", "c_block4", "c_ratelimit", "c_ratelimit4"})
 
 
 # --- offender codes -------------------------------------------------------------------

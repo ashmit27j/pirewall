@@ -42,6 +42,12 @@ class NetworkConfig(PirewallModel):
     # access" — see docs/PROGRESS.md's resolution of that open question.
     pirewall_lan_ip: IPv4Address
 
+    # The interface the Admin PC connects on (v2: `ADMIN_INTERFACE` in
+    # base.nft.template pins SSH and the API to it). Optional so a 1.x
+    # config still loads; `render_templates.py` refuses to render the base
+    # ruleset while it is unset.
+    admin_interface: str | None = Field(default=None, min_length=1)
+
 
 class CaptureConfig(PirewallModel):
     """Packet capture tuning (spec §6)."""
@@ -410,6 +416,12 @@ class AdminConfig(PirewallModel):
     """The Admin PC's address, and whether the Pi's own console may reach the panel."""
 
     admin_pc_ip: IPv4Address
+    # The Admin PC's MAC (v2: `ADMIN_PC_MAC` in base.nft.template). The admin
+    # rule matches interface + MAC + IP, because an IP alone is spoofable
+    # (critique_redteam.md finding 2). Optional so a 1.x config still loads;
+    # rendering refuses while it is unset. Also a never-target identity for
+    # the v2 validator's safety stage.
+    admin_pc_mac: UnicastMacAddress | None = None
 
     # ADDENDUM_3.md C6. Loopback only — never a routable address. An
     # operator at the Pi's desktop can open the control panel at

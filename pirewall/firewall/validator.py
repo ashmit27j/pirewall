@@ -51,6 +51,7 @@ from ipaddress import IPv4Network
 from pirewall.config.models import PirewallConfig
 from pirewall.core.enums import FirewallAction, RuleRejectionReason, RuleStatus
 from pirewall.core.models.allowlist import AllowlistEntry
+from pirewall.core.models.identity import RuleTarget
 from pirewall.core.models.rule import CandidateRule, FirewallRule
 from pirewall.firewall.local_addresses import LocalAddresses, cached_local_addresses
 from pirewall.firewall.rate_limiter import RuleCreationRateLimiter
@@ -333,3 +334,173 @@ def _assign_priority(candidate: CandidateRule) -> int:
     """Higher threat score -> lower priority number -> evaluated first."""
     score = candidate.threat_score if candidate.threat_score is not None else 0.0
     return round(100.0 - min(max(score, 0.0), 100.0))
+
+
+# ================================================================ v2 set path
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveTarget:
+    """An ACTIVE rule and the device its set element enforces on (the v2 validator's view)."""
+
+    rule: FirewallRule
+    target: RuleTarget
+
+
+@dataclass(frozen=True, slots=True)
+class SetValidationOutcome:
+    """The v2 chain's verdict. `upgrade_of` names the ACTIVE RATE_LIMIT a BLOCK replaces atomically."""
+
+    approved: bool
+    rejection: ValidationRejection | None = None
+    upgrade_of: str | None = None
+
+
+def validate_set_candidate(
+    candidate: CandidateRule,
+    *,
+    target: RuleTarget | None,
+    config: PirewallConfig,
+    known_decision_ids: Sequence[str],
+    active: Sequence[ActiveTarget],
+    allowlist: Sequence[AllowlistEntry],
+    rate_limiter: RuleCreationRateLimiter,
+    now: datetime,
+    local_addresses: LocalAddresses | None = None,
+) -> SetValidationOutcome:
+    """The v2 validator chain for set elements (ADDENDUM_4.md D4, PLAN_FINAL §4.6), in order.
+
+    schema -> network -> allowlist -> safety -> conflict -> duplicate ->
+    rate-cap -> escalation -> expiration -> authorization.
+
+    What differs from the v1 chain (`validate_candidate_rule`, unchanged):
+
+    * **network**: there must be a device to key on (`target`, from
+      `pirewall.firewall.sets.device_target`). A rule with no LAN /32 source
+      is UNENFORCEABLE: v2 enforces per device, at LAN ingress.
+    * **allowlist**: an element acts on the whole device, so any allowlist
+      entry covering the target's IP refuses it, whatever port or protocol
+      the entry names. Narrower than the device would be the v1 notion.
+    * **safety**: the target IP and MAC against the infrastructure set (every
+      address this host holds, the configured Pi LAN address, the gateway,
+      the Admin PC's IP and MAC). Non-unicast MACs cannot reach here: the
+      target type refuses them.
+    * **conflict / duplicate**: per target, not per port tuple (audit item
+      14). BLOCK outranks RATE_LIMIT: a RATE_LIMIT on a blocked device is a
+      CONFLICT, a BLOCK on a rate-limited one is an upgrade.
+    * **escalation** replaces priority: an upgrade needs evidence the active
+      rule did not already carry (NO_NEW_EVIDENCE otherwise). Repeating the
+      same evidence never upgrades.
+    * **expiration** is mandatory and capped at `policy.max_ttl_seconds`.
+    """
+    upgrade_of: list[str] = []
+    checks: tuple[tuple[str, Callable[[], RuleRejectionReason | None]], ...] = (
+        ("schema", lambda: _validate_schema(candidate)),
+        ("network", lambda: None if target is not None else RuleRejectionReason.UNENFORCEABLE),
+        ("allowlist", lambda: _validate_set_allowlist(candidate, _require(target), allowlist)),
+        ("safety", lambda: _validate_set_safety(candidate, _require(target), config, local_addresses)),
+        ("conflict", lambda: _validate_set_conflict(candidate, _require(target), active, upgrade_of)),
+        ("duplicate", lambda: _validate_set_duplicate(candidate, _require(target), active)),
+        ("rate_cap", lambda: _validate_rate_cap(rate_limiter, now)),
+        ("escalation", lambda: _validate_escalation(candidate, active, upgrade_of)),
+        ("expiration", lambda: _validate_set_expiration(candidate, config, now)),
+        ("authorization", lambda: _validate_authorization(candidate, known_decision_ids)),
+    )
+    for stage_name, check in checks:
+        reason = check()
+        if reason is not None:
+            return SetValidationOutcome(approved=False, rejection=ValidationRejection(stage_name, reason))
+    return SetValidationOutcome(approved=True, upgrade_of=upgrade_of[0] if upgrade_of else None)
+
+
+def _require(target: RuleTarget | None) -> RuleTarget:
+    # Every stage after "network" only runs once it has passed.
+    assert target is not None
+    return target
+
+
+def _same_device(left: RuleTarget, right: RuleTarget) -> bool:
+    """Same IP, or the same known MAC (a MAC survives a change of address, D3)."""
+    return left.ip == right.ip or (left.mac is not None and left.mac == right.mac)
+
+
+def _validate_set_allowlist(
+    candidate: CandidateRule, target: RuleTarget, allowlist: Sequence[AllowlistEntry]
+) -> RuleRejectionReason | None:
+    if candidate.action not in _RESTRICTIVE_ACTIONS:
+        return None
+    if any(target.ip in entry.target for entry in allowlist):
+        return RuleRejectionReason.ALLOWLISTED
+    return None
+
+
+def _validate_set_safety(
+    candidate: CandidateRule,
+    target: RuleTarget,
+    config: PirewallConfig,
+    local_addresses: LocalAddresses | None,
+) -> RuleRejectionReason | None:
+    if candidate.action not in _RESTRICTIVE_ACTIONS:
+        return None
+    if not _is_targetable_network(IPv4Network(f"{target.ip}/32")):
+        return RuleRejectionReason.UNSAFE
+    resolved_local = cached_local_addresses() if local_addresses is None else local_addresses
+    infrastructure = {
+        *resolved_local.host,
+        *resolved_local.broadcast,
+        config.network.pirewall_lan_ip,
+        config.network.upstream_gateway,
+        config.admin.admin_pc_ip,
+        config.network.protected_network.network_address,
+        config.network.protected_network.broadcast_address,
+    }
+    if target.ip in infrastructure:
+        return RuleRejectionReason.UNSAFE
+    admin_mac = config.admin.admin_pc_mac
+    if admin_mac is not None and target.mac == admin_mac:
+        return RuleRejectionReason.UNSAFE
+    return None
+
+
+def _validate_set_conflict(
+    candidate: CandidateRule,
+    target: RuleTarget,
+    active: Sequence[ActiveTarget],
+    upgrade_of: list[str],
+) -> RuleRejectionReason | None:
+    for entry in active:
+        if not _same_device(entry.target, target) or entry.rule.action == candidate.action:
+            continue
+        if entry.rule.action is FirewallAction.BLOCK and candidate.action is FirewallAction.RATE_LIMIT:
+            return RuleRejectionReason.CONFLICT
+        if entry.rule.action is FirewallAction.RATE_LIMIT and candidate.action is FirewallAction.BLOCK:
+            upgrade_of.append(entry.rule.id)
+    return None
+
+
+def _validate_set_duplicate(
+    candidate: CandidateRule, target: RuleTarget, active: Sequence[ActiveTarget]
+) -> RuleRejectionReason | None:
+    for entry in active:
+        if _same_device(entry.target, target) and entry.rule.action == candidate.action:
+            return RuleRejectionReason.DUPLICATE
+    return None
+
+
+def _validate_escalation(
+    candidate: CandidateRule, active: Sequence[ActiveTarget], upgrade_of: list[str]
+) -> RuleRejectionReason | None:
+    for entry in active:
+        if entry.rule.id in upgrade_of and set(candidate.evidence) <= set(entry.rule.evidence):
+            return RuleRejectionReason.NO_NEW_EVIDENCE
+    return None
+
+
+def _validate_set_expiration(
+    candidate: CandidateRule, config: PirewallConfig, now: datetime
+) -> RuleRejectionReason | None:
+    if candidate.expires_at is None or candidate.expires_at <= now:
+        return RuleRejectionReason.MISSING_EXPIRATION
+    if (candidate.expires_at - now).total_seconds() > config.policy.max_ttl_seconds:
+        return RuleRejectionReason.EXPIRATION_TOO_LONG
+    return None

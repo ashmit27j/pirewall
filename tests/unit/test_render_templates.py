@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from scripts.deployment.render_templates import render_all, render_template, substitution_mapping
 
+from pirewall.core.exceptions import ConfigurationError
 from tests.helpers.config import make_config
 
 
@@ -32,13 +33,16 @@ def test_render_template_substitutes_every_token() -> None:
 
 def test_render_template_raises_on_unknown_token() -> None:
     config = make_config()
-    with pytest.raises(KeyError):
+    with pytest.raises(ConfigurationError, match="NOT_A_REAL_TOKEN"):
         render_template("${NOT_A_REAL_TOKEN}", config)
 
 
 def test_render_all_renders_every_real_template_without_leftover_placeholders(tmp_path: Path) -> None:
     """Exercises the actual checked-in `deploy/network/`/`deploy/firewall/` templates end to end."""
-    config = make_config()
+    config = make_config(
+        network={"admin_interface": "eth0"},
+        admin={"admin_pc_ip": "192.168.1.50", "admin_pc_mac": "02:00:00:00:00:02"},
+    )
     repo_root = Path(__file__).resolve().parent.parent.parent
     output_dir = tmp_path / "rendered"
 

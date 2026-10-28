@@ -236,6 +236,65 @@ PY
     warn "  set it to true in config/local_config.toml to enable the captive portal"
     WANT_PORTAL=0
   fi
+
+  check_lease_file
+}
+
+# Portal sign-in is refused for a client with no IP<->MAC binding, and the
+# bindings come from antispoof.lease_file. A wrong or stale path fails
+# silently: the file never changes and nobody can sign in. So with the
+# portal on, anything but a file a running dnsmasq is writing, and that
+# pirewall-core can read, is a refusal. With the portal off it only costs
+# anti-spoof bindings, so it is a warning.
+check_lease_file() {
+  local lease_env
+  if ! lease_env="$("$VENV_PY" -m scripts.deployment.lease_check --config config/local_config.toml --shell)"; then
+    refuse "the lease-file check could not run" "Run: uv run python -m scripts.deployment.lease_check"
+  fi
+  eval "$lease_env"
+
+  local fix="antispoof.lease_file is derived from network.lan_interface (${LAN_IF}) when unset.
+Check that the NetworkManager shared connection on ${LAN_IF} is up, and remove
+any explicit antispoof.lease_file from config/local_config.toml unless your
+DHCP server really writes somewhere else. Diagnose with:
+    uv run python -m scripts.deployment.lease_check"
+
+  case "$LEASE_STATE" in
+    ok)
+      ok "$LEASE_MESSAGE"
+      ;;
+    unreadable)
+      if (( EUID != 0 )); then
+        warn "$LEASE_MESSAGE"
+        warn "  not running as root, so whether pirewall-core can read it is undecided"
+        return 0
+      fi
+      lease_problem "$LEASE_MESSAGE" "$fix"
+      return 0
+      ;;
+    *)
+      lease_problem "$LEASE_MESSAGE" "$fix"
+      return 0
+      ;;
+  esac
+
+  # Readable by root is not readable by the account that actually reads it.
+  if (( EUID == 0 )) && id -u pirewall-core >/dev/null 2>&1; then
+    if runuser -u pirewall-core -- test -r "$LEASE_FILE"; then
+      ok "pirewall-core can read the lease file"
+    else
+      lease_problem "pirewall-core cannot read ${LEASE_FILE}" \
+        "Check the permissions on ${LEASE_FILE} and its directory."
+    fi
+  fi
+}
+
+lease_problem() {
+  if (( WANT_PORTAL )); then
+    refuse "$1 — portal sign-in needs IP<->MAC bindings from this file" "$2"
+  fi
+  warn "$1"
+  warn "  anti-spoof bindings will come from [[antispoof.static]] only"
 }
 
 # --------------------------------------------------------------- helpers
@@ -500,9 +559,62 @@ load_portal_gate() {
   # network with nowhere to sign in.
   local portal="${REPO_ROOT}/deploy/rendered/portal.nft"
   [[ -f "$portal" ]] || die "missing ${portal}"
+
+  # v1 -> v2: `authed` became `ipv4_addr . ether_addr` (ADDENDUM_4.md D3).
+  # nft cannot change an existing set's type, so loading the new file over
+  # a v1 table fails. Delete and reload in ONE transaction: if anything in
+  # it fails, the old table is still there and the LAN is never ungated.
+  case "$(portal_table_state)" in
+    outdated)
+      warn "inet pirewall_portal has a v1 IP-only authed set; nft cannot change a set's type"
+      warn "  replacing the table in one transaction: every LAN client is signed out once"
+      local migration="${REPO_ROOT}/deploy/rendered/portal-migrate.nft"
+      if (( DRY_RUN )); then
+        skip "would write ${migration#"$REPO_ROOT"/}"
+      else
+        printf '%s\n' \
+          '#!/usr/sbin/nft -f' \
+          '# Written by pirewall-start: replace a v1 pirewall_portal table in one transaction.' \
+          'delete table inet pirewall_portal' \
+          "include \"${portal}\"" > "$migration"
+      fi
+      run nft -c -f "$migration" || die "the portal migration failed its syntax check — the old table is still loaded"
+      run nft -f "$migration" || die "the portal migration failed — the old table is still loaded"
+      ok "replaced table inet pirewall_portal (sessions are now bound to ip . mac)"
+      return 0
+      ;;
+    unknown)
+      warn "cannot read the ruleset without root — whether inet pirewall_portal needs"
+      warn "  the v1 -> v2 migration is undecided. A real run checks and does it."
+      ;;
+  esac
+
   run nft -c -f "$portal" || die "portal.nft failed its syntax check — nothing was loaded"
   run nft -f "$portal"
   ok "loaded table inet pirewall_portal (LAN forwarding now requires sign-in)"
+}
+
+# absent | current | outdated | unknown. `outdated` is a pirewall_portal
+# table whose `authed` set is not `ipv4_addr . ether_addr`, or has none.
+portal_table_state() {
+  local tables set_def
+  if ! tables="$(nft list tables 2>/dev/null)"; then
+    echo unknown
+    return 0
+  fi
+  if ! grep -qx 'table inet pirewall_portal' <<<"$tables"; then
+    echo absent
+    return 0
+  fi
+  if ! set_def="$(nft list set inet pirewall_portal authed 2>/dev/null)"; then
+    echo outdated
+    return 0
+  fi
+  if grep -Eq 'type[[:space:]]+ipv4_addr[[:space:]]*\.[[:space:]]*ether_addr' <<<"$set_def"; then
+    echo current
+  else
+    echo outdated
+  fi
 }
 
 install_dnsmasq_dropin() {

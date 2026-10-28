@@ -111,6 +111,10 @@ pub struct FlowState {
     pub fwd_sport: Option<u16>,
     pub fwd_dst: u32,
     pub fwd_dport: Option<u16>,
+    /// Ethernet source/destination of the opening frame: the initiator's
+    /// MAC, even when its IP source was spoofed (`Flow.source_mac`).
+    pub fwd_src_mac: u64,
+    pub fwd_dst_mac: u64,
     pub first_seen_us: i64,
     pub last_seen_us: i64,
     pub packet_count: u64,
@@ -147,6 +151,8 @@ impl FlowState {
             fwd_sport: packet.sport,
             fwd_dst: packet.dst,
             fwd_dport: packet.dport,
+            fwd_src_mac: packet.src_mac,
+            fwd_dst_mac: packet.dst_mac,
             first_seen_us: packet.ts_us,
             last_seen_us: packet.ts_us,
             packet_count: 0,
@@ -245,6 +251,8 @@ impl FlowState {
 pub struct NewFlow {
     pub src: u32,
     pub dst: u32,
+    pub src_mac: u64,
+    pub dst_mac: u64,
     pub dport: Option<u16>,
     pub proto: Proto,
     pub ts_us: i64,
@@ -524,6 +532,8 @@ impl Engine {
                 self.new_flows.push(NewFlow {
                     src: packet.src,
                     dst: packet.dst,
+                    src_mac: packet.src_mac,
+                    dst_mac: packet.dst_mac,
                     dport: packet.dport,
                     proto: packet.proto,
                     ts_us: packet.ts_us,
@@ -658,7 +668,7 @@ mod tests {
 
     fn frame(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, flags: u8, payload: usize) -> Vec<u8> {
         let total = 40 + payload;
-        let mut f = vec![0u8; 12];
+        let mut f = vec![0x02, 0, dst[0], dst[1], dst[2], dst[3], 0x02, 0, src[0], src[1], src[2], src[3]];
         f.extend_from_slice(&[0x08, 0x00, 0x45, 0, (total >> 8) as u8, total as u8, 0, 0, 0, 0, 64, 6, 0, 0]);
         f.extend_from_slice(&src);
         f.extend_from_slice(&dst);
@@ -684,6 +694,10 @@ mod tests {
         assert_eq!((flow.fwd_payload, flow.bwd_payload), (10, 0));
         assert_eq!(flow.inter_arrival.count, 3);
         assert_eq!(engine.len(), 0);
+        // The initiator's MAC, from the opening frame, in both directions' record.
+        assert_eq!(flow.fwd_src_mac, 0x0200_0A00_0005);
+        assert_eq!(flow.fwd_dst_mac, 0x0200_0A00_000A);
+        assert_eq!(engine.new_flows[0].src_mac, 0x0200_0A00_0005);
     }
 
     #[test]

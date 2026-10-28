@@ -10,7 +10,7 @@ from ipaddress import IPv4Address, IPv6Address
 from pydantic import AwareDatetime, Field, NonNegativeInt
 
 from pirewall.core.enums import AddressFamily, Protocol
-from pirewall.core.models.common import PirewallModel, TcpFlags
+from pirewall.core.models.common import MacAddress, PirewallModel, TcpFlags
 
 
 class PacketMetadata(PirewallModel):
@@ -20,6 +20,11 @@ class PacketMetadata(PirewallModel):
     IPv6 — both are parsed (spec §7), but only IPV4 packets are aggregated
     into adaptive-pipeline flows in v1 (ADDENDUM.md A5); Phase 3 filters on
     this field.
+
+    `source_mac`/`destination_mac` are the frame's Ethernet addresses
+    (ADDENDUM_4.md D3), carried for device identity and never a model
+    feature. Optional, so packets built without a frame (tests, dataset
+    rows) stay valid. A spoofed IP source still carries the sender's MAC.
     """
 
     timestamp: AwareDatetime
@@ -34,3 +39,6 @@ class PacketMetadata(PirewallModel):
 
     total_length: NonNegativeInt
     payload_length: NonNegativeInt
+
+    source_mac: MacAddress | None = None
+    destination_mac: MacAddress | None = None

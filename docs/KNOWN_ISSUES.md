@@ -11,7 +11,8 @@ follows from the code but has not been triggered. **Deferred** means it is a
 deliberate choice with a stated reason, not an oversight.
 
 Last reviewed: **2026-09-10**, after the first real client session and the
-move to a new uplink network.
+move to a new uplink network. Items 1, 2 and 23 updated 2026-10-28 (v2
+phase 14b).
 
 ---
 
@@ -19,8 +20,8 @@ move to a new uplink network.
 
 | # | Issue | Severity | Status |
 |---|---|---|---|
-| 1 | ML models misclassify ordinary browsing as attacks | High | Observed |
-| 2 | Isolation Forest flags benign traffic as anomalous | High | Observed |
+| 1 | ML models misclassify ordinary browsing as attacks | High | Observed; actions capped at MONITOR (2026-10-28); retrain Environment-dependent |
+| 2 | Isolation Forest flags benign traffic as anomalous | High | Observed; cannot change an action under the cap (2026-10-28); threshold Environment-dependent |
 | 3 | Behaviour thresholds still tuned for a quiet network | Medium | Partly fixed (2026-10-15) |
 | 4 | Demo portal accounts are live on this deployment | High | Tooling fixed (2026-10-28); removal on the Pi is the operator's step |
 | 5 | Enforcement is `assisted` without the recommended SHADOW soak | Medium | Fixed |
@@ -41,6 +42,7 @@ move to a new uplink network.
 | 20 | Real floods/scans are detected but never scored above LOW | High | Fixed (2026-10-15) |
 | 21 | A flood evicts the bounded history buffers within seconds | Medium | Observed |
 | 22 | Restart button can't be built as `sudo` + sudoers under `NoNewPrivileges` | Low | Blocked |
+| 23 | Identity keyed on source IP; blocking weaponisable by spoofing (audit #12, #16) | High | Fixed in code (2026-10-28); kernel half live with phase 16; Pi `ether saddr` Environment-dependent |
 
 ---
 
@@ -62,11 +64,26 @@ traffic. The confidence is not merely high, it is saturated — the model is
 not uncertain, it is confidently wrong, so raising
 `known_attack_confidence_threshold` cannot help.
 
-**Cost.** At `known_attack_weight = 60`, one such classification plus an
-anomaly flag reaches exactly `high_threshold` (75) → `RATE_LIMIT`. That is
-bounded — it no longer reaches BLOCK, and in `assisted` mode a
-high-confidence BLOCK queues for approval — but it still throttles innocent
-traffic.
+**Cost, before 2026-10-28.** At `known_attack_weight = 60`, a saturated
+(1.0) classification plus an anomaly flag reaches exactly `high_threshold`
+(75) → `RATE_LIMIT`. At the observed 99.99974% it is 74.9998, just MEDIUM.
+The larger cost was the same verdict on top of page-load behaviour (30
+points): 100, CRITICAL, BLOCK.
+
+**Mitigated 2026-10-28 (phase 14b): ML evidence cannot act on its own.**
+`threat.ml_evidence_can_enforce = false`, the default, applies ADDENDUM_4
+D4's ceiling to the v1 path:
+
+* The action is chosen from the behaviour and protocol-signature evidence
+  alone.
+* LightGBM and Isolation Forest evidence still raises the reported score
+  and level, and can lift ALLOW to MONITOR, but nothing stronger.
+* Both cases above are now MONITOR. A real scan plus ML is still
+  RATE_LIMIT.
+
+`tests/unit/test_ml_ceiling.py` pins the whole matrix. This is a mitigation
+and the model is still wrong: leave the flag false until the retrain below
+has been evaluated.
 
 **What fixing it involves.** Retraining on traffic captured from this
 network, which is the spec §34 attack-lab exercise: capture a labelled
@@ -75,7 +92,20 @@ retrain, and re-evaluate. Environment-dependent, and the only real fix.
 
 **Deliberately not done:** lowering `known_attack_weight` to hide it. That
 would move a model problem into a tuning constant and make the weights stop
-meaning what `pirewall/engine/scoring.py` documents them to mean.
+meaning what `pirewall/engine/scoring.py` documents them to mean. The
+2026-10-28 ceiling keeps that intent: the weights and the reported score
+are unchanged, and the flag that caps the action is named and documented.
+
+**Retraining order.** A retrain on CICIDS2017 CSVs again would repeat the
+failure: features computed differently from runtime, the dataset's known
+label errors, and another network's traffic. Phase 19 moves to feature
+schema 3.0.0, which forces a retrain anyway. The order is:
+
+1. Phase 15's pcap reader, so training features come from the same native
+   engine as live capture.
+2. At least a week of benign `pi-live` capture, plus `pi-scripted` attacks
+   against the lab victim.
+3. Train on that (phase 19).
 
 ## 2. Isolation Forest flags benign traffic as anomalous
 
@@ -95,6 +125,12 @@ has been observed.
 than from the model's default. The latter is cheap and honest if the
 baseline is captured properly and the chosen value is recorded with the
 evidence.
+
+**2026-10-28:** under item 1's ceiling, anomaly evidence cannot change any
+action. Alone it scores 15 (LOW, ALLOW), and alongside a classification it
+is capped at MONITOR. It still appears in explanations. The threshold
+itself was not recalibrated, because no Pi baseline was available.
+Environment-dependent.
 
 ## 3. Behaviour thresholds are still tuned for a quiet network
 
@@ -953,6 +989,59 @@ for the session rather than pick a workaround under time pressure.
 3. **Skip the feature.** What happened this session.
 
 Not implemented; no code changed for this item.
+
+## 23. Identity keyed on source IP; blocking weaponisable by spoofing
+
+**Status: Fixed in code (2026-10-28, v2 phase 14). Partly live: see below.
+Environment-dependent on the Pi.** These are `docs/v2/audit_new_main.md`
+§1 items 12 and 16.
+
+**What was wrong.** Everything was keyed on the source IP, and nothing
+bound an IP to a device. A LAN client could spoof a neighbour's address
+with a SYN flood and get the *neighbour* rate-limited or blocked.
+Behaviour alone reaches RATE_LIMIT, which needs no approval in ASSISTED
+mode. Reasoned from the code; never triggered on the Pi.
+
+**What changed (phase 14):**
+
+* Frames' MACs travel with packets, flows and rules (`RuleTarget`).
+* IP↔MAC bindings come from the dnsmasq lease file and
+  `[[antispoof.static]]`, kept current by core's lease-sync thread.
+* The manager keys enforcement on the bound MAC.
+* On the v1 path, a rule whose evidence frame MAC is not the IP's bound
+  MAC is refused (`SPOOFED_SOURCE`), rather than blocking the IP's owner.
+* Portal grants are `ip . mac` pairs, so a spoofer cannot borrow a session.
+
+Evidence: unit tests, plus the netns tier on a real kernel (env=sandbox,
+not Pi results). See `docs/PROGRESS.md` "Phase 14 details".
+
+**What is live today and what is not.**
+
+* Live now: lease sync, MAC resolution, the v1 `SPOOFED_SOURCE` refusal
+  and MAC-bound portal sessions. The last needs the v2
+  `portal.nft.template`. nft cannot change a set's type, so since
+  2026-10-28 `pirewall-start` detects a v1 table and replaces it in one
+  checked transaction. A failed migration leaves the old table in place.
+* Not live until phase 16 makes `NftablesSetBackend` core's default: the
+  kernel binding sets, the raw-guard spoof drop and MAC-keyed enforcement.
+* Still keyed on IP: Python detection (phase 17).
+
+**Operational note.** With bindings wired in, the portal refuses sign-in
+from an address that has no binding. Since 2026-10-28 (phase 14b):
+
+* `antispoof.lease_file` follows `network.lan_interface` when unset.
+* `pirewall-start` refuses to bring the portal up unless a running dnsmasq
+  writes that file and `pirewall-core` can read it. Diagnose with
+  `uv run python -m scripts.deployment.lease_check`.
+* Statically addressed devices go under `[[antispoof.static]]`. Run
+  `uv run python -m scripts.deployment.configure --static-bindings` to have
+  unleased neighbours offered for confirmation.
+
+**To verify on the Pi:** with a client associated to the AP, run
+`sudo tcpdump -e -n -i wlan0 -c 20 host <client-ip>`. Confirm the client's
+frames carry its own MAC (the one in its lease) as the source, not the
+AP's. If brcmfmac rewrote it, every MAC-keyed decision would key on the
+wrong device.
 
 ## Not issues
 

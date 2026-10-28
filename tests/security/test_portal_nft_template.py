@@ -86,8 +86,23 @@ def test_authenticated_clients_fall_through_to_the_adaptive_chain() -> None:
     device, and the adaptive chain at priority 0 still gets its say.
     """
     rules = _chain_rules(_text(), "forward")
-    assert "ip saddr @authed return" in rules
-    assert "ip saddr @authed accept" not in rules
+    assert "ip saddr . ether saddr @authed return" in rules
+    assert not any("@authed accept" in rule for rule in rules)
+
+
+def test_a_session_is_the_ip_and_mac_pair_not_the_address() -> None:
+    """ADDENDUM_4.md D3: `authed` is `ipv4_addr . ether_addr`, and both gates match the pair.
+
+    An IP-only match would let any LAN client that spoofs a signed-in
+    neighbour's address ride on the neighbour's session.
+    """
+    text = _text()
+    (declaration,) = re.findall(r"set authed \{(.*?)\}", text, re.S)
+    assert "type ipv4_addr . ether_addr" in declaration
+    for chain in ("forward", "prerouting"):
+        rules = _chain_rules(text, chain)
+        assert "ip saddr . ether saddr @authed return" in rules
+        assert not any(re.search(r"ip saddr @authed", rule) for rule in rules)
 
 
 def test_the_gate_runs_before_the_adaptive_and_base_chains() -> None:
@@ -121,9 +136,11 @@ def test_reloading_does_not_sign_every_client_out() -> None:
     Deleting it would take every signed-in client's authorization with it on
     every reload, which `pirewall-start` performs routinely.
     """
-    text = _text()
-    assert "delete table" not in text
-    assert "flush set" not in text, "flushing the set would sign every client out on reload"
+    # Commands only: the header documents the one-time upgrade step in a comment.
+    command_lines = [line for line in _text().splitlines() if not line.lstrip().startswith("#")]
+    commands = "\n".join(command_lines)
+    assert "delete table" not in commands
+    assert "flush set" not in commands, "flushing the set would sign every client out on reload"
 
 
 def test_the_base_ruleset_is_also_idempotent() -> None:

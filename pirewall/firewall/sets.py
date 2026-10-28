@@ -275,7 +275,13 @@ def validate_element(op: SetOp) -> None:
         if shape.timeout_required:
             raise FirewallError(f"refusing an element without a timeout in {op.set_name} (D1)")
         return
-    if not 0 < op.timeout_seconds <= MAX_ELEMENT_TIMEOUT_SECONDS:
+    if op.timeout_seconds <= 0:
+        raise FirewallError(f"element timeout {op.timeout_seconds}s must be positive")
+    # D1's one-hour ceiling is for *enforcement* elements, so an orphaned block
+    # ends on its own. A binding's timeout is its DHCP lease (plus grace,
+    # phase 14), which is routinely longer; capping it would unbind every
+    # device before its lease ran out.
+    if shape.timeout_required and op.timeout_seconds > MAX_ELEMENT_TIMEOUT_SECONDS:
         raise FirewallError(
             f"element timeout {op.timeout_seconds}s outside 1..{MAX_ELEMENT_TIMEOUT_SECONDS}s"
         )

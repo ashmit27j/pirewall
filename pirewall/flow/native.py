@@ -71,6 +71,15 @@ def from_microseconds(microseconds: int) -> datetime:
     return _EPOCH + timedelta(microseconds=microseconds)
 
 
+def mac_from_int(value: int) -> str:
+    """A 48-bit integer (octets big-endian, as the engine reports MACs) as `aa:bb:cc:dd:ee:ff`.
+
+    The same normalised form `pirewall.capture.parser` produces with
+    `bytes.hex(":")`; the parity test holds the two to it.
+    """
+    return value.to_bytes(6, "big").hex(":")
+
+
 def _flow_from_record(record: "FlowRecord") -> Flow:
     return Flow.model_validate(
         {
@@ -109,6 +118,8 @@ def _flow_from_record(record: "FlowRecord") -> Flow:
                 "std_seconds": record.iat_sample_std,
             },
             "opened_by_initiation": record.opened_by_initiation,
+            "source_mac": mac_from_int(record.src_mac),
+            "destination_mac": mac_from_int(record.dst_mac),
             "payload_stats": {
                 "forward_bytes": record.forward_payload_bytes,
                 "backward_bytes": record.backward_payload_bytes,
@@ -195,6 +206,8 @@ class NativeFlowAggregator:
                     destination_port=signal.dport,
                     protocol=Protocol(signal.protocol),
                     timestamp=from_microseconds(signal.ts_us),
+                    source_mac=mac_from_int(signal.src_mac),
+                    destination_mac=mac_from_int(signal.dst_mac),
                 )
                 for signal in new_flows
             ],

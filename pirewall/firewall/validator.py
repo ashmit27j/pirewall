@@ -41,6 +41,19 @@ is never enforceable and never evidence-backed;
 `pirewall.flow.aggregator` already keeps that traffic out of the pipeline,
 but safety validation is not permitted to assume an upstream layer was
 careful.
+
+**MAC identity (ADDENDUM_4.md D3, phase 14).** Both chains read the
+candidate's optional `target`:
+
+* allowlist: an entry's MAC protects that device wherever it is, as well as
+  the entry's address (the v2 chain refuses a target whose IP *or* MAC is
+  allowlisted);
+* network (v1 only): a candidate whose evidence frame came from a MAC other
+  than the one bound to its source IP is SPOOFED_SOURCE. The v1 backend
+  keys on IPs, so acting would punish the address's real owner (audit item
+  16). The v2 chain does not need this: its element keys the sender's MAC;
+* same-device checks compare MACs when both sides have one, and IPs
+  otherwise, because that is what the kernel element keys on.
 """
 
 from collections.abc import Callable, Sequence
@@ -87,6 +100,7 @@ def validate_candidate_rule(
     rate_limiter: RuleCreationRateLimiter,
     now: datetime,
     local_addresses: LocalAddresses | None = None,
+    bound_mac: str | None = None,
 ) -> ValidationOutcome:
     """Run the full validation chain against `candidate`, in order.
 
@@ -94,6 +108,10 @@ def validate_candidate_rule(
     this host holds; when omitted it is read from the kernel (see
     `pirewall.firewall.local_addresses`). Tests pass it explicitly so their
     result does not depend on the addressing of the machine they run on.
+
+    `bound_mac` is the MAC the binding table holds for the candidate's
+    source address (None when unbound or no table is wired in). The network
+    stage compares it with `candidate.target.mac` (module docstring).
 
     Each stage is only *called* once it's actually its turn — building an
     eagerly-evaluated tuple of call results here would run every stage
@@ -103,7 +121,7 @@ def validate_candidate_rule(
     """
     checks: tuple[tuple[str, Callable[[], RuleRejectionReason | None]], ...] = (
         ("schema", lambda: _validate_schema(candidate)),
-        ("network", lambda: _validate_network(candidate)),
+        ("network", lambda: _validate_network(candidate) or _validate_identity(candidate, bound_mac)),
         ("allowlist", lambda: _validate_allowlist(candidate, allowlist)),
         ("safety", lambda: _validate_safety(candidate, config, local_addresses)),
         ("conflict", lambda: _validate_conflict(candidate, active_rules)),
@@ -144,6 +162,13 @@ def _validate_network(candidate: CandidateRule) -> RuleRejectionReason | None:
     return None
 
 
+def _validate_identity(candidate: CandidateRule, bound_mac: str | None) -> RuleRejectionReason | None:
+    target = candidate.target
+    if target is None or target.mac is None or bound_mac is None:
+        return None
+    return RuleRejectionReason.SPOOFED_SOURCE if target.mac != bound_mac else None
+
+
 def _validate_allowlist(
     candidate: CandidateRule, allowlist: Sequence[AllowlistEntry]
 ) -> RuleRejectionReason | None:
@@ -164,7 +189,15 @@ def _matches_allowlist(candidate: CandidateRule, entry: AllowlistEntry) -> bool:
     destination_match = candidate.destination.overlaps(entry.target) and (
         entry.port is None or entry.port == candidate.destination_port
     )
-    return source_match or destination_match
+    # A MAC pins the entry to a device, and a rule's device is its source.
+    target = candidate.target
+    device_match = (
+        entry.mac is not None
+        and target is not None
+        and target.mac == entry.mac
+        and (entry.port is None or entry.port == candidate.source_port)
+    )
+    return source_match or destination_match or device_match
 
 
 def _validate_safety(
@@ -379,8 +412,9 @@ def validate_set_candidate(
       `pirewall.firewall.sets.device_target`). A rule with no LAN /32 source
       is UNENFORCEABLE: v2 enforces per device, at LAN ingress.
     * **allowlist**: an element acts on the whole device, so any allowlist
-      entry covering the target's IP refuses it, whatever port or protocol
-      the entry names. Narrower than the device would be the v1 notion.
+      entry covering the target's IP, or naming its MAC, refuses it, whatever
+      port or protocol the entry names. Narrower than the device would be
+      the v1 notion.
     * **safety**: the target IP and MAC against the infrastructure set (every
       address this host holds, the configured Pi LAN address, the gateway,
       the Admin PC's IP and MAC). Non-unicast MACs cannot reach here: the
@@ -419,9 +453,17 @@ def _require(target: RuleTarget | None) -> RuleTarget:
     return target
 
 
-def _same_device(left: RuleTarget, right: RuleTarget) -> bool:
-    """Same IP, or the same known MAC (a MAC survives a change of address, D3)."""
-    return left.ip == right.ip or (left.mac is not None and left.mac == right.mac)
+def same_device(left: RuleTarget, right: RuleTarget) -> bool:
+    """Whether two targets name one device, as the kernel elements would key them (D3).
+
+    Both MACs known: the MACs decide. A MAC survives a change of address, and
+    one IP seen from two MACs is two devices (a reassigned lease, or a
+    spoofer and the address's owner), each with its own `block_mac` element.
+    Otherwise the IPs decide, because at least one side is keyed by IP.
+    """
+    if left.mac is not None and right.mac is not None:
+        return left.mac == right.mac
+    return left.ip == right.ip
 
 
 def _validate_set_allowlist(
@@ -429,8 +471,9 @@ def _validate_set_allowlist(
 ) -> RuleRejectionReason | None:
     if candidate.action not in _RESTRICTIVE_ACTIONS:
         return None
-    if any(target.ip in entry.target for entry in allowlist):
-        return RuleRejectionReason.ALLOWLISTED
+    for entry in allowlist:
+        if target.ip in entry.target or (target.mac is not None and entry.mac == target.mac):
+            return RuleRejectionReason.ALLOWLISTED
     return None
 
 
@@ -469,7 +512,7 @@ def _validate_set_conflict(
     upgrade_of: list[str],
 ) -> RuleRejectionReason | None:
     for entry in active:
-        if not _same_device(entry.target, target) or entry.rule.action == candidate.action:
+        if not same_device(entry.target, target) or entry.rule.action == candidate.action:
             continue
         if entry.rule.action is FirewallAction.BLOCK and candidate.action is FirewallAction.RATE_LIMIT:
             return RuleRejectionReason.CONFLICT
@@ -482,7 +525,7 @@ def _validate_set_duplicate(
     candidate: CandidateRule, target: RuleTarget, active: Sequence[ActiveTarget]
 ) -> RuleRejectionReason | None:
     for entry in active:
-        if _same_device(entry.target, target) and entry.rule.action == candidate.action:
+        if same_device(entry.target, target) and entry.rule.action == candidate.action:
             return RuleRejectionReason.DUPLICATE
     return None
 

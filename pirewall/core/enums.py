@@ -163,6 +163,14 @@ class RuleRejectionReason(StrEnum):
     """The TTL exceeds `policy.max_ttl_seconds` (every adaptive element expires within 1 h)."""
     NO_NEW_EVIDENCE = "no_new_evidence"
     """An escalation (RATE_LIMIT -> BLOCK) without evidence the active rule did not already carry."""
+    # MAC identity (ADDENDUM_4.md D3), added by phase 14.
+    SPOOFED_SOURCE = "spoofed_source"
+    """The evidence frame's MAC is not the one bound to the rule's source IP, and only the IP can be keyed.
+
+    Acting on that IP would punish its bound owner for traffic another device
+    sent (audit item 16). The v1 path keys on IPs, so it refuses; the v2 set
+    path keys the sender's MAC instead.
+    """
 
 
 class AddressFamily(StrEnum):

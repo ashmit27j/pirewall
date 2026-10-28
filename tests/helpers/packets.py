@@ -7,8 +7,13 @@ DST_MAC = b"\xaa\xbb\xcc\xdd\xee\xff"
 SRC_MAC = b"\x11\x22\x33\x44\x55\x66"
 
 
-def eth(ethertype: int) -> bytes:
-    return DST_MAC + SRC_MAC + struct.pack("!H", ethertype)
+def eth(ethertype: int, src_mac: bytes = SRC_MAC, dst_mac: bytes = DST_MAC) -> bytes:
+    return dst_mac + src_mac + struct.pack("!H", ethertype)
+
+
+def mac_bytes(mac: str) -> bytes:
+    """`aa:bb:cc:dd:ee:ff` as the six bytes a frame carries."""
+    return bytes.fromhex(mac.replace(":", ""))
 
 
 def ipv4_header(

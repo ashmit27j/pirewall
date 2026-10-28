@@ -27,7 +27,7 @@ from pirewall.core.exceptions import PacketParseError
 from pirewall.core.models.flow import Flow
 from pirewall.flow.aggregator import FlowAggregator, NewFlowSignal
 from pirewall.flow.native import NativeFlowAggregator, native_engine_available
-from tests.helpers.packets import eth, ipv4_header, ipv6_header, tcp_header, udp_header
+from tests.helpers.packets import eth, ipv4_header, ipv6_header, mac_bytes, tcp_header, udp_header
 
 pytestmark = pytest.mark.skipif(not native_engine_available(), reason="pirewall_native not built")
 
@@ -36,20 +36,33 @@ PROTECTED = IPv4Network("192.168.100.0/24")
 CONFIG = FlowConfig(active_timeout_seconds=120, inactive_timeout_seconds=60, max_flows=64)
 
 _FIN, _SYN, _RST, _PSH, _ACK = 0x01, 0x02, 0x04, 0x08, 0x10
+ATTACKER_MAC = "02:00:00:00:00:ee"
 
 
-def _tcp(src: str, dst: str, sport: int, dport: int, flags: int, payload: bytes = b"") -> bytes:
+def _mac_of(address: str) -> bytes:
+    """A distinct, locally administered MAC per address, so a mixed-up MAC shows up in the comparison."""
+    return b"\x02\x00" + bytes(int(part) for part in address.split("."))
+
+
+def _frame(src: str, dst: str, src_mac: bytes | None) -> bytes:
+    return eth(0x0800, src_mac=src_mac or _mac_of(src), dst_mac=_mac_of(dst))
+
+
+def _tcp(
+    src: str, dst: str, sport: int, dport: int, flags: int, payload: bytes = b"", src_mac: bytes | None = None
+) -> bytes:
     ip = ipv4_header(6, total_length=40 + len(payload), src=src, dst=dst)
-    return eth(0x0800) + ip + tcp_header(sport, dport, flags=flags) + payload
+    return _frame(src, dst, src_mac) + ip + tcp_header(sport, dport, flags=flags) + payload
 
 
 def _udp(src: str, dst: str, sport: int, dport: int, payload: bytes = b"") -> bytes:
     ip = ipv4_header(17, total_length=28 + len(payload), src=src, dst=dst)
-    return eth(0x0800) + ip + udp_header(sport, dport, 8 + len(payload)) + payload
+    return _frame(src, dst, None) + ip + udp_header(sport, dport, 8 + len(payload)) + payload
 
 
 def _icmp(src: str, dst: str) -> bytes:
-    return eth(0x0800) + ipv4_header(1, total_length=28, src=src, dst=dst) + b"\x08\x00\x00\x00" + b"\x00" * 4
+    header = _frame(src, dst, None) + ipv4_header(1, total_length=28, src=src, dst=dst)
+    return header + b"\x08\x00\x00\x00" + b"\x00" * 4
 
 
 def _client_hello() -> bytes:
@@ -91,8 +104,10 @@ def _frames(seed: int) -> list[tuple[bytes, datetime]]:
                 emit(_tcp(client, server, sport, dport, _FIN | _ACK))
                 emit(_tcp(server, client, dport, sport, _FIN | _ACK))
         elif kind < 0.45:  # scan / flood shapes: unanswered SYNs, RSTs, heartbeat records
+            # Sometimes from a spoofed source: another client's IP in the attacker's frame.
+            spoofer = mac_bytes(ATTACKER_MAC) if rng.random() < 0.3 else None
             for port in range(rng.randint(2, 20)):
-                emit(_tcp(client, server, sport, 1 + port, _SYN))
+                emit(_tcp(client, server, sport, 1 + port, _SYN, src_mac=spoofer))
             emit(_tcp(server, client, 443, sport, _RST))
             emit(_tcp(client, server, sport, 443, _ACK | _PSH, b"\x18\x03\x02\x00\x03\x01\x40\x00"))
         elif kind < 0.65:
@@ -224,3 +239,27 @@ def test_per_drain_caps_shed_and_count_the_excess() -> None:
     assert shed_signals == len(py_signals) - 70
     # What was kept is the head of the same stream, unchanged.
     assert [_comparable(f) for f in batch.completed] == [_comparable(f) for f in py_completed[:50]]
+
+
+def test_flows_and_signals_carry_the_opening_frames_macs_on_both_paths() -> None:
+    """D3: both paths agree on every MAC, and a spoofed source carries the attacker's MAC."""
+    victim, server = "192.168.100.10", "203.0.113.9"
+    frames = [
+        (_tcp(victim, server, 40000, 80, _SYN, src_mac=mac_bytes(ATTACKER_MAC)), T0),
+        (_tcp(server, victim, 80, 40000, _RST | _ACK), T0 + timedelta(milliseconds=1)),
+        (_tcp(victim, server, 40001, 80, _SYN), T0 + timedelta(milliseconds=2)),
+        (_tcp(server, victim, 80, 40001, _RST | _ACK), T0 + timedelta(milliseconds=3)),
+    ]
+    _, py_completed, py_signals, _, _ = _python_path(frames)
+    native = NativeFlowAggregator(CONFIG, PROTECTED)
+    for raw, moment in frames:
+        native.feed(raw, moment)
+    batch = native.drain()
+
+    expected = [ATTACKER_MAC, "02:00:c0:a8:64:0a"]
+    assert [flow.source_mac for flow in py_completed] == expected
+    assert [flow.source_mac for flow in batch.completed] == expected
+    assert [flow.destination_mac for flow in batch.completed] == ["02:00:cb:00:71:09"] * 2
+    assert [signal.source_mac for signal in py_signals] == expected
+    assert [signal.source_mac for signal in batch.new_flows] == expected
+    assert all(str(flow.source_ip) == victim for flow in batch.completed), "the IP header names the victim"

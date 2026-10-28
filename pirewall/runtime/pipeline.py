@@ -53,7 +53,7 @@ from pirewall.engine.decision import EvidenceMaturityTracker, decide
 from pirewall.engine.scoring import score_evidence
 from pirewall.engine.threat import assess_threat
 from pirewall.features.extractor import extract_features
-from pirewall.firewall.generator import generate_candidate_rule
+from pirewall.firewall.generator import MacResolver, generate_candidate_rule
 from pirewall.firewall.manager import FirewallManager
 from pirewall.ipc.state import CoreStateStore
 from pirewall.runtime.forwarder import EventForwarder
@@ -104,8 +104,11 @@ class FlowPipeline:
         counters: RuntimeCounters,
         lock: AbstractContextManager[bool],
         anomaly_scorer: AnomalyScorer | None = None,
+        resolve_mac: MacResolver | None = None,
     ) -> None:
+        """`resolve_mac` names each candidate's device MAC (ADDENDUM_4.md D3; the binding table's lookup)."""
         self._config = config
+        self._resolve_mac = resolve_mac
         self._coordinator = coordinator
         self._manager = manager
         self._state = state
@@ -285,7 +288,7 @@ class FlowPipeline:
             )
 
         candidate = generate_candidate_rule(
-            decision, flow, now, self._config.firewall.default_rule_ttl_seconds
+            decision, flow, now, self._config.firewall.default_rule_ttl_seconds, self._resolve_mac
         )
         if candidate is None:
             # ALLOW: nothing to enforce. Not an error, and not worth an event.

@@ -143,3 +143,32 @@ def test_extract_tcp_payload_bounded_by_actually_captured_bytes() -> None:
 
     result = extract_tcp_payload(raw)
     assert result == payload  # bounded by len(raw), not the inflated declared length
+
+
+def test_ethernet_addresses_are_carried_normalised() -> None:
+    """D3: the frame's MACs ride along on the packet, in `MacAddress` form."""
+    tcp = tcp_header(51234, 443, flags=0x02)
+    raw = eth(0x0800, src_mac=b"\x02\xAB\x00\x00\x00\x20", dst_mac=b"\xFF" * 6)
+    raw += ipv4_header(protocol=6, total_length=20 + len(tcp)) + tcp
+
+    metadata = parse_packet(raw, NOW)
+
+    assert metadata.source_mac == "02:ab:00:00:00:20"
+    assert metadata.destination_mac == "ff:ff:ff:ff:ff:ff"
+
+
+def test_a_spoofed_ip_source_still_carries_the_senders_mac() -> None:
+    """The IP header can lie about who sent it; the frame header names the actual sender."""
+    tcp = tcp_header(40000, 80, flags=0x02)
+    attacker = b"\x02\x00\x00\x00\x00\x20"
+    raw = eth(0x0800, src_mac=attacker) + ipv4_header(6, 20 + len(tcp), src="192.168.100.10") + tcp
+
+    metadata = parse_packet(raw, NOW)
+
+    assert str(metadata.source_ip) == "192.168.100.10"
+    assert metadata.source_mac == "02:00:00:00:00:20"
+
+
+def test_ipv6_packets_carry_their_macs_too() -> None:
+    raw = eth(0x86DD, src_mac=b"\x02\x00\x00\x00\x00\x10") + ipv6_header(17, 8) + udp_header(1, 2, 8)
+    assert parse_packet(raw, NOW).source_mac == "02:00:00:00:00:10"

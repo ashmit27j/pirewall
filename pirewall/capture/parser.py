@@ -19,6 +19,7 @@ Known limitations, documented rather than silently handled:
 import struct
 from datetime import datetime
 from ipaddress import IPv4Address, IPv6Address
+from typing import NamedTuple
 
 from pirewall.core.enums import AddressFamily, Protocol
 from pirewall.core.exceptions import PacketParseError, UnsupportedProtocolError
@@ -47,6 +48,13 @@ _TCP_FLAG_RST = 0x04
 _TCP_FLAG_PSH = 0x08
 _TCP_FLAG_ACK = 0x10
 _TCP_FLAG_URG = 0x20
+
+
+class _Macs(NamedTuple):
+    """The frame's Ethernet source and destination, already in `MacAddress` form."""
+
+    source: str
+    destination: str
 
 
 class _L4Info:
@@ -90,14 +98,17 @@ def _parse_packet(raw: bytes, captured_at: datetime) -> PacketMetadata:
 
     ethertype = struct.unpack("!H", raw[12:14])[0]
 
+    # The Ethernet addresses (ADDENDUM_4.md D3). `bytes.hex(":")` is already
+    # the normalised lowercase form `MacAddress` produces.
+    macs = _Macs(source=raw[6:12].hex(":"), destination=raw[0:6].hex(":"))
     if ethertype == _ETHERTYPE_IPV4:
-        return _parse_ipv4(raw, _ETH_HEADER_LEN, captured_at)
+        return _parse_ipv4(raw, _ETH_HEADER_LEN, captured_at, macs)
     if ethertype == _ETHERTYPE_IPV6:
-        return _parse_ipv6(raw, _ETH_HEADER_LEN, captured_at)
+        return _parse_ipv6(raw, _ETH_HEADER_LEN, captured_at, macs)
     raise UnsupportedProtocolError(f"unsupported ethertype 0x{ethertype:04x}")
 
 
-def _parse_ipv4(raw: bytes, offset: int, captured_at: datetime) -> PacketMetadata:
+def _parse_ipv4(raw: bytes, offset: int, captured_at: datetime, macs: _Macs) -> PacketMetadata:
     if len(raw) < offset + _IPV4_MIN_HEADER_LEN:
         raise PacketParseError("truncated IPv4 header")
 
@@ -140,10 +151,12 @@ def _parse_ipv4(raw: bytes, offset: int, captured_at: datetime) -> PacketMetadat
         tcp_flags=l4.tcp_flags,
         total_length=total_length,
         payload_length=payload_length,
+        source_mac=macs.source,
+        destination_mac=macs.destination,
     )
 
 
-def _parse_ipv6(raw: bytes, offset: int, captured_at: datetime) -> PacketMetadata:
+def _parse_ipv6(raw: bytes, offset: int, captured_at: datetime, macs: _Macs) -> PacketMetadata:
     if len(raw) < offset + _IPV6_HEADER_LEN:
         raise PacketParseError("truncated IPv6 header")
 
@@ -176,6 +189,8 @@ def _parse_ipv6(raw: bytes, offset: int, captured_at: datetime) -> PacketMetadat
         tcp_flags=l4.tcp_flags,
         total_length=_IPV6_HEADER_LEN + declared_payload_length,
         payload_length=payload_length,
+        source_mac=macs.source,
+        destination_mac=macs.destination,
     )
 
 

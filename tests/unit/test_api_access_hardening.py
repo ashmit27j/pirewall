@@ -162,20 +162,24 @@ def test_a_rejected_allowlist_request_never_echoes_the_password() -> None:
     assert TEST_ADMIN_PASSWORD not in response.text
 
 
-def test_allowlist_mac_is_validated_and_then_refused_until_core_supports_it() -> None:
+def test_allowlist_mac_is_validated_and_reaches_core_normalised() -> None:
+    """Phase 12 refused a MAC until core could hold one; phase 14 (D3) passes it through."""
     harness = make_harness(NOW)
     token = login(harness)
     multicast = harness.post(
         "/api/v1/allowlist", json=_allowlist_body(mac="01:00:5e:00:00:01"), headers=auth_headers(token)
     )
     assert multicast.status_code == 422
+    assert harness.manager.allowlist == ()
 
     unicast = harness.post(
         "/api/v1/allowlist", json=_allowlist_body(mac="AA-BB-CC-00-11-22"), headers=auth_headers(token)
     )
-    assert unicast.status_code == 422
-    assert "MAC" in unicast.json()["detail"]
-    assert harness.manager.allowlist == ()
+    assert unicast.status_code == 200
+    assert unicast.json()["mac"] == "aa:bb:cc:00:11:22"
+    (entry,) = harness.manager.allowlist
+    assert entry.mac == "aa:bb:cc:00:11:22"
+    assert any("(aa:bb:cc:00:11:22)" in (event.reason or "") for event in harness.state.events)
 
 
 # ------------------------------------------------------------- idle timeout

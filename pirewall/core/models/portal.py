@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from pydantic import AwareDatetime, Field
 
-from pirewall.core.models.common import PirewallModel
+from pirewall.core.models.common import PirewallModel, UnicastMacAddress
 
 
 class PortalClientStatus(StrEnum):
@@ -56,6 +56,12 @@ class PortalSession(PirewallModel):
     because the token's whole purpose is to authorize *that address* for
     forwarding in the `pirewall_portal` nft set. A token replayed from a
     different address authorizes nothing and is rejected.
+
+    `client_mac` (ADDENDUM_4.md D3) is the MAC core's binding table held for
+    `client_ip` at login, never anything the HTTP request said. The kernel
+    grant is the `(client_ip, client_mac)` pair, and a session whose address
+    is now bound to a different MAC is ended. None only where no binding
+    table is wired in (the IP-only path older callers use).
     """
 
     id: str = Field(default_factory=lambda: str(uuid4()), min_length=1)
@@ -64,6 +70,7 @@ class PortalSession(PirewallModel):
     client_ip: IPv4Address
     issued_at: AwareDatetime
     expires_at: AwareDatetime
+    client_mac: UnicastMacAddress | None = None
 
 
 class PortalClientState(PirewallModel):

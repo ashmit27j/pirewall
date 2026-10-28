@@ -7,6 +7,7 @@ from pydantic import AwareDatetime, Field, NonNegativeInt, model_validator
 from pirewall.core.enums import Protocol
 from pirewall.core.models.common import (
     InterArrivalStats,
+    MacAddress,
     PacketSizeStats,
     PayloadStats,
     PirewallModel,
@@ -56,6 +57,15 @@ class Flow(PirewallModel):
     # analysis must not count those as connections the responder made: it
     # once rate-limited a flood's own victim (LIVE_AB.md).
     opened_by_initiation: bool = True
+    # Ethernet addresses of the frame that opened the flow (ADDENDUM_4.md
+    # D3): the initiator's MAC, even when its IP source was spoofed. For
+    # keying and spoof detection only. MAC is never a model feature: the
+    # feature extractor does not read these, and a test pins that. None
+    # where there was no frame (the CICIDS/UNSW dataset adapters). Not
+    # `UnicastMacAddress`: an observed frame field may be anything a sender
+    # put on the wire; whatever *identifies a device* re-validates it.
+    source_mac: MacAddress | None = None
+    destination_mac: MacAddress | None = None
 
     @model_validator(mode="after")
     def _check_consistency(self) -> "Flow":

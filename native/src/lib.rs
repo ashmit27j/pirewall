@@ -31,6 +31,8 @@ use flow::{Engine, FlowState};
 pub struct FlowRecord {
     src: u32,
     dst: u32,
+    src_mac: u64,
+    dst_mac: u64,
     sport: Option<u16>,
     dport: Option<u16>,
     protocol: &'static str,
@@ -70,6 +72,8 @@ impl From<&FlowState> for FlowRecord {
         Self {
             src: s.fwd_src,
             dst: s.fwd_dst,
+            src_mac: s.fwd_src_mac,
+            dst_mac: s.fwd_dst_mac,
             sport: s.fwd_sport,
             dport: s.fwd_dport,
             protocol: s.proto.as_str(),
@@ -111,6 +115,8 @@ impl From<&FlowState> for FlowRecord {
 pub struct NewFlowRecord {
     src: u32,
     dst: u32,
+    src_mac: u64,
+    dst_mac: u64,
     dport: Option<u16>,
     protocol: &'static str,
     ts_us: i64,
@@ -210,6 +216,8 @@ impl FlowEngine {
             .map(|n| NewFlowRecord {
                 src: n.src,
                 dst: n.dst,
+                src_mac: n.src_mac,
+                dst_mac: n.dst_mac,
                 dport: n.dport,
                 protocol: n.proto.as_str(),
                 ts_us: n.ts_us,

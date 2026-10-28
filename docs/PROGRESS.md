@@ -35,7 +35,8 @@ are regression evidence and are labelled as such.
 | 11 | v2 contracts, project rules, additive config, `migrate_config.py` | Complete | See "Phase 11 details" below. No runtime behaviour changed. |
 | 12 | Access hardening and hygiene (P0) | Complete | See "Phase 12 details" below. Wazuh forwarding of API-reported events is handed to phase 16. |
 | 13 | Kernel data plane, set backend, guard modes, kill switch, panic | Complete | See "Phase 13 details" below. Built beside v1, not wired into core (phase 16). Netns tier 24/24 passed, env=sandbox only. Pi nft 1.0.6 is Environment-dependent. |
-| 14 | MAC identity end to end, bindings, anti-spoof, portal binding | Not started | Prompt: `phase-14-mac-identity-antispoof.md`. Depends on 13. Integrator for `runtime/core.py` and `firewall/manager.py`. |
+| 14 | MAC identity end to end, bindings, anti-spoof, portal binding | Complete | See "Phase 14 details" below. Lease sync runs in core now. Its kernel writes happen only with a set backend, which phase 16 makes the default. Netns tier 31/31 passed, env=sandbox only. `ether saddr` on brcmfmac `wlan0` is Environment-dependent. |
+| 14b | Interim: four live risks on today's v1 Pi (fail-open guards, ML ceiling, lease-file path, portal migration) | Complete | See "Phase 14b details" below. Not a planned phase; approved by the human 2026-10-28. Edits two phase 16 files (deviation 1). Netns tier 31/31, env=sandbox only. Nothing ran on the Pi. |
 | 15 | Native hardening, pcap reader, replay capture backend | Not started | Prompt: `phase-15-native-hardening-replay.md`. Can run in parallel with 12 and 13. Also implements `pirewall/flow/connection_start.py` (V2_CONTRACTS §11). |
 | 16 | `pirewall-start` v2, deployment templates, systemd, data modes, lab victim | Not started | Prompt: `phase-16-startup-deploy.md`. Depends on 13, 14, 15. Marks **v2.0 deployable**. |
 | 17 | D1 detectors, kernel offender poller, policy engine | Not started | Prompt: `phase-17-detection-policy.md`. Depends on 16. Marks **v2.1 (engine)**. |
@@ -483,6 +484,204 @@ on the set path. Each becomes live only when phase 16 wires
 **Referenced but not yet written:** `docs/v2/RUNBOOK_PI.md`, the phase
 18–20 prompts, and `lab/` with its mock outputs. Nothing was invented for
 them.
+
+
+### Phase 14 details
+
+**Scope.** Carry the source and destination MAC from the frame to every
+decision. Bind IP↔MAC from the dnsmasq lease file plus
+`[[antispoof.static]]`. Make enforcement, the allowlist, portal sessions
+and the C4 block notice MAC-aware. IP-only callers keep their behaviour.
+No detector changes (phase 17) and no `pirewall-start` changes (phase 16).
+
+**Runtime state after this phase.** `CoreDaemon` builds a
+`LeaseBindingTable`, seeds it at startup and runs a `pirewall-lease-sync`
+thread. The table feeds the generator's `target.mac`, the manager's
+`blocking_rules_matching`, and the portal. Kernel binding and
+`allow_bound` writes happen only when core has a set backend. Core still
+gets none by default (phase 16 makes `NftablesSetBackend` the default), so
+on today's v1 runtime the bindings are used for resolution only.
+
+**Sandbox environment for every `netns` result below** (env=sandbox,
+**never Pi results**): WSL2, nft 1.1.6, hping3, system Python with scapy,
+run as root on 2026-10-28. The non-netns suite ran as the unprivileged
+user `pw` in the same WSL2 Ubuntu.
+
+**Gates (2026-10-28):** `ruff check .` clean; `pyright` (strict) 0 errors;
+`pytest` 1289 passed, 31 skipped (the netns tier, non-root); `tests/netns`
+as root **31/31 passed**; native parity 8/8; `cargo test` ok;
+`cargo clippy --all-targets -D warnings` clean; `cargo fmt --check` clean.
+`ruff format --check` reports pre-existing repo-wide drift (84 files,
+including benchmarks this phase never touched). It is not a definition-of-
+done gate and was not reformatted here.
+
+| Deliverable | Label | Evidence |
+|---|---|---|
+| 1. `src_mac`/`dst_mac` in `native/src/parse.rs` → `FlowState` → `FlowRecord`/`NewFlowRecord` → `.pyi`; Python `PacketMetadata`, flow state, `Flow.source_mac`/`destination_mac` (optional, default None) | Tested | `test_native_parity.py::test_flows_and_signals_carry_the_opening_frames_macs_on_both_paths` (identical MACs on both paths, with spoofed-source frames mixed in); `test_parser.py::test_a_spoofed_ip_source_still_carries_the_senders_mac`, `test_ethernet_addresses_are_carried_normalised`. CICIDS/UNSW adapters unchanged and green. |
+| 1. MAC is never a model feature | Tested | `test_feature_schema.py::test_no_feature_is_a_mac_address_or_derived_from_one`, `test_the_extractor_ignores_the_flow_macs`. |
+| 2. Lease parser: only `expiry MAC IP` by strict regex; hostname and client-id never read or logged | Tested | `test_bindings.py`: malformed lines, an injected newline in a hostname, a crafted injection aimed at a neighbour's address, IPv6 and DUID lines, duplicates, expiry `0`, one IP leased to two MACs (binds neither). `test_lease_sync.py::test_hostnames_never_reach_an_event_or_the_log`. |
+| 2. `LeaseBindingTable` + static merge (static wins for its IP or MAC) | Tested | `test_bindings.py`. Satisfies the frozen `BindingTable` Protocol. |
+| 2. Lease sync: inotify where available plus `antispoof.poll_seconds` poll; outside the RPC lock; snapshot reads | Tested | `test_lease_sync.py` (inotify on Linux, timeout-only fallback, change-only writes, unreadable/oversized file keeps last-known bindings, failed write retried as a full resync); `test_core_daemon_bindings.py::test_the_lease_sync_thread_picks_up_a_new_lease`. |
+| 2. `FirewallManager.sync_bindings` / `replace_bindings`: non-RuleStatus, delete-before-add, timeout = lease expiry + grace, one batch, both binding tables | Tested (fake); sandbox-tested (netns 14a, 14c) | `test_manager_identity.py::test_a_moved_lease_deletes_the_old_pair_before_adding_the_new_one_in_one_batch` (Fake call log), `test_binding_writes_stay_inside_d1s_allowance`. netns 14a: a lease file plus a static entry land in `macbind`/`bound4` of both `inet pirewall_static` and `arp pirewall_static_arp`. netns 14c: a lease moving to a new MAC removes the old pair on the real kernel. |
+| 2. A failed startup seed sets the raw guard to observe and emits SYSTEM_WARNING | Tested | `test_lease_sync.py::test_a_missing_lease_file_fails_the_seed_and_puts_the_raw_guard_in_observe`, `test_a_refused_kernel_write_fails_the_seed_too`, `test_if_even_the_downgrade_fails_the_warning_is_critical`; whole daemon: `test_core_daemon_bindings.py::test_a_failed_seed_leaves_the_raw_guard_in_observe_and_says_so`. |
+| 3. `RuleTarget` on `CandidateRule`/`FirewallRule` (`source`/`destination` kept); the generator fills `target.mac` from `BindingTable.resolve_mac`; the manager prefers `block_mac`/`ratelimit_mac` | Tested (fake); sandbox-tested (netns 14d) | `test_generator.py` (bound source, no frame MAC, spoofed source, unbound source, group-address MACs); `test_manager_identity.py::test_a_bound_device_is_blocked_by_mac`. netns 14d: a BLOCK resolved through a real lease lands in `block_mac`, not `block4`. |
+| 3. `blocking_rules_matching(ip)` resolves IP→MAC and matches either | Tested | `test_manager_identity.py`: a MAC-keyed block follows the device to a new address; a device that inherits a blocked device's address is not told it is blocked; with no binding left, it still matches by address. |
+| 4. Allowlist entries gain an optional MAC (needs a `/32`); `allow_bound` synced from IP+MAC entries; the validator refuses a target whose IP **or** MAC is allowlisted | Tested (fake); sandbox-tested (netns 14e) | `test_manager_identity.py` (allowlist cases); `test_api_access_hardening.py::test_allowlist_mac_is_validated_and_reaches_core_normalised` (phase 12's 422 refusal is gone). netns 14e: an entry added through the manager reaches both `allow_bound` sets, the pair floods unmetered, a BLOCK on it is refused, and removal empties both sets. |
+| 5. Portal: `authed` is `ipv4_addr . ether_addr`, the gate is `ip saddr . ether saddr @authed`; login/keepalive/logout resolve the MAC from `BindingTable`; login refused without a binding; sessions store `(ip, mac)` | Tested; sandbox-tested (netns 14f) | `test_portal_mac_binding.py` (no binding → refused with a clear message; session ended when its address rebinds to another MAC or the binding disappears; logout from another device refused). `test_portal_nft_template.py`. netns 14f: on the real kernel, a grant for the right IP but the wrong MAC does not open the forward gate; the right pair does. |
+| 6. Block notice (C4) looked up by IP→MAC | Tested; sandbox-tested (netns 14d) | `test_portal_mac_binding.py::test_a_mac_keyed_block_is_shown_to_the_device_at_its_new_address`. netns 14d: a MAC-keyed BLOCK still reaches DHCP, DNS and the portal notice, and the neighbour is untouched. |
+| 7. ARP anti-poisoning table, synced from the same bindings | sandbox-tested (netns 3b, 14a) | Ported by phase 13. Phase 14 writes `arp pirewall_static_arp`'s binding sets in the same batch as the inet table. |
+| Netns: spoofing a bound neighbour's IP is dropped, and the neighbour never appears in an accusatory set | sandbox-tested | netns 14b (bindings from a real lease file, not seeded `SetOp`s) and 14g, plus phase 13's 3a/3c. |
+| `ether saddr` on brcmfmac `wlan0` in AP mode is the station's MAC | **Environment-dependent** | Nothing here ran on the Pi. `docs/v2/RUNBOOK_PI.md` H1 does not exist yet (phase 16), so this is PLAN_FINAL's H1 check: on the Pi, with a client associated to the AP and generating traffic, run `sudo tcpdump -e -n -i wlan0 -c 20 host <client-ip>` and confirm that the source MAC on the client's frames is the MAC in its dnsmasq lease, not the AP's. Then run `sudo -E uv run pytest tests/netns` on the Pi. |
+
+**Audit flaws closed in code** (`docs/v2/audit_new_main.md` §1; the
+prompt's "v1 #12/#16 and audit #16". As in phase 13, deviation 1, the
+numbers match the audit's table, not `KNOWN_ISSUES.md`'s numbering).
+
+| Audit # | Flaw | Status |
+|---|---|---|
+| 12 | Everything keyed on source IP | **Fixed in code for identity and enforcement.** Tested; sandbox-tested. Flows carry MACs, rules carry `RuleTarget`, and the manager keys on the MAC when one is bound. **Not fixed:** Python detection is still per source IP (phase 17's detectors). The kernel meters keyed on `ether saddr` (phase 13) already absorb random-source floods. |
+| 16 | Blocking can be weaponised (no anti-spoof) | **Fixed in code.** Tested; sandbox-tested. Spoofed bound sources are dropped at raw (netns 3a, 14b). A rule whose evidence frame MAC differs from the source IP's binding targets the sender's MAC on the set path (`test_v2_a_spoofed_source_blocks_the_sender_and_never_the_bound_owner`) and is refused as `SPOOFED_SOURCE` on the v1 path, which can only key on the IP. The kernel half becomes live when phase 16 wires the set backend; the v1 refusal is live now. |
+
+Tracked as `docs/KNOWN_ISSUES.md` #23.
+
+**Deviations and choices where the prompt was ambiguous:**
+
+1. **Binding timeouts may exceed one hour.** `sets.py` caps only
+   enforcement elements at 3600 s (D1's rule, which is about
+   `pirewall_adaptive`). A binding's timeout is its lease plus
+   `antispoof.grace_seconds`, and capping it would unbind devices before
+   their lease ends. Checked on the real kernel (netns 14a binds for
+   3660 s). Static bindings carry no timeout.
+2. **`replace_bindings`** is the startup seed alongside `sync_bindings`.
+   Elements outlive core, so the seed removes pairs left from a previous
+   run and refreshes the rest. It is one batch, with removals first.
+3. **One IP leased to two MACs binds neither.** The lease file is not
+   trusted to break the tie.
+4. **The v1 path refuses a spoofed source** (`RuleRejectionReason.SPOOFED_SOURCE`,
+   an additive enum value) instead of blocking the bound owner's IP.
+5. **Login with no binding is refused when core has a binding table**,
+   which `CoreDaemon` always does now. **Operational consequence:** on a
+   deployment whose `antispoof.lease_file` is wrong, or for a client with a
+   static address that is not in `[[antispoof.static]]`, portal sign-in
+   fails with "no binding" until that is fixed. The default path is
+   `/var/lib/NetworkManager/dnsmasq-wlan0.leases`.
+6. **Portal set upgrade.** nft cannot change a set's type, so loading the
+   v2 `portal.nft.template` over a v1 `pirewall_portal` table fails until
+   `sudo nft delete table inet pirewall_portal` has been run once, which
+   signs every client out once. The template header documents this.
+   Automating it is `pirewall-start`'s job (phase 16).
+7. **Reconcile still does not attribute MAC-keyed elements** (phase 13
+   deviation 13). It was not in phase 14's deliverables. They are still
+   reported and left to expire (≤ 1 h).
+8. **Netns tier additions** (`tests/netns/test_mac_identity.py`, 7 tests).
+   Phase 13's tier seeds bindings with raw `SetOp`s and resolves MACs from
+   a dict. The new module drives the real path end to end:
+   lease file → `LeaseSync` → `replace_bindings`/`sync_bindings`, with
+   `LeaseBindingTable.resolve_mac` as the manager's resolver, and the
+   portal through the real `NftablesBackend`. Its portal test probes the
+   forward gate with forwarded ICMP, because an unsigned client's HTTP is
+   redirected to the portal by design.
+9. **Files edited outside V2_CONTRACTS §12's phase 14 list,** all additive:
+   * `pirewall/core/enums.py` (`SPOOFED_SOURCE`).
+   * `pirewall/firewall/{interface,sets,generator}.py` and
+     `backend/{fake,nftables}.py`: the portal pair element, the
+     `list_portal_grants` read, the binding-timeout rule and the
+     generator's resolver.
+   * `pirewall/api/routes/allowlist.py`: dropping phase 12's MAC refusal,
+     which phase 12's notes hand to phase 14.
+   * `pirewall/runtime/pipeline.py`: passing the resolver through.
+   * New modules: `pirewall/core/bindings.py` and
+     `pirewall/runtime/lease_sync.py`.
+   * `runtime/core.py` and `firewall/manager.py`, as this phase's
+     integrator duty.
+10. **`cargo test` needs `PYO3_PYTHON`** pointed at the 3.12 venv on a host
+    whose system Python is 3.14, or linking fails on `-lpython3.14`. This
+    is environmental. No code changed for it.
+
+**Not done here, by design:** making the set backend core's default, the
+`pirewall_portal` table migration in `pirewall-start` (both phase 16),
+detector changes (phase 17), and the Pi run (Environment-dependent).
+
+**Referenced but not yet written:** `docs/v2/RUNBOOK_PI.md` (H1). Nothing
+was invented for it.
+
+### Phase 14b details
+
+**Scope** (`docs/v2/prompts/phase-14b-interim-pi-risk-fixes.md`). Four
+small fixes for risks that are live on the v1 Pi today, without pulling
+phase 15 or 16 forward:
+
+1. A clean fail-open stop leaves the guards alone (audit #17).
+2. An interim D4 ceiling on ML-driven actions (KNOWN_ISSUES #1, #2).
+3. A lease-file path that cannot silently be wrong.
+4. The `pirewall_portal` v1 → v2 migration in `pirewall-start`.
+
+**Gates (2026-10-28):**
+- `ruff check .` clean, and `pyright` (strict) 0 errors.
+- `pytest`: 1438 passed, 31 skipped (the netns tier, run as the non-root
+  user `pw` in WSL2 Ubuntu).
+- `tests/netns` as root: **31/31 passed** (env=sandbox: WSL2, nft 1.1.6).
+
+| Deliverable | Label | Evidence |
+|---|---|---|
+| 1. `CoreDaemon` calls `FirewallManager.fail_open_shutdown` on a fail-open stop, not `revert_to_base`. With a set backend it flushes even when core tracks no active rule. | Tested (fake) | `test_core_daemon_bindings.py::test_a_fail_open_stop_flushes_the_adaptive_sets_and_leaves_every_guard_alone`: a forward guard set to enforce stays enforce, and a leftover `block4` element from "a previous run" is flushed. Without a set backend, `test_clean_shutdown_reverts_the_ruleset_when_failing_open` still passes unchanged. **Not live on the Pi** until phase 16 gives core a set backend; on today's v1 runtime behaviour is unchanged. |
+| 2. `threat.ml_evidence_can_enforce` (default **false**). `ThreatAssessment.enforceable_level` is the level of the non-ML score (behaviour + protocol signature, `ScoreBreakdown.non_ml_total`). `decide` caps the action at that level's action, raised to MONITOR when the full level is MEDIUM+, and says so in the reason. | Tested | `test_ml_ceiling.py` (105 tests), including an exhaustive matrix over known-attack × anomaly × behaviour patterns × protocol signature: with ML added, the action never exceeds max(non-ML action, MONITOR), and ML never lowers a deterministic action. Named cases: (a) a saturated "Bot" verdict plus anomaly, 75 → was RATE_LIMIT, now MONITOR; (b) the same on a page load, 100 → was BLOCK, now MONITOR; (c) a scan plus ML → RATE_LIMIT, not BLOCK; (d) behaviour-only, Heartbleed and anomaly-only results are unchanged; (e) the flag set to true restores the old ladder. **Live on the Pi's v1 path** after a deploy (the config default is false). |
+| 2. Isolation Forest | Not changed; Environment-dependent | Under the ceiling, anomaly evidence cannot change any action: alone it scores 15 (LOW, ALLOW), and with ML it is capped. Its threshold was not recalibrated. Calibrating `anomaly_score_threshold` needs a benign baseline from the Pi (pi-live), and none was available. |
+| 3. `antispoof.lease_file` is derived from `network.lan_interface` when unset; an explicit value wins. `default_config.toml`, `migrate_config.py` and `configure.py` stop writing a fixed path. | Tested | `test_config_v2_sections.py::test_the_lease_file_follows_the_lan_interface_unless_set_explicitly`, `test_a_derived_lease_file_survives_a_dump_and_reload`; `test_migrate_config.py` (the migrated file has no `lease_file` and loads with the derived path); `test_configure_static_bindings.py::test_a_generated_config_leaves_the_lease_file_to_follow_the_lan`. |
+| 3. `scripts/deployment/lease_check.py`: the file exists, is readable, and a running dnsmasq writes it (`/proc/*/cmdline`, `--dhcp-leasefile=`/`-l`). It counts the leases `parse_leases` accepts and never prints a hostname. | Tested | `test_lease_check.py` (21 tests): every argument spelling; missing, unreadable, written by no dnsmasq, and written by another dnsmasq (the LAN-moved case); path normalisation; a hostile hostname never reaching the message; `--shell` output that survives `eval` with an apostrophe in the path. |
+| 3. `pirewall-start` preflight runs it. With the portal on, any problem is a refusal (exit 2); with it off, a warning. As root it also checks `runuser -u pirewall-core -- test -r`. | Tested (static); functionally run off-Pi | `test_pirewall_start_script.py::test_preflight_checks_the_lease_file_and_refuses_with_the_portal_on`. The script's real `check_lease_file`/`lease_problem` functions were also run in WSL against the real CLI: the portal-on missing file refused, the portal-off case warned, and a file no dnsmasq writes refused. **Environment-dependent:** the NetworkManager dnsmasq command line and `/var/lib/NetworkManager` permissions on the Pi. Verify with `uv run python -m scripts.deployment.lease_check` and `sudo scripts/deployment/pirewall-start --check` on the Pi. |
+| 3. `configure.py` offers LAN neighbours with a MAC and no current lease as `[[antispoof.static]]` candidates. A human picks each one, an empty answer adds none, and nothing is offered if the lease file cannot be read. It also gains `--static-bindings` for an existing config. | Tested | `test_configure_static_bindings.py` (16 tests): leased, Pi, off-LAN, multicast, all-zero and moved-MAC neighbours are filtered out, and already-bound devices are not re-offered. File surgery: replacing `static = []`, appending to existing array tables, adding a missing section, refusing a hand-written inline array, validation before writing, and the CLI end to end. `test_discovery.py`: `lladdr` parsing. **Environment-dependent:** `ip -j neigh` on the Pi. |
+| 4. `pirewall-start` detects a `pirewall_portal` whose `authed` set is not `ipv4_addr . ether_addr`. It then deletes and reloads the table in **one** `nft -f` transaction (`delete table` plus `include` of the rendered file), checked with `nft -c` first. Unknown state under a non-root dry run is warned about, never guessed. | Tested (static); sandbox-tested | `test_pirewall_start_script.py::test_the_portal_migration_is_one_checked_transaction`. Sandbox (env=sandbox, WSL2 nft 1.1.6, a throwaway netns, using the script's real `portal_table_state` and the real template): absent → `absent`, a v1 table → `outdated`. A plain v2 load over v1 fails with "set already exists with different datatype". A migration with a broken include is refused **and the old table and its element survive**. The real migration passes `nft -c`, applies, gives `type ipv4_addr . ether_addr` and → `current`, and two reloads stay idempotent. **Environment-dependent:** Pi nft 1.0.6. |
+
+**Deviations and choices:**
+
+1. **File ownership (approved by the human 2026-10-28).** V2_CONTRACTS
+   §12 gives `pirewall/runtime/core.py` and `scripts/deployment/pirewall-start`
+   to phase 16. This batch changed:
+   * `_revert_ruleset_if_failing_open` and the module docstring in
+     `core.py`;
+   * `check_lease_file`, `lease_problem`, `portal_table_state` and the
+     migration branch of `load_portal_gate` in `pirewall-start`.
+
+   Phase 16 should keep these, not redo them. Phase 16's "preflight reports
+   whether the lease file is readable" is now a refusal when the portal is
+   on.
+2. **KNOWN_ISSUES #1's "deliberately not done" is overridden, by a flag
+   rather than a weight.** The weights keep the meanings
+   `pirewall/engine/scoring.py` documents. The reported score and level are
+   unchanged, so the dashboard still shows what the model said. The cap
+   applies only to the action, and only while
+   `ml_evidence_can_enforce = false`. Turn it off after a retrain on this
+   network has been evaluated (phase 19), not before.
+3. **A correction to KNOWN_ISSUES #1's arithmetic.** At the observed
+   99.99974% confidence, "Bot" plus an anomaly flag scores 74.9998: MEDIUM,
+   not "exactly 75". A verdict that saturates to 1.0 reaches 75, which is
+   HIGH and RATE_LIMIT. The larger hole was the same verdict on a page
+   load: 30 behaviour points plus 75 scores CRITICAL, which was BLOCK. Both
+   are now MONITOR.
+4. **Contract additions** (additive only):
+   * `ThreatAssessment.enforceable_level` (optional, default `None`);
+   * `ScoreBreakdown.non_ml_total`;
+   * `ThreatConfig.ml_evidence_can_enforce`;
+   * `pirewall.config.models.lease_file_for`;
+   * `DiscoveredNetwork.neighbour_macs`.
+
+   None is a V2_CONTRACTS type. A `ThreatAssessment` built by hand, as
+   older tests do, has no ceiling. Only `assess_threat` sets one.
+5. **No `--allow-stale-leases` escape hatch.** A deployment whose DHCP
+   server is not dnsmasq can set `antispoof.lease_file` explicitly. One with
+   only static clients can run `--no-portal` until phase 16 revisits this.
+6. **The Windows checkout is CRLF** (`core.autocrlf=true`, the index is
+   LF). It made no difference to the product: templates are rendered
+   through Python, and the Pi checks out LF. The ad-hoc sandbox script had
+   to strip CRs before using `sed` on the template.
+
+**Not done here, by design:**
+- the set backend as core's default (phase 16);
+- native hardening (phase 15);
+- calibrating the Isolation Forest threshold, which needs a Pi baseline;
+- KNOWN_ISSUES #6 (demo portal accounts), the operator's step on the Pi;
+- any Pi run.
 
 ### Detection-quality and native capture overhaul (2026-10-15)
 

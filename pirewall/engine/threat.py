@@ -33,11 +33,20 @@ def assess_threat(
 
     Deterministic: identical inputs always produce an identical
     `ThreatAssessment` (aside from the freshly generated `id`).
+
+    Unless `config.ml_evidence_can_enforce` is true, the assessment also
+    carries `enforceable_level`: the level the non-ML evidence reaches on
+    its own, which caps the action `pirewall.engine.decision.decide` picks.
     """
     breakdown = score_evidence(
         config, known_evidence, anomaly_evidence, behavior_assessment, protocol_signature_evidence
     )
     level = _determine_level(breakdown.total, config)
+    # Interim D4 ceiling: without it, a confidently wrong classification plus
+    # an anomaly flag reaches RATE_LIMIT (docs/KNOWN_ISSUES.md #1).
+    enforceable_level = (
+        None if config.ml_evidence_can_enforce else _determine_level(breakdown.non_ml_total, config)
+    )
     explanation, contributing_evidence = _explain(
         breakdown, known_evidence, anomaly_evidence, behavior_assessment, protocol_signature_evidence
     )
@@ -52,6 +61,7 @@ def assess_threat(
         destination_ip=destination_ip,
         threat_score=breakdown.total,
         threat_level=level,
+        enforceable_level=enforceable_level,
         confidence=confidence,
         known_evidence=known_evidence,
         anomaly_evidence=anomaly_evidence,

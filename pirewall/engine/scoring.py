@@ -53,6 +53,12 @@ configured weight:
   `confidence`, reflecting that it's an honestly weaker, evadable signal.
 
 The four contributions are summed and clamped to `[0, 100]`.
+
+**Interim ML ceiling (ADDENDUM_4.md D4, applied to v1).** While
+`ThreatConfig.ml_evidence_can_enforce` is false, `total` is still what the
+score and level report, but the *action* is chosen from `non_ml_total`
+(`pirewall.engine.threat`, `pirewall.engine.decision`). The weights above
+keep their meaning; ML evidence just cannot act on them by itself.
 """
 
 from dataclasses import dataclass
@@ -72,6 +78,15 @@ class ScoreBreakdown:
     anomaly_contribution: float
     behavior_contribution: float
     protocol_signature_contribution: float = 0.0
+
+    @property
+    def non_ml_total(self) -> float:
+        """The score from the deterministic evidence alone: behavior plus protocol signature.
+
+        What the interim D4 ceiling (`ThreatConfig.ml_evidence_can_enforce`)
+        lets choose an action. Never above `total`.
+        """
+        return min(100.0, self.behavior_contribution + self.protocol_signature_contribution)
 
 
 def score_evidence(

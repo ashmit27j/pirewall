@@ -11,6 +11,13 @@ from typing import Protocol, runtime_checkable
 
 from pirewall.core.models.rule import FirewallRule
 
+PortalGrant = tuple[IPv4Address, str | None]
+"""One element of the portal's `authed` set: the client address and its MAC (ADDENDUM_4.md D3).
+
+The MAC is None only for an IP-only element, which the pre-v2 `ipv4_addr`
+set held; the v2 template's set is `ipv4_addr . ether_addr`.
+"""
+
 
 @runtime_checkable
 class FirewallBackend(Protocol):
@@ -39,8 +46,16 @@ class FirewallBackend(Protocol):
         """True if the backend is reachable and operating normally."""
         ...
 
-    def authorize_portal_client(self, client_ip: IPv4Address, timeout_seconds: int) -> None:
+    def authorize_portal_client(
+        self, client_ip: IPv4Address, timeout_seconds: int, client_mac: str | None = None
+    ) -> None:
         """Add `client_ip` to the captive portal's authorized set (ADDENDUM_3.md C2).
+
+        With `client_mac` (ADDENDUM_4.md D3) the element is the pair
+        `client_ip . client_mac`, matching the v2 template's
+        `ipv4_addr . ether_addr` set and its `ip saddr . ether saddr @authed`
+        gate, so a grant cannot be borrowed by another device spoofing the
+        address. Without it, the element is the bare address (the pre-v2 set).
 
         `timeout_seconds` is handed to the kernel as the set element's own
         timeout, so the session expires without pirewall running a timer,
@@ -58,8 +73,8 @@ class FirewallBackend(Protocol):
         """
         ...
 
-    def deauthorize_portal_client(self, client_ip: IPv4Address) -> None:
-        """Remove `client_ip` from the portal's authorized set. Idempotent."""
+    def deauthorize_portal_client(self, client_ip: IPv4Address, client_mac: str | None = None) -> None:
+        """Remove the `client_ip` (or `client_ip . client_mac`) element. Idempotent."""
         ...
 
     def list_portal_clients(self) -> frozenset[IPv4Address]:
@@ -68,5 +83,14 @@ class FirewallBackend(Protocol):
         The kernel is the source of truth here, not pirewall's in-memory
         session table: elements expire without telling us, so anything that
         needs to know who is actually authorized must ask the backend.
+        """
+        ...
+
+    def list_portal_grants(self) -> frozenset[PortalGrant]:
+        """Every element of the portal's authorized set, with its MAC where it has one.
+
+        Same source of truth as `list_portal_clients`. Deleting a pair
+        element needs its MAC, which only the kernel can say for a grant
+        whose session pirewall no longer remembers (a core restart).
         """
         ...

@@ -27,6 +27,7 @@ from typing import cast
 from pirewall.core.enums import FirewallAction, Protocol
 from pirewall.core.exceptions import FirewallError
 from pirewall.core.models.rule import FirewallRule
+from pirewall.firewall.interface import PortalGrant
 
 _NFT_BINARY = "nft"
 _FAMILY = "inet"
@@ -127,7 +128,9 @@ class NftablesBackend:
         except FirewallError:
             return False
 
-    def authorize_portal_client(self, client_ip: IPv4Address, timeout_seconds: int) -> None:
+    def authorize_portal_client(
+        self, client_ip: IPv4Address, timeout_seconds: int, client_mac: str | None = None
+    ) -> None:
         """Add `client_ip` to `pirewall_portal`'s `authed` set with a kernel-side timeout.
 
         `timeout` is expressed in nft's own units ("1800s"); the kernel
@@ -139,7 +142,7 @@ class NftablesBackend:
         if timeout_seconds <= 0:
             raise FirewallError(f"portal session timeout must be positive, got {timeout_seconds}")
         element: dict[str, object] = {
-            "elem": {"val": str(client_ip), "timeout": timeout_seconds},
+            "elem": {"val": _portal_value(client_ip, client_mac), "timeout": timeout_seconds},
         }
         payload = {
             "nftables": [
@@ -162,8 +165,8 @@ class NftablesBackend:
         except Exception as exc:  # never let an unexpected error look like success
             raise FirewallError(f"failed to authorize portal client {client_ip}: {exc}") from exc
 
-    def deauthorize_portal_client(self, client_ip: IPv4Address) -> None:
-        """Remove `client_ip` from the portal set. Idempotent: an absent element is not an error."""
+    def deauthorize_portal_client(self, client_ip: IPv4Address, client_mac: str | None = None) -> None:
+        """Remove the portal element. Idempotent: an absent element is not an error."""
         payload = {
             "nftables": [
                 {
@@ -172,7 +175,7 @@ class NftablesBackend:
                             "family": _FAMILY,
                             "table": _PORTAL_TABLE,
                             "name": _PORTAL_SET,
-                            "elem": [str(client_ip)],
+                            "elem": [_portal_value(client_ip, client_mac)],
                         }
                     }
                 }
@@ -191,6 +194,10 @@ class NftablesBackend:
 
     def list_portal_clients(self) -> frozenset[IPv4Address]:
         """Addresses currently in the portal set, as the kernel sees them."""
+        return frozenset(ip for ip, _ in self.list_portal_grants())
+
+    def list_portal_grants(self) -> frozenset[PortalGrant]:
+        """Every portal element as `(address, MAC or None)`, as the kernel sees them."""
         result = self._run_command(["-j", "list", "set", _FAMILY, _PORTAL_TABLE, _PORTAL_SET])
         try:
             parsed: object = json.loads(result)
@@ -202,7 +209,7 @@ class NftablesBackend:
         items = parsed_dict.get("nftables")
         if not isinstance(items, list):
             return frozenset()
-        addresses: set[IPv4Address] = set()
+        grants: set[PortalGrant] = set()
         for entry in cast("list[object]", items):
             entry_dict = _as_dict(entry)
             if entry_dict is None:
@@ -211,10 +218,10 @@ class NftablesBackend:
             if set_dict is None:
                 continue
             for element in _as_list(set_dict.get("elem")):
-                address = _portal_element_address(element)
-                if address is not None:
-                    addresses.add(address)
-        return frozenset(addresses)
+                grant = _portal_element_grant(element)
+                if grant is not None:
+                    grants.add(grant)
+        return frozenset(grants)
 
     def _find_handles_by_comment(self, comment: str) -> list[int]:
         handles: list[int] = []
@@ -374,24 +381,39 @@ def _as_list(value: object) -> list[object]:
     return cast("list[object]", value) if isinstance(value, list) else []
 
 
-def _portal_element_address(element: object) -> IPv4Address | None:
-    """Pull the address out of one set element, in either shape nft emits.
+def _portal_value(client_ip: IPv4Address, client_mac: str | None) -> object:
+    """The JSON element value: the bare address, or the `ip . mac` concatenation (D3)."""
+    if client_mac is None:
+        return str(client_ip)
+    return {"concat": [str(client_ip), client_mac]}
 
-    A timeout-less element is a bare string (`"192.168.100.50"`); one with a
-    timeout is `{"elem": {"val": "192.168.100.50", "timeout": 1800, ...}}`.
-    Portal elements always carry a timeout, but reading both shapes means a
-    hand-added element does not make this return nonsense.
+
+def _portal_element_grant(element: object) -> PortalGrant | None:
+    """Pull `(address, MAC or None)` out of one set element, in any shape nft emits.
+
+    A timeout-less element is the bare value; one with a timeout is
+    `{"elem": {"val": <value>, "timeout": 1800, ...}}`. The value is an
+    address string (the pre-v2 `ipv4_addr` set) or `{"concat": [ip, mac]}`
+    (the v2 `ipv4_addr . ether_addr` set). Portal elements always carry a
+    timeout, but reading every shape means a hand-added element does not
+    make this return nonsense.
     """
-    if isinstance(element, str):
-        return _parse_address(element)
+    value: object = element
     element_dict = _as_dict(element)
-    if element_dict is None:
+    if element_dict is not None and "elem" in element_dict:
+        inner = _as_dict(element_dict.get("elem"))
+        if inner is None:
+            return None
+        value = inner.get("val")
+    if isinstance(value, str):
+        address = _parse_address(value)
+        return None if address is None else (address, None)
+    value_dict = _as_dict(value)
+    parts = _as_list(value_dict.get("concat")) if value_dict is not None else []
+    if len(parts) != 2 or not isinstance(parts[0], str) or not isinstance(parts[1], str):
         return None
-    inner = _as_dict(element_dict.get("elem"))
-    if inner is None:
-        return None
-    value = inner.get("val")
-    return _parse_address(value) if isinstance(value, str) else None
+    address = _parse_address(parts[0])
+    return None if address is None else (address, parts[1].lower())
 
 
 def _parse_address(value: str) -> IPv4Address | None:

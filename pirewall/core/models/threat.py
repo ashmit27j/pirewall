@@ -26,6 +26,11 @@ class ThreatAssessment(PirewallModel):
     threat_score: float = Field(ge=0.0, le=100.0)
     threat_level: ThreatLevel
     confidence: float = Field(ge=0.0, le=1.0)
+    # The level the evidence permitted to choose an action reaches without
+    # the ML evidence (`ThreatConfig.ml_evidence_can_enforce = false`).
+    # `None` means every evidence type may enforce, so `threat_level` alone
+    # picks the action. Never above `threat_level`.
+    enforceable_level: ThreatLevel | None = None
 
     known_evidence: KnownEvidence | None = None
     anomaly_evidence: AnomalyEvidence | None = None

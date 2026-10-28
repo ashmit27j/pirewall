@@ -297,6 +297,16 @@ class ThreatConfig(PirewallModel):
     evidence_maturity_consistency_windows: int = Field(default=3, gt=0)
     max_tracked_maturity_sources: int = Field(default=10_000, gt=0)
 
+    # Interim ADDENDUM_4.md D4 ceiling on the v1 path. While false, the
+    # action is chosen from the non-ML evidence alone (behavior + protocol
+    # signature). LightGBM and Isolation Forest evidence still raises the
+    # reported score and level, and can lift ALLOW to MONITOR, but never to
+    # RATE_LIMIT or BLOCK. False because both models are known to be wrong
+    # on this network (docs/KNOWN_ISSUES.md #1, #2): a phone loading a shop
+    # was "Bot" at 99.9997%. Set true only after a retrain on this
+    # network's traffic has been evaluated.
+    ml_evidence_can_enforce: bool = False
+
     @model_validator(mode="after")
     def _check_ascending(self) -> "ThreatConfig":
         thresholds = (
@@ -643,12 +653,21 @@ class StaticBindingEntry(PirewallModel):
     reason: str = Field(min_length=1)
 
 
+def lease_file_for(lan_interface: str) -> str:
+    """NetworkManager shared mode's dnsmasq lease file for `lan_interface`."""
+    return f"/var/lib/NetworkManager/dnsmasq-{lan_interface}.leases"
+
+
 class AntispoofConfig(PirewallModel):
     """IP<->MAC binding sources for the anti-spoof guard (ADDENDUM_4.md D3)."""
 
-    # NetworkManager shared mode's dnsmasq lease file for the LAN interface:
-    # /var/lib/NetworkManager/dnsmasq-<lan_interface>.leases. Read-only; only
-    # the expiry, MAC and IP fields are parsed, never hostname or client-id.
+    # NetworkManager shared mode's dnsmasq lease file for the LAN interface.
+    # Read-only; only the expiry, MAC and IP fields are parsed, never
+    # hostname or client-id. Leave it unset: `PirewallConfig` then derives it
+    # from `network.lan_interface` (`lease_file_for`), so moving the LAN to
+    # another interface cannot leave it pointing at a file nothing writes.
+    # Portal sign-in needs a binding, so a wrong path signs nobody in. This
+    # default is only what a standalone `AntispoofConfig()` holds.
     lease_file: str = Field(default="/var/lib/NetworkManager/dnsmasq-wlan0.leases", min_length=1)
     static: tuple[StaticBindingEntry, ...] = Field(default_factory=tuple)
     # Added to a lease's expiry when it becomes the binding's element timeout,
@@ -737,3 +756,12 @@ class PirewallConfig(PirewallModel):
     antispoof: AntispoofConfig = Field(default_factory=AntispoofConfig)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     lab: LabConfig = Field(default_factory=LabConfig)
+
+    @model_validator(mode="after")
+    def _derive_lease_file(self) -> "PirewallConfig":
+        # An explicit `antispoof.lease_file` wins; otherwise follow the LAN.
+        if "lease_file" not in self.antispoof.model_fields_set:
+            self.antispoof = self.antispoof.model_copy(
+                update={"lease_file": lease_file_for(self.network.lan_interface)}
+            )
+        return self

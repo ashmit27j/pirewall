@@ -33,6 +33,9 @@ class FakeFirewallBackend:
         # behaviour that matters most about the real set: the kernel drops
         # elements on its own, without pirewall being told (ADDENDUM_3.md C2).
         self.portal_clients: dict[IPv4Address, datetime | None] = {}
+        # The MAC half of each `authed` element, keyed like `portal_clients`
+        # (None for an IP-only element).
+        self.portal_macs: dict[IPv4Address, str | None] = {}
         self.portal_authorize_calls = 0
         self.portal_deauthorize_calls = 0
         self._now: datetime | None = None
@@ -59,18 +62,29 @@ class FakeFirewallBackend:
     def health_check(self) -> bool:
         return True
 
-    def authorize_portal_client(self, client_ip: IPv4Address, timeout_seconds: int) -> None:
+    def authorize_portal_client(
+        self, client_ip: IPv4Address, timeout_seconds: int, client_mac: str | None = None
+    ) -> None:
         self.portal_authorize_calls += 1
         if self.fail_on_portal:
             raise FirewallError(f"simulated portal authorize failure for {client_ip}")
         expires_at = self._now + timedelta(seconds=timeout_seconds) if self._now is not None else None
         self.portal_clients[client_ip] = expires_at
+        self.portal_macs[client_ip] = client_mac
 
-    def deauthorize_portal_client(self, client_ip: IPv4Address) -> None:
+    def deauthorize_portal_client(self, client_ip: IPv4Address, client_mac: str | None = None) -> None:
         self.portal_deauthorize_calls += 1
         if self.fail_on_portal:
             raise FirewallError(f"simulated portal deauthorize failure for {client_ip}")
-        self.portal_clients.pop(client_ip, None)
+        # Like the kernel: only the exact element goes. A pair element is not
+        # deleted by naming its address alone, nor by naming another MAC.
+        if self.portal_macs.get(client_ip) == client_mac:
+            self.portal_clients.pop(client_ip, None)
+            self.portal_macs.pop(client_ip, None)
+
+    def list_portal_grants(self) -> frozenset[tuple[IPv4Address, str | None]]:
+        live = self.list_portal_clients()
+        return frozenset((ip, self.portal_macs.get(ip)) for ip in live)
 
     def list_portal_clients(self) -> frozenset[IPv4Address]:
         if self._now is None:
@@ -82,4 +96,5 @@ class FakeFirewallBackend:
         }
         # Model the kernel actually removing them, not just hiding them.
         self.portal_clients = {ip: self.portal_clients[ip] for ip in live}
+        self.portal_macs = {ip: mac for ip, mac in self.portal_macs.items() if ip in live}
         return frozenset(live)

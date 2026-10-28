@@ -30,10 +30,23 @@ the sets only; `panic` deletes the v2 tables. `reconcile` rebuilds rule
 state from live set contents at startup and never recreates a table. Without
 a `set_backend` everything behaves exactly as before (v1), which is what
 `pirewall-core` does until phase 16 wires `NftablesSetBackend` in.
+
+**Device identity (ADDENDUM_4.md D3; phase 14).** `sync_bindings` and
+`replace_bindings` are the only writers of the binding sets (`bound4`,
+`macbind` in `pirewall_static` and its arp companion), and
+`sync_allowlist` / the allowlist methods the only writers of
+`allow_bound`. Like portal grants these are not `FirewallRule`s: no
+`RuleStatus`, no A3 rate cap. The lease-sync thread calls `sync_bindings`
+without core's RPC lock, so every set-backend call here is serialized on a
+lock of this manager's own (`_SerializedSetBackend`). Portal grants carry
+the client's MAC, and the C4 "am I blocked?" checks match each rule the way
+its kernel element keys: by MAC for `block_mac`/`ratelimit_mac`, by IP
+otherwise.
 """
 
 import contextlib
-from collections.abc import Callable, Iterable, Mapping
+import threading
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from ipaddress import IPv4Address, IPv4Network
@@ -41,11 +54,13 @@ from ipaddress import IPv4Address, IPv4Network
 from pirewall.config.models import PirewallConfig
 from pirewall.core import nft_names
 from pirewall.core.enums import (
+    BindingSource,
     EnforcementMode,
     EventSeverity,
     FirewallAction,
     GuardMode,
     GuardName,
+    NftTransportKind,
     Protocol,
     RuleDirection,
     RuleStatus,
@@ -55,14 +70,16 @@ from pirewall.core.exceptions import FirewallError
 from pirewall.core.models.allowlist import AllowlistEntry
 from pirewall.core.models.decision import FirewallDecision
 from pirewall.core.models.event import SecurityEvent
-from pirewall.core.models.identity import RuleTarget
+from pirewall.core.models.identity import Binding, BindingChange, RuleTarget
 from pirewall.core.models.rule import CandidateRule, FirewallRule
 from pirewall.firewall.allowlist_store import AllowlistStore
 from pirewall.firewall.guards import ALL_OBSERVE
-from pirewall.firewall.interface import FirewallBackend
+from pirewall.firewall.interface import FirewallBackend, PortalGrant
 from pirewall.firewall.rate_limiter import RuleCreationRateLimiter
 from pirewall.firewall.sets import (
     ElementKey,
+    ElementState,
+    RulesetSnapshot,
     SetBackend,
     SetFill,
     SetOp,
@@ -73,7 +90,12 @@ from pirewall.firewall.sets import (
     element_timeout_seconds,
     enforcement_set_for,
 )
-from pirewall.firewall.validator import ActiveTarget, validate_candidate_rule, validate_set_candidate
+from pirewall.firewall.validator import (
+    ActiveTarget,
+    same_device,
+    validate_candidate_rule,
+    validate_set_candidate,
+)
 from pirewall.ipc.protocol_v2 import GuardModes, PanicResult
 
 _SUBSYSTEM = "firewall.manager"
@@ -91,6 +113,84 @@ _ACTION_FOR_SET: Mapping[str, FirewallAction] = {
     nft_names.SET_RATELIMIT4: FirewallAction.RATE_LIMIT,
 }
 _IP_KEYED_SETS = frozenset({nft_names.SET_BLOCK4, nft_names.SET_RATELIMIT4})
+# Where the binding pairs live (D3): the inet guard table and its arp
+# companion, which is the only place ARP can be checked. Same batch, always.
+_BINDING_TABLES: tuple[tuple[str, str], ...] = (
+    (nft_names.INET_FAMILY, nft_names.STATIC_TABLE),
+    (nft_names.ARP_FAMILY, nft_names.STATIC_ARP_TABLE),
+)
+# Both copies of the allowlist pairs (static before anti-spoof's meters,
+# adaptive before the block sets), written in one batch.
+_ALLOW_BOUND_TABLES: tuple[str, ...] = (nft_names.STATIC_TABLE, nft_names.ADAPTIVE_TABLE)
+
+
+class _SerializedSetBackend:
+    """The manager's set backend, with every call behind one lock.
+
+    `FirewallManager` is otherwise single-threaded under core's RPC lock, but
+    lease sync writes bindings from its own thread *without* that lock (V2
+    contracts: lease sync stays outside it). This lock is the manager's own,
+    held only for the duration of one backend call, so a binding sync and a
+    rule deploy can never interleave inside one transport.
+    """
+
+    def __init__(self, backend: SetBackend) -> None:
+        self._backend = backend
+        self._lock = threading.Lock()
+
+    @property
+    def transport(self) -> NftTransportKind:
+        return self._backend.transport
+
+    def metrics(self) -> TransportMetrics:
+        with self._lock:
+            return self._backend.metrics()
+
+    def apply(self, ops: Sequence[SetOp]) -> None:
+        with self._lock:
+            self._backend.apply(ops)
+
+    def flush_sets(self, set_names: Iterable[str]) -> None:
+        with self._lock:
+            self._backend.flush_sets(set_names)
+
+    def list_set(
+        self, set_name: str, *, table: str = nft_names.ADAPTIVE_TABLE, family: str = nft_names.INET_FAMILY
+    ) -> list[ElementState]:
+        with self._lock:
+            return self._backend.list_set(set_name, table=table, family=family)
+
+    def set_fill(self, set_name: str) -> SetFill:
+        with self._lock:
+            return self._backend.set_fill(set_name)
+
+    def set_guard_modes(self, modes: Mapping[GuardName, GuardMode]) -> None:
+        with self._lock:
+            self._backend.set_guard_modes(modes)
+
+    def set_guard_mode(self, guard: GuardName, mode: GuardMode) -> None:
+        with self._lock:
+            self._backend.set_guard_mode(guard, mode)
+
+    def guard_mode(self, guard: GuardName) -> GuardMode | None:
+        with self._lock:
+            return self._backend.guard_mode(guard)
+
+    def table_exists(self, family: str, table: str) -> bool:
+        with self._lock:
+            return self._backend.table_exists(family, table)
+
+    def panic(self) -> tuple[tuple[str, str], ...]:
+        with self._lock:
+            return self._backend.panic()
+
+    def snapshot(self) -> RulesetSnapshot:
+        with self._lock:
+            return self._backend.snapshot()
+
+    def health_check(self) -> bool:
+        with self._lock:
+            return self._backend.health_check()
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,15 +246,16 @@ class FirewallManager:
         """`set_backend` switches adaptive enforcement to the v2 set path (module docstring).
 
         `backend` is still required: the captive portal's `authed` set
-        (ADDENDUM_3.md C2) stays on it until phase 14. `mac_resolver` maps a
-        target IP to its bound MAC; phase 14 passes the binding table's
-        lookup. Without one every v2 target is IP-only (`block4`/`ratelimit4`).
+        (ADDENDUM_3.md C2) lives on it. `mac_resolver` maps an IP to its
+        bound MAC (core passes `LeaseBindingTable.resolve_mac`). Without one,
+        a v2 target has a MAC only if its candidate's `target` carried one,
+        and the C4 checks match by IP alone.
         """
         self._config = config
         self.__backend = backend
         # Same discipline as `__backend`: the only reference to the kernel's
         # adaptive sets lives here (CLAUDE.md single deploy path).
-        self.__sets = set_backend
+        self.__sets = None if set_backend is None else _SerializedSetBackend(set_backend)
         self._mac_resolver = mac_resolver
         self._targets: dict[str, RuleTarget] = {}
         self._rules: dict[str, FirewallRule] = {}
@@ -287,11 +388,19 @@ class FirewallManager:
     def add_allowlist_entry(self, entry: AllowlistEntry) -> None:
         """Add an allowlist entry (ADDENDUM.md A2), persisted so it survives a restart.
 
-        See KNOWN_ISSUES.md #10.
+        See KNOWN_ISSUES.md #10. An entry with a MAC and a /32 is also written
+        to both `allow_bound` sets (D3) on the v2 set path. A2 holds in the
+        validator either way, so a failed kernel write still protects the
+        device from adaptive rules; it only loses the meter exemption, and
+        raises so the caller can report it.
         """
         self._allowlist.append(entry)
         if self._allowlist_store is not None:
             self._allowlist_store.add(entry)
+        pair = _allow_bound_pair(entry)
+        already_pinned = pair in self._allow_bound_pairs(exclude=entry.id)
+        if pair is not None and self.__sets is not None and not already_pinned:
+            self.__sets.apply(_allow_bound_ops(SetOpKind.ADD, pair))
 
     def remove_allowlist_entry(self, entry_id: str) -> bool:
         """Remove an allowlist entry by id. Returns `False` if `entry_id` wasn't found.
@@ -306,11 +415,118 @@ class FirewallManager:
                 del self._allowlist[index]
                 if self._allowlist_store is not None:
                     self._allowlist_store.remove(entry_id)
+                pair = _allow_bound_pair(entry)
+                # Another entry may pin the same pair; the element stays while one does.
+                if pair is not None and self.__sets is not None and pair not in self._allow_bound_pairs():
+                    with contextlib.suppress(FirewallError):
+                        self.__sets.apply(_allow_bound_ops(SetOpKind.DELETE, pair))
                 return True
         return False
 
-    def authorize_portal_client(self, client_ip: IPv4Address, timeout_seconds: int) -> None:
+    def sync_allowlist(self) -> int:
+        """Make both kernel `allow_bound` sets hold exactly the allowlist's MAC+IP pairs. Returns ops written.
+
+        Called at startup: the sets outlive core, and entries may have been
+        added or removed (in config, or in the store) while it was down. One
+        atomic batch. A no-op without a set backend.
+        """
+        sets = self.__sets
+        if sets is None:
+            return 0
+        wanted = self._allow_bound_pairs()
+        ops: list[SetOp] = []
+        for table in _ALLOW_BOUND_TABLES:
+            live = {
+                element.key
+                for element in sets.list_set(nft_names.SET_ALLOW_BOUND, table=table)
+                if isinstance(element.key, tuple)
+            }
+            ops.extend(
+                SetOp(SetOpKind.DELETE, nft_names.SET_ALLOW_BOUND, key, table=table)
+                for key in sorted(live - wanted)
+            )
+            ops.extend(
+                SetOp(SetOpKind.ADD, nft_names.SET_ALLOW_BOUND, key, table=table)
+                for key in sorted(wanted - live)
+            )
+        sets.apply(ops)
+        return len(ops)
+
+    def _allow_bound_pairs(self, exclude: str | None = None) -> set[tuple[str, str]]:
+        return {
+            pair
+            for entry in self._allowlist
+            if entry.id != exclude and (pair := _allow_bound_pair(entry)) is not None
+        }
+
+    # ------------------------------------------------------------- bindings
+
+    def sync_bindings(self, change: BindingChange, now: datetime) -> int:
+        """Write one `BindingTable` change to the kernel binding sets, in one batch. Returns ops written.
+
+        The only writer of `bound4`/`macbind` in both binding tables (D1, D3).
+        Every removal precedes every addition in the batch, so a lease that
+        moved to a new MAC stops being honoured for the old device first
+        (critique_safety_eval.md A6), and the batch commits as a whole. A
+        lease element's timeout is its expiry plus `antispoof.grace_seconds`;
+        a static one has none. Not a `FirewallRule`: no lifecycle, no A3 cap.
+        A no-op (0) without a set backend, the v1 path, which loads no
+        binding sets. Raises `FirewallError` if the kernel refuses.
+        """
+        sets = self.__sets
+        if sets is None or (not change.removed and not change.added):
+            return 0
+        ops = [op for binding in change.removed for op in _binding_ops(SetOpKind.DELETE, binding, None)]
+        for binding in change.added:
+            ops.extend(_binding_ops(SetOpKind.ADD, binding, self._binding_timeout(binding, now)))
+        sets.apply(ops)
+        return len(ops)
+
+    def replace_bindings(self, bindings: Sequence[Binding], now: datetime) -> int:
+        """Make the kernel binding sets hold exactly `bindings` (the startup seed). Returns ops written.
+
+        Elements outlive core, so at startup the kernel may hold pairs whose
+        lease ended, or whose static entry was removed, while core was down.
+        This deletes every live pair not in `bindings`, and re-adds every
+        pair in `bindings` (delete + add) so its timeout is current. One
+        atomic batch, removals first, like `sync_bindings`.
+        """
+        sets = self.__sets
+        if sets is None:
+            return 0
+        wanted = {(str(binding.ip), str(binding.mac)) for binding in bindings}
+        ops: list[SetOp] = []
+        for family, table in _BINDING_TABLES:
+            wanted_ips = {ip for ip, _ in wanted}
+            for set_name in (nft_names.SET_MACBIND, nft_names.SET_BOUND4):
+                for element in sets.list_set(set_name, table=table, family=family):
+                    stale = element.key not in (wanted if set_name == nft_names.SET_MACBIND else wanted_ips)
+                    if stale:
+                        ops.append(SetOp(SetOpKind.DELETE, set_name, element.key, table=table, family=family))
+        for binding in bindings:
+            ops.extend(_binding_ops(SetOpKind.DELETE, binding, None))
+        for binding in bindings:
+            ops.extend(_binding_ops(SetOpKind.ADD, binding, self._binding_timeout(binding, now)))
+        sets.apply(ops)
+        return len(ops)
+
+    def _binding_timeout(self, binding: Binding, now: datetime) -> int | None:
+        if binding.source is BindingSource.STATIC or binding.expires_at is None:
+            return None
+        remaining = int((binding.expires_at - now).total_seconds())
+        return max(1, remaining + self._config.antispoof.grace_seconds)
+
+    def _resolve_mac(self, ip: IPv4Address) -> str | None:
+        return None if self._mac_resolver is None else self._mac_resolver(ip)
+
+    def authorize_portal_client(
+        self, client_ip: IPv4Address, timeout_seconds: int, client_mac: str | None = None
+    ) -> None:
         """Authorize a logged-in captive-portal client for forwarding (ADDENDUM_3.md C2).
+
+        `client_mac` makes the grant the `(client_ip, client_mac)` pair that
+        the v2 template's `authed` set holds (D3). The caller resolves it
+        from core's binding table, never from the client's request.
 
         Routed through this manager for the same reason every rule is: it
         holds the only reference to the backend (CLAUDE.md, "exactly one
@@ -334,11 +550,32 @@ class FirewallManager:
                 f"refusing to authorize {client_ip}: not inside the protected network "
                 f"{self._config.network.protected_network}"
             )
-        self.__backend.authorize_portal_client(client_ip, timeout_seconds)
+        self.__backend.authorize_portal_client(client_ip, timeout_seconds, client_mac)
 
-    def deauthorize_portal_client(self, client_ip: IPv4Address) -> None:
-        """Revoke a portal client's forwarding authorization. Idempotent."""
-        self.__backend.deauthorize_portal_client(client_ip)
+    def deauthorize_portal_client(self, client_ip: IPv4Address, client_mac: str | None = None) -> None:
+        """Revoke a portal client's forwarding authorization. Idempotent.
+
+        Without `client_mac`, every grant the kernel holds for `client_ip` is
+        removed, whatever its MAC: a pair element cannot be deleted by its
+        address alone, and after a core restart only the kernel knows the
+        MAC. If listing fails, the bare-address element is still attempted.
+        """
+        if client_mac is not None:
+            self.__backend.deauthorize_portal_client(client_ip, client_mac)
+            return
+        try:
+            grants = [grant for grant in self.__backend.list_portal_grants() if grant[0] == client_ip]
+        except FirewallError:
+            grants = []
+        for _, mac in grants or [(client_ip, None)]:
+            self.__backend.deauthorize_portal_client(client_ip, mac)
+
+    def authorized_portal_grants(self) -> frozenset[PortalGrant]:
+        """Every `(address, MAC or None)` the kernel has authorized. Empty if the backend is unreachable."""
+        try:
+            return self.__backend.list_portal_grants()
+        except FirewallError:
+            return frozenset()
 
     def authorized_portal_clients(self) -> frozenset[IPv4Address]:
         """Addresses the kernel currently has authorized. Empty set if the backend is unreachable.
@@ -354,10 +591,19 @@ class FirewallManager:
             return frozenset()
 
     def blocking_rules_matching(self, client_ip: IPv4Address) -> list[FirewallRule]:
-        """Active BLOCK rules targeting `client_ip` — the ones that actually disconnect it."""
-        return blocking_rules_targeting(
-            self.active_rules(), client_ip, self._config.network.protected_network
-        )
+        """Active BLOCK rules that cut off the device at `client_ip` — the ones that disconnect it.
+
+        Resolves `client_ip` to its bound MAC and matches each rule the way
+        its enforcement keys (D3): a MAC-keyed element by the MAC, so a
+        device stays blocked after its address changes and a device that
+        inherited a blocked device's old address does not; an IP-keyed one
+        (and every v1 rule) by the address.
+        """
+        return [
+            rule
+            for rule in self.restrictive_rules_matching(client_ip)
+            if rule.action is FirewallAction.BLOCK
+        ]
 
     def restrictive_rules_matching(self, client_ip: IPv4Address) -> list[FirewallRule]:
         """Active BLOCK/RATE_LIMIT rules that actually target `client_ip`.
@@ -368,7 +614,32 @@ class FirewallManager:
         transition; it is an O(active rules) walk, bounded by
         `firewall.max_active_rules`.
         """
-        return rules_targeting(self.active_rules(), client_ip, self._config.network.protected_network)
+        protected = self._config.network.protected_network
+        if self.__sets is None:
+            # v1: the backend enforces on addresses, so the address decides.
+            return rules_targeting(self.active_rules(), client_ip, protected)
+        client_mac = self._resolve_mac(client_ip)
+        return [
+            rule
+            for rule in self.active_rules()
+            if rule.action in (FirewallAction.BLOCK, FirewallAction.RATE_LIMIT)
+            and self._element_restricts(rule, client_ip, client_mac)
+        ]
+
+    def _element_restricts(self, rule: FirewallRule, client_ip: IPv4Address, client_mac: str | None) -> bool:
+        location = _element_of(rule)
+        if location is None:
+            return bool(rules_targeting((rule,), client_ip, self._config.network.protected_network))
+        set_name, key = location
+        if set_name in _IP_KEYED_SETS:
+            return key == str(client_ip)
+        if client_mac is not None:
+            return key == client_mac
+        # No binding resolves this client now (its lease lapsed, say). Its
+        # address is all there is to go on; the kernel may well still be
+        # blocking it, and C4 errs toward telling the client why.
+        target = self._targets.get(rule.id)
+        return target is not None and target.ip == client_ip
 
     def register_decision(self, decision: FirewallDecision) -> None:
         """Record that `decision` came from the real decision engine (spec §24 authorization stage)."""
@@ -386,6 +657,7 @@ class FirewallManager:
             allowlist=self._allowlist,
             rate_limiter=self._rate_limiter,
             now=now,
+            bound_mac=self._bound_mac_of(candidate),
         )
         if not outcome.approved or outcome.priority is None:
             rejection = outcome.rejection
@@ -420,6 +692,7 @@ class FirewallManager:
             evidence=candidate.evidence,
             status=RuleStatus.VALIDATING,
             metadata=candidate.metadata,
+            target=candidate.target,
         )
         self._record(rule.id, None, RuleStatus.VALIDATING, now, "passed full validation chain")
 
@@ -536,6 +809,7 @@ class FirewallManager:
             evidence=candidate.evidence,
             status=RuleStatus.VALIDATING,
             metadata=candidate.metadata,
+            target=target,
         )
         self._targets[rule.id] = target
         self._record(rule.id, None, RuleStatus.VALIDATING, now, "passed the v2 validation chain")
@@ -547,10 +821,22 @@ class FirewallManager:
         return self._deploy_to_sets(rule, now, upgrade_of=outcome.upgrade_of)
 
     def _target_for(self, rule: CandidateRule | FirewallRule) -> RuleTarget | None:
-        mac: str | None = None
-        if self._mac_resolver is not None and rule.source.prefixlen == 32:
-            mac = self._mac_resolver(rule.source.network_address)
+        """The device a candidate's element keys on: its own `target` MAC if it has one, else the binding's.
+
+        A candidate's target MAC comes from the generator, which resolves the
+        binding and, when the evidence frame came from another MAC, names
+        that sender instead (D3, audit item 16). That is the MAC the element
+        must key on: the binding's would punish the address's owner.
+        """
+        mac = rule.target.mac if rule.target is not None else None
+        if mac is None:
+            mac = self._bound_mac_of(rule)
         return device_target(rule, self._config.network.protected_network, mac)
+
+    def _bound_mac_of(self, rule: CandidateRule | FirewallRule) -> str | None:
+        if rule.source.prefixlen != 32:
+            return None
+        return self._resolve_mac(rule.source.network_address)
 
     def _active_targets(self) -> list[ActiveTarget]:
         return [
@@ -565,9 +851,7 @@ class FirewallManager:
         if rule.action is not FirewallAction.BLOCK or target is None:
             return None
         for entry in self._active_targets():
-            if entry.rule.action is FirewallAction.RATE_LIMIT and (
-                entry.target.ip == target.ip or (target.mac is not None and entry.target.mac == target.mac)
-            ):
+            if entry.rule.action is FirewallAction.RATE_LIMIT and same_device(entry.target, target):
                 return entry.rule.id
         return None
 
@@ -1015,3 +1299,24 @@ def _delete_ops(rule: FirewallRule) -> list[SetOp]:
     if location is None:
         return []
     return [SetOp(SetOpKind.DELETE, location[0], location[1])]
+
+
+def _binding_ops(kind: SetOpKind, binding: Binding, timeout: int | None) -> list[SetOp]:
+    """One binding's elements in both binding tables: `bound4` (IP) and `macbind` (IP . MAC)."""
+    ip, mac = str(binding.ip), str(binding.mac)
+    ops: list[SetOp] = []
+    for family, table in _BINDING_TABLES:
+        ops.append(SetOp(kind, nft_names.SET_BOUND4, ip, timeout, table=table, family=family))
+        ops.append(SetOp(kind, nft_names.SET_MACBIND, (ip, mac), timeout, table=table, family=family))
+    return ops
+
+
+def _allow_bound_pair(entry: AllowlistEntry) -> tuple[str, str] | None:
+    """The `allow_bound` key (MAC . IP) an allowlist entry pins, or None if it pins no single device."""
+    if entry.mac is None or entry.target.prefixlen != 32:
+        return None
+    return (str(entry.mac), str(entry.target.network_address))
+
+
+def _allow_bound_ops(kind: SetOpKind, pair: tuple[str, str]) -> list[SetOp]:
+    return [SetOp(kind, nft_names.SET_ALLOW_BOUND, pair, table=table) for table in _ALLOW_BOUND_TABLES]

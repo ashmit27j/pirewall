@@ -108,10 +108,12 @@ class FlowState:
         "first_seen",
         "forward_byte_count",
         "forward_destination_ip",
+        "forward_destination_mac",
         "forward_destination_port",
         "forward_packet_count",
         "forward_payload_bytes",
         "forward_source_ip",
+        "forward_source_mac",
         "forward_source_port",
         "initiated",
         "inter_arrival_stats",
@@ -139,6 +141,8 @@ class FlowState:
         forward_destination_ip: IPv4Address,
         forward_destination_port: int | None,
         first_seen: datetime,
+        forward_source_mac: str | None = None,
+        forward_destination_mac: str | None = None,
     ) -> None:
         self.key = key
         self.protocol = protocol
@@ -146,6 +150,11 @@ class FlowState:
         self.forward_source_port = forward_source_port
         self.forward_destination_ip = forward_destination_ip
         self.forward_destination_port = forward_destination_port
+        # The opening frame's Ethernet addresses (ADDENDUM_4.md D3), like the
+        # native engine's `fwd_src_mac`: fixed by the first packet, never
+        # updated, so a flow keeps naming the device that started it.
+        self.forward_source_mac = forward_source_mac
+        self.forward_destination_mac = forward_destination_mac
         self.first_seen = first_seen
         self.last_seen = first_seen
         self.packet_count = 0
@@ -184,6 +193,8 @@ class FlowState:
             forward_destination_ip=packet.destination_ip,
             forward_destination_port=packet.destination_port,
             first_seen=packet.timestamp,
+            forward_source_mac=packet.source_mac,
+            forward_destination_mac=packet.destination_mac,
         )
         state.initiated = is_initiation(packet)
         state.observe(packet)
@@ -272,6 +283,8 @@ class FlowState:
                 std_seconds=self.inter_arrival_stats.sample_std,
             ),
             opened_by_initiation=self.initiated,
+            source_mac=self.forward_source_mac,
+            destination_mac=self.forward_destination_mac,
             payload_stats=PayloadStats(
                 forward_bytes=self.forward_payload_bytes,
                 backward_bytes=self.backward_payload_bytes,

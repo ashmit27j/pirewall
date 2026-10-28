@@ -48,6 +48,15 @@ apply. Path (c) is therefore not reachable from today's real scoring
 output at all — it exists purely as a forward-looking safety net for a
 future weight/threshold change, verified by construction rather than
 assumed (see `docs/ADDENDUM_2.md` B3 for the full arithmetic).
+
+**Interim ML ceiling (ADDENDUM_4.md D4, applied to v1).** When the
+assessment carries an `enforceable_level` (the level the non-ML evidence
+reaches alone; `ThreatConfig.ml_evidence_can_enforce = false`), the action
+may not exceed that level's action. The one exception: evidence that put
+the flow at MEDIUM or above still gets at least MONITOR, so an ML-only
+verdict is recorded and visible but never throttles or blocks. Applied
+before the maturity gate, which then only ever sees what the deterministic
+evidence justified. The reason says when the ceiling applied.
 """
 
 from collections import OrderedDict
@@ -73,6 +82,14 @@ _ACTION_BY_LEVEL: dict[ThreatLevel, FirewallAction] = {
 # gating; this is exactly the "restrictive" action set spec §24 already
 # names for the validator's allowlist/safety stages.
 _MATURITY_GATED_ACTIONS = frozenset({FirewallAction.RATE_LIMIT, FirewallAction.BLOCK})
+
+# Strength order, for the ML ceiling's "never above" comparison.
+_ACTION_RANK: dict[FirewallAction, int] = {
+    FirewallAction.ALLOW: 0,
+    FirewallAction.MONITOR: 1,
+    FirewallAction.RATE_LIMIT: 2,
+    FirewallAction.BLOCK: 3,
+}
 
 # Mirrors `DetectionConfig.known_attack_confidence_threshold`'s own default,
 # so a caller that does not thread config through still applies the same bar
@@ -137,6 +154,14 @@ def decide(
     `MONITOR`, which is the conservative default, never the permissive one.
     """
     action = _ACTION_BY_LEVEL[assessment.threat_level]
+    reason = assessment.explanation
+    ceiling = _ml_ceiling(assessment)
+    if ceiling is not None and _ACTION_RANK[action] > _ACTION_RANK[ceiling]:
+        reason = (
+            f"{reason}; action capped at {ceiling.value} (would be {action.value}): "
+            "ML evidence alone may not enforce (threat.ml_evidence_can_enforce = false)"
+        )
+        action = ceiling
     if action in _MATURITY_GATED_ACTIONS and not _has_mature_evidence(
         assessment, maturity_tracker, known_attack_confidence_threshold
     ):
@@ -148,10 +173,24 @@ def decide(
         action=action,
         threat_score=assessment.threat_score,
         threat_level=assessment.threat_level,
-        reason=assessment.explanation,
+        reason=reason,
         evidence=assessment.contributing_evidence,
         decided_at=decided_at,
     )
+
+
+def _ml_ceiling(assessment: ThreatAssessment) -> FirewallAction | None:
+    """The strongest action the interim D4 ceiling allows, or `None` when it does not apply.
+
+    The non-ML level's action, raised to MONITOR when the full level is
+    MEDIUM or above: ML may make a flow visible, never act on it.
+    """
+    if assessment.enforceable_level is None:
+        return None
+    ceiling = _ACTION_BY_LEVEL[assessment.enforceable_level]
+    if _ACTION_RANK[_ACTION_BY_LEVEL[assessment.threat_level]] >= _ACTION_RANK[FirewallAction.MONITOR]:
+        ceiling = max(ceiling, FirewallAction.MONITOR, key=_ACTION_RANK.__getitem__)
+    return ceiling
 
 
 def _has_mature_evidence(

@@ -33,6 +33,16 @@ Usage:
     uv run python -m scripts.deployment.configure --detect        # show detection, write nothing
     uv run python -m scripts.deployment.configure --set-admin-pc  # change only the Admin PC
     uv run python -m scripts.deployment.configure --set-password  # rotate only the admin password
+    uv run python -m scripts.deployment.configure --static-bindings  # add [[antispoof.static]] devices
+
+**Static bindings** (`[[antispoof.static]]`, ADDENDUM_4.md D3) are offered,
+never added by default. A device with a fixed address has no DHCP lease, so
+without an entry it has no IP<->MAC binding: it cannot sign in to the portal
+and is metered as unbound. The candidates are LAN neighbours with a MAC and
+no current lease. A static entry outranks the lease file, so one made for a
+device that is really on DHCP pins it to an address it may not keep. That
+is why a human confirms each one, and why nothing is offered when the lease
+file cannot be read.
 """
 
 import argparse
@@ -40,12 +50,18 @@ import getpass
 import ipaddress
 import re
 import sys
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from pydantic import TypeAdapter, ValidationError
+
 from pirewall.api.auth import hash_password
 from pirewall.config.loader import load_config
+from pirewall.config.models import lease_file_for
+from pirewall.core.bindings import MAX_LEASE_FILE_BYTES, parse_leases
 from pirewall.core.exceptions import ConfigurationError
+from pirewall.core.models.common import UnicastMacAddress
 from scripts.deployment.discovery import DiscoveredNetwork, DiscoveryError, discover
 
 DEFAULT_CONFIG_PATH = Path("config/local_config.toml")
@@ -59,6 +75,19 @@ EXIT_OK = 0
 EXIT_FAILURE = 1
 
 
+_UNICAST_MAC: TypeAdapter[str] = TypeAdapter(UnicastMacAddress)
+_DEFAULT_STATIC_REASON = "static address, confirmed in scripts.deployment.configure"
+
+
+@dataclass(frozen=True, slots=True)
+class StaticBinding:
+    """One confirmed `[[antispoof.static]]` entry."""
+
+    ip: ipaddress.IPv4Address
+    mac: str
+    reason: str
+
+
 @dataclass(frozen=True, slots=True)
 class Answers:
     """The values a human supplies, as opposed to the ones `discovery` observes."""
@@ -66,6 +95,7 @@ class Answers:
     admin_pc_ip: ipaddress.IPv4Address
     admin_username: str
     admin_password_hash: str
+    static_bindings: tuple[StaticBinding, ...] = ()
 
 
 # --------------------------------------------------------------------- prompts
@@ -145,14 +175,115 @@ def prompt_password_hash() -> str:
         return hash_password(password)
 
 
+def read_leased_ips(
+    path: Path, protected_network: ipaddress.IPv4Network
+) -> set[ipaddress.IPv4Address] | None:
+    """Addresses with a current lease in `path`, via the runtime's parser; `None` if unreadable."""
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_LEASE_FILE_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > MAX_LEASE_FILE_BYTES:
+        return None
+    parsed = parse_leases(raw.decode("utf-8", errors="replace"), protected_network)
+    return {binding.ip for binding in parsed.bindings}
+
+
+def static_binding_candidates(
+    neighbours: Sequence[tuple[ipaddress.IPv4Address, str]],
+    *,
+    leased: Collection[ipaddress.IPv4Address],
+    protected_network: ipaddress.IPv4Network,
+    pirewall_lan_ip: ipaddress.IPv4Address,
+    existing_ips: Collection[ipaddress.IPv4Address] = (),
+    existing_macs: Collection[str] = (),
+) -> list[tuple[ipaddress.IPv4Address, str]]:
+    """Neighbours worth offering as `[[antispoof.static]]`: on the LAN, unicast, unleased, not yet bound.
+
+    MACs come back normalised. A MAC seen at more than one address is
+    dropped, because there is no telling which address is the fixed one.
+    """
+    normalised: list[tuple[ipaddress.IPv4Address, str]] = []
+    for address, mac in neighbours:
+        if address == pirewall_lan_ip or address not in protected_network or address in leased:
+            continue
+        try:
+            normalised.append((address, _UNICAST_MAC.validate_python(mac)))
+        except ValidationError:
+            continue
+    seen_macs = [mac for _, mac in normalised]
+    taken_macs = {_UNICAST_MAC.validate_python(mac) for mac in existing_macs}
+    return sorted(
+        (address, mac)
+        for address, mac in normalised
+        if seen_macs.count(mac) == 1 and address not in existing_ips and mac not in taken_macs
+    )
+
+
+def prompt_static_bindings(
+    candidates: Sequence[tuple[ipaddress.IPv4Address, str]], lease_file: Path, *, leases_readable: bool
+) -> tuple[StaticBinding, ...]:
+    """Offer `candidates` for `[[antispoof.static]]` and return the ones a human confirms.
+
+    Never adds one by default: an empty answer adds none.
+    """
+    print("\nDevices with a fixed address (config: [[antispoof.static]])")
+    print("  A device with no DHCP lease has no IP<->MAC binding: it cannot sign in to")
+    print("  the portal and is metered as unbound. Only add devices whose address is")
+    print("  configured on the device itself; an entry outranks the lease file.")
+    if not leases_readable:
+        print(f"\n  The lease file {lease_file} could not be read, so DHCP clients cannot be")
+        print("  told apart from fixed-address devices. Nothing is offered. Add entries by hand,")
+        print("  or re-run with --static-bindings once the lease file exists.")
+        return ()
+    if not candidates:
+        print("\n  No unleased devices seen on the LAN. Add entries later with --static-bindings.")
+        return ()
+    print("\n  Seen on the LAN with no current lease (candidates, not a guess):")
+    for index, (address, mac) in enumerate(candidates, start=1):
+        print(f"    {index}) {address}  {mac}")
+    while True:
+        answer = input("  Numbers to add, comma-separated (empty for none): ").strip()
+        if not answer:
+            return ()
+        try:
+            picks = sorted({int(part) for part in answer.split(",") if part.strip()})
+        except ValueError:
+            print("  Use numbers from the list, e.g. 1,3.")
+            continue
+        if not picks or any(not 1 <= pick <= len(candidates) for pick in picks):
+            print(f"  Pick from 1-{len(candidates)}.")
+            continue
+        break
+    chosen: list[StaticBinding] = []
+    for pick in picks:
+        address, mac = candidates[pick - 1]
+        reason = _prompt(f"  Reason for {address} ({mac})", _DEFAULT_STATIC_REASON)
+        # Written into a TOML basic string; keep it one line with no escapes.
+        reason = reason.replace("\\", "/").replace('"', "'")
+        chosen.append(StaticBinding(ip=address, mac=mac, reason=reason))
+    return tuple(chosen)
+
+
 def collect_answers(discovered: DiscoveredNetwork) -> Answers:
     """Ask for everything that is a policy decision rather than an observable fact."""
     admin_pc_ip = prompt_admin_pc_ip(discovered)
     username = _prompt("\nAdmin username (config: authentication.admin_username)", "admin")
+    password_hash = prompt_password_hash()
+    lease_file = Path(lease_file_for(discovered.lan_interface))
+    leased = read_leased_ips(lease_file, discovered.protected_network)
+    candidates = static_binding_candidates(
+        discovered.neighbour_macs,
+        leased=leased or set(),
+        protected_network=discovered.protected_network,
+        pirewall_lan_ip=discovered.pirewall_lan_ip,
+    )
     return Answers(
         admin_pc_ip=admin_pc_ip,
         admin_username=username,
-        admin_password_hash=prompt_password_hash(),
+        admin_password_hash=password_hash,
+        static_bindings=prompt_static_bindings(candidates, lease_file, leases_readable=leased is not None),
     )
 
 
@@ -259,6 +390,9 @@ anomaly_weight = 15.0
 # RATE_LIMIT but never BLOCK. See config/default_config.toml.
 behavior_weight = 80.0
 protocol_signature_weight = 75.0
+# Interim D4 ceiling: ML evidence alone never causes more than MONITOR until
+# the models are retrained on this network (docs/KNOWN_ISSUES.md #1, #2).
+ml_evidence_can_enforce = false
 
 [threat.behavior_pattern_points]
 scanning = 55.0
@@ -344,7 +478,32 @@ mode = "fail_open"
 watchdog_sec = 30
 crash_loop_restart_count = 3
 crash_loop_window_seconds = 300
+
+{render_antispoof_section(answers.static_bindings)}'''
+
+
+def render_static_binding(binding: StaticBinding) -> str:
+    """One `[[antispoof.static]]` table."""
+    return f'''[[antispoof.static]]
+ip = "{binding.ip}"
+mac = "{binding.mac}"
+reason = "{binding.reason}"
 '''
+
+
+def render_antispoof_section(static_bindings: Sequence[StaticBinding]) -> str:
+    """The `[antispoof]` section, with `lease_file` left unset so it follows `network.lan_interface`."""
+    header = '''[antispoof]
+# ADDENDUM_4.md D3 — IP<->MAC bindings. lease_file is derived from
+# network.lan_interface (/var/lib/NetworkManager/dnsmasq-<lan_interface>.leases)
+# while unset, so it follows the LAN. Portal sign-in needs a binding.
+# Add fixed-address devices with: python -m scripts.deployment.configure --static-bindings
+grace_seconds = 60
+poll_seconds = 2.0
+'''
+    if not static_bindings:
+        return header + "static = []\n"
+    return header + "\n" + "\n".join(render_static_binding(binding) for binding in static_bindings)
 
 
 # --------------------------------------------------------------- file surgery
@@ -397,6 +556,40 @@ def replace_admin_pc_allowlist(text: str, admin_pc_ip: ipaddress.IPv4Address) ->
             lines[index] = f'{match.group(1)}target{match.group(2)}"{admin_pc_ip}/32"\n'
             return "".join(lines)
     return text
+
+
+def add_static_bindings(text: str, bindings: Sequence[StaticBinding]) -> str:
+    """Append `[[antispoof.static]]` tables to an existing config, leaving everything else as it is.
+
+    An `[antispoof]` section's `static = []` is dropped, since TOML forbids
+    an inline array and array tables for the same key. A non-empty inline
+    `static = [...]` is refused: rewriting it would mean re-serialising
+    entries an operator wrote by hand. With no `[antispoof]` section, one is
+    appended.
+    """
+    if not bindings:
+        return text
+    lines = text.splitlines(keepends=True)
+    has_section = False
+    in_section = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_section = stripped == "[antispoof]"
+            has_section = has_section or in_section
+            continue
+        if in_section and re.match(r"static\s*=", stripped):
+            if re.fullmatch(r"static\s*=\s*\[\s*\](\s*#.*)?", stripped) is None:
+                raise ConfigurationError(
+                    "[antispoof] static is a non-empty inline array; add the entries by hand"
+                )
+            lines[index] = ""
+    body = "".join(lines)
+    if not body.endswith("\n"):
+        body += "\n"
+    if not has_section:
+        return body + "\n" + render_antispoof_section(bindings)
+    return body + "\n" + "\n".join(render_static_binding(binding) for binding in bindings)
 
 
 # ------------------------------------------------------------------- workflow
@@ -515,6 +708,34 @@ def run_set_password(path: Path) -> int:
     return EXIT_OK
 
 
+def run_static_bindings(path: Path) -> int:
+    """Offer unleased LAN devices for `[[antispoof.static]]` and add the confirmed ones."""
+    current = load_config(path)
+    try:
+        discovered = discover()
+    except DiscoveryError as exc:
+        print(f"Could not scan the network ({exc})", file=sys.stderr)
+        return EXIT_FAILURE
+    lease_file = Path(current.antispoof.lease_file)
+    leased = read_leased_ips(lease_file, current.network.protected_network)
+    candidates = static_binding_candidates(
+        discovered.neighbour_macs,
+        leased=leased or set(),
+        protected_network=current.network.protected_network,
+        pirewall_lan_ip=current.network.pirewall_lan_ip,
+        existing_ips={entry.ip for entry in current.antispoof.static},
+        existing_macs={entry.mac for entry in current.antispoof.static},
+    )
+    chosen = prompt_static_bindings(candidates, lease_file, leases_readable=leased is not None)
+    if not chosen:
+        print("\nNothing added.")
+        return EXIT_OK
+    write_validated(path, add_static_bindings(path.read_text(encoding="utf-8"), chosen))
+    print(f"\nAdded {len(chosen)} static binding(s) to {path}.")
+    print("Restart pirewall-core for them to take effect:  sudo systemctl restart pirewall-core")
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pirewall-configure",
@@ -534,6 +755,11 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--set-password", action="store_true", help="rotate only the admin password hash"
     )
+    mode.add_argument(
+        "--static-bindings",
+        action="store_true",
+        help="offer fixed-address LAN devices for [[antispoof.static]] in an existing config",
+    )
     parser.add_argument(
         "--admin-pc-ip",
         default=None,
@@ -549,7 +775,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.detect:
             print(describe(discover()))
             return EXIT_OK
-        if args.set_admin_pc or args.set_password:
+        if args.set_admin_pc or args.set_password or args.static_bindings:
             if not path.is_file():
                 print(
                     f"{path} does not exist — run `python -m scripts.deployment.configure` first.",
@@ -558,6 +784,8 @@ def main(argv: list[str] | None = None) -> int:
                 return EXIT_FAILURE
             if args.set_admin_pc:
                 return run_set_admin_pc(path, args.admin_pc_ip)
+            if args.static_bindings:
+                return run_static_bindings(path)
             return run_set_password(path)
         return run_full_setup(path)
     except DiscoveryError as exc:

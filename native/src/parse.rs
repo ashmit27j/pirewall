@@ -57,6 +57,11 @@ pub struct Packet {
     /// resolution as the Python path's `datetime`, so inter-arrival
     /// arithmetic is bit-identical between the two.
     pub ts_us: i64,
+    /// Ethernet source and destination, as 48-bit integers with the octets
+    /// big-endian (`aa:bb:..` = 0xaabb..), like `src`/`dst` below. Carried
+    /// for device identity (ADDENDUM_4.md D3); never a model feature.
+    pub src_mac: u64,
+    pub dst_mac: u64,
     /// IPv6 frames are parsed (and validated) but never aggregated (A5).
     pub ipv4: bool,
     pub src: u32,
@@ -98,6 +103,12 @@ fn be32(raw: &[u8], at: usize) -> u32 {
     u32::from_be_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]])
 }
 
+/// Six bytes at `at` as a 48-bit integer, octets big-endian.
+#[inline]
+fn be48(raw: &[u8], at: usize) -> u64 {
+    raw[at..at + 6].iter().fold(0u64, |acc, &octet| (acc << 8) | u64::from(octet))
+}
+
 pub fn parse(raw: &[u8], ts_us: i64) -> Result<Packet, ParseError> {
     if raw.len() < ETH_HEADER_LEN {
         return Err(ParseError::Malformed);
@@ -136,6 +147,8 @@ fn parse_ipv4(raw: &[u8], offset: usize, ts_us: i64) -> Result<Packet, ParseErro
     let tcp_payload_offset = (l4.proto == Proto::Tcp).then_some(l4_offset + l4.header_length);
     Ok(Packet {
         ts_us,
+        src_mac: be48(raw, 6),
+        dst_mac: be48(raw, 0),
         ipv4: true,
         src,
         dst,
@@ -167,6 +180,8 @@ fn parse_ipv6(raw: &[u8], offset: usize, ts_us: i64) -> Result<Packet, ParseErro
     }
     Ok(Packet {
         ts_us,
+        src_mac: be48(raw, 6),
+        dst_mac: be48(raw, 0),
         ipv4: false,
         src: 0,
         dst: 0,
@@ -238,7 +253,7 @@ mod tests {
 
     fn tcp_frame(flags: u8, payload: &[u8]) -> Vec<u8> {
         let total = 20 + 20 + payload.len();
-        let mut f = vec![0u8; 12];
+        let mut f = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x02, 0x00, 0x00, 0x00, 0x00, 0x20];
         f.extend_from_slice(&[0x08, 0x00]);
         f.extend_from_slice(&[0x45, 0, (total >> 8) as u8, total as u8, 0, 0, 0, 0, 64, 6, 0, 0]);
         f.extend_from_slice(&[10, 0, 0, 5, 10, 0, 0, 10]);
@@ -257,6 +272,13 @@ mod tests {
         assert_eq!(p.total_length, 45);
         assert_eq!(p.payload_length, 5);
         assert_eq!(tcp_payload(&frame, &p), Some(&b"hello"[..]));
+    }
+
+    #[test]
+    fn ethernet_addresses_are_read_as_big_endian_48_bit_integers() {
+        let p = parse(&tcp_frame(TCP_SYN, b""), 0).unwrap();
+        assert_eq!(p.dst_mac, 0xAABB_CCDD_EEFF);
+        assert_eq!(p.src_mac, 0x0200_0000_0020);
     }
 
     #[test]

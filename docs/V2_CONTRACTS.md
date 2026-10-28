@@ -246,7 +246,7 @@ loads unchanged, and no existing key was renamed or removed.
 |---|---|
 | `[pipeline]` | `engine = "v1"` |
 | `[guards]` | `raw_mode = "enforce"` (enforce **if seeded**), `input_mode = "enforce"`, `forward_mode = "observe"`, meter pairs `{rate, burst}` (table below), `portal_concurrency = 20`, set sizes |
-| `[antispoof]` | `lease_file = "/var/lib/NetworkManager/dnsmasq-wlan0.leases"`, `static = []` (`{ip, mac, reason}`; each IP and MAC once), `grace_seconds = 60`, `poll_seconds = 2.0` |
+| `[antispoof]` | `lease_file`: when unset, derived from `network.lan_interface` as `/var/lib/NetworkManager/dnsmasq-<lan_interface>.leases` (phase 14b; was a fixed `dnsmasq-wlan0.leases`, the same file for the default LAN), and an explicit value wins; `static = []` (`{ip, mac, reason}`; each IP and MAC once), `grace_seconds = 60`, `poll_seconds = 2.0` |
 | `[policy]` | `rate_limit_ttl_seconds = 300`, `block_ttl_seconds = 300`, `escalation_ttl_multiplier = 2`, `max_ttl_seconds = 3600` (≤ 3600), `sustained_polls = 2` (≥ 2) |
 | `[lab]` | `env_tag = "sandbox"`, `victim_netns = "labvictim"`, `victim_host_interface = "lab0"`, `victim_network = "10.250.0.0/30"` (must be a /30) |
 | `[capture]` additions | `backend` also accepts `"replay"`, which needs `replay_path`. `replay_speed = "max"` (also `"realtime"` or `"<N>x"`). Validation only: core does not read these before phases 15 and 16. |

@@ -13,6 +13,9 @@ HAS_PACKET_RING: bool
 class FlowRecord:
     src: int
     dst: int
+    # EUI-48 as an unsigned 48-bit integer, octets big-endian (V2_CONTRACTS §10).
+    src_mac: int
+    dst_mac: int
     sport: int | None
     dport: int | None
     protocol: str
@@ -50,6 +53,8 @@ class FlowRecord:
 class NewFlowRecord:
     src: int
     dst: int
+    src_mac: int
+    dst_mac: int
     dport: int | None
     protocol: str
     ts_us: int

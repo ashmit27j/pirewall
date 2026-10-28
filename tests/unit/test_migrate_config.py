@@ -11,7 +11,7 @@ from scripts.deployment import migrate_config
 from scripts.deployment.migrate_config import MigrationError, migrate_text
 
 from pirewall.config.loader import load_config
-from pirewall.config.models import GuardsConfig, PolicyConfig
+from pirewall.config.models import GuardsConfig, PirewallConfig, PolicyConfig
 from pirewall.core.enums import PipelineEngine
 from tests.unit.test_config_loader import DEFAULT_CONFIG, MINIMAL_VALID_TOML
 
@@ -45,7 +45,10 @@ def test_a_1x_config_is_upgraded_to_feature_schema_2_0_and_v2() -> None:
     assert raw["threat"]["behavior_pattern_points"]["scanning"] == 55.0
     for section in migrate_config.V2_SECTION_ORDER:
         assert section in raw, section
-    assert raw["antispoof"]["lease_file"] == "/var/lib/NetworkManager/dnsmasq-wlan0.leases"
+    # Left unset so it is derived, and follows the LAN if that moves.
+    assert "lease_file" not in raw["antispoof"]
+    migrated = PirewallConfig.model_validate(raw)
+    assert migrated.antispoof.lease_file == "/var/lib/NetworkManager/dnsmasq-wlan0.leases"
 
 
 def test_a_1x_migration_keeps_comments_and_untouched_values() -> None:

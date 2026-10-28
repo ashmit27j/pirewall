@@ -15,6 +15,11 @@ privileged process:
 * the nft `@authed` grant, via `FirewallManager` — the one authorized path
   to the backend (CLAUDE.md)
 * the blocked-client answer (C4)
+* the client's MAC (ADDENDUM_4.md D3), resolved from the request's source
+  address through core's `BindingTable`, never from anything in the HTTP
+  request. A session is the `(ip, mac)` pair the kernel grant names: no
+  binding means no login, and a session whose address is now bound to a
+  different MAC is ended.
 
 The portal process holds no state of its own and makes no decisions; it
 renders what this returns. That is the same relationship pirewall-api has
@@ -27,6 +32,7 @@ from datetime import UTC, datetime
 from ipaddress import IPv4Address
 
 from pirewall.config.models import PirewallConfig
+from pirewall.core.binding_table import BindingTable
 from pirewall.core.enums import EventSeverity, SecurityEventType
 from pirewall.core.exceptions import FirewallError
 from pirewall.core.models.event import SecurityEvent
@@ -46,6 +52,10 @@ _SESSION_TOKEN_BYTES = 32
 _BLOCKED_MESSAGE = (
     "Malicious activity has been detected from this device and its network "
     "access has been suspended."
+)
+_NO_BINDING_MESSAGE = (
+    "This device does not have an address lease from this network yet. "
+    "Disconnect from the Wi-Fi, reconnect, and try again."
 )
 
 
@@ -68,8 +78,14 @@ class PortalService:
         store: PortalUserStore,
         on_event: Callable[[SecurityEvent], None],
         now_fn: Callable[[], datetime] = lambda: datetime.now(UTC),
+        bindings: BindingTable | None = None,
     ) -> None:
+        """`bindings` makes sessions MAC-bound (module docstring); pirewall-core always passes one.
+
+        Without it, sessions and grants are IP-only, the pre-v2 behaviour.
+        """
         self._config = config
+        self._bindings = bindings
         self._manager = manager
         self._store = store
         self._on_event = on_event
@@ -126,6 +142,16 @@ class PortalService:
         if self._manager.blocking_rules_matching(client_ip):
             raise PortalLoginError(_BLOCKED_MESSAGE + " " + self._config.portal.contact_message)
 
+        # Before the password, so a device with no lease costs no scrypt.
+        client_mac = self._bound_mac(client_ip)
+        if self._bindings is not None and client_mac is None:
+            self._emit(
+                EventSeverity.INFO,
+                SecurityEventType.AUTHENTICATION_FAILURE,
+                f"portal login refused for {client_ip}: no IP-MAC binding for this address",
+            )
+            raise PortalLoginError(_NO_BINDING_MESSAGE)
+
         if not self._store.verify(username, password):
             newly_locked = self._throttle.record_failure(client_ip, now, username)
             self._emit(
@@ -143,10 +169,10 @@ class PortalService:
             raise PortalLoginError("Invalid username or password.")
 
         token = secrets.token_urlsafe(_SESSION_TOKEN_BYTES)
-        session = self._sessions.create(username, client_ip, token, now)
+        session = self._sessions.create(username, client_ip, token, now, client_mac)
         try:
             self._manager.authorize_portal_client(
-                client_ip, self._config.portal.session_timeout_seconds
+                client_ip, self._config.portal.session_timeout_seconds, client_mac
             )
         except FirewallError as exc:
             # Never report a login as successful when the client is not
@@ -161,10 +187,11 @@ class PortalService:
             raise PortalLoginError("Could not grant network access. Please try again.") from exc
 
         self._throttle.clear(client_ip, username)
+        device = client_ip if client_mac is None else f"{client_ip} ({client_mac})"
         self._emit(
             EventSeverity.INFO,
             SecurityEventType.FIREWALL_ALLOW,
-            f"portal login: {username!r} authorized {client_ip} "
+            f"portal login: {username!r} authorized {device} "
             f"for {self._config.portal.session_timeout_seconds}s",
         )
         return session
@@ -199,6 +226,12 @@ class PortalService:
             )
 
         session = self._sessions.validate(token, client_ip, now) if token else None
+        if session is not None and not self._same_device(session, client_ip):
+            # The address is now bound to another MAC: a new device holds it,
+            # or the old one changed its MAC. Either way the grant names a
+            # pair that no longer exists, and the session ends with it.
+            self._revoke(client_ip, reason="the address is now bound to a different device")
+            return PortalClientState(status=PortalClientStatus.EXPIRED, client_ip=client_ip)
         if session is None:
             # A token that no longer validates means the session ran out (or
             # was ended for them); no token at all means they never logged
@@ -223,8 +256,12 @@ class PortalService:
         session = self._sessions.validate(token, client_ip, now)
         if session is None:
             return False
+        if not self._same_device(session, client_ip):
+            # Not the device the session was issued to; it ends all the same.
+            self._revoke(client_ip, reason="the address is now bound to a different device")
+            return False
         self._sessions.invalidate(token)
-        self._deauthorize(client_ip)
+        self._deauthorize(client_ip, session.client_mac)
         self._emit(
             EventSeverity.INFO,
             SecurityEventType.FIREWALL_ALLOW,
@@ -285,6 +322,8 @@ class PortalService:
     def force_logout(self, client_ip: IPv4Address) -> bool:
         """Admin-initiated disconnect of one client."""
         session = self._sessions.invalidate_ip(client_ip)
+        # Every grant for the address, not just the session's: an admin
+        # disconnect must not leave a stale pair behind.
         self._deauthorize(client_ip)
         if session is not None:
             self._emit(
@@ -306,7 +345,7 @@ class PortalService:
         """
         expired = self._sessions.purge_expired(self._now_fn())
         for session in expired:
-            self._deauthorize(session.client_ip)
+            self._deauthorize(session.client_ip, session.client_mac)
         return len(expired) + self.reconcile()
 
     def reconcile(self) -> int:
@@ -336,12 +375,12 @@ class PortalService:
         """
         now = self._now_fn()
         orphans = [
-            client_ip
-            for client_ip in self._manager.authorized_portal_clients()
-            if self._sessions.get_by_ip(client_ip, now) is None
+            (client_ip, client_mac)
+            for client_ip, client_mac in self._manager.authorized_portal_grants()
+            if not self._grant_has_session(client_ip, client_mac, now)
         ]
-        for client_ip in orphans:
-            self._deauthorize(client_ip)
+        for client_ip, client_mac in sorted(orphans, key=lambda grant: (grant[0], grant[1] or "")):
+            self._deauthorize(client_ip, client_mac)
             self._emit(
                 EventSeverity.WARNING,
                 SecurityEventType.SYSTEM_WARNING,
@@ -349,6 +388,20 @@ class PortalService:
                 "no active session (pirewall-core restart, or a login that did not complete)",
             )
         return len(orphans)
+
+    def _grant_has_session(self, client_ip: IPv4Address, client_mac: str | None, now: datetime) -> bool:
+        """Whether a live session stands behind this exact kernel element."""
+        session = self._sessions.get_by_ip(client_ip, now)
+        return session is not None and session.client_mac == client_mac
+
+    def _bound_mac(self, client_ip: IPv4Address) -> str | None:
+        return None if self._bindings is None else self._bindings.resolve_mac(client_ip)
+
+    def _same_device(self, session: PortalSession, client_ip: IPv4Address) -> bool:
+        """Whether `client_ip` is still bound to the MAC the session was issued to (always, IP-only)."""
+        if self._bindings is None or session.client_mac is None:
+            return True
+        return self._bindings.resolve_mac(client_ip) == session.client_mac
 
     def warn_about_demo_accounts(self) -> None:
         """Emit a startup warning while the documented demo credentials still exist."""
@@ -365,7 +418,7 @@ class PortalService:
 
     def _revoke(self, client_ip: IPv4Address, reason: str) -> None:
         session = self._sessions.invalidate_ip(client_ip)
-        self._deauthorize(client_ip)
+        self._deauthorize(client_ip, None if session is None else session.client_mac)
         if session is not None:
             self._emit(
                 EventSeverity.WARNING,
@@ -377,17 +430,20 @@ class PortalService:
         for session in list(self._sessions.list_sessions(self._now_fn())):
             if session.username == username:
                 self._sessions.invalidate(session.token)
-                self._deauthorize(session.client_ip)
+                self._deauthorize(session.client_ip, session.client_mac)
                 self._emit(
                     EventSeverity.INFO,
                     SecurityEventType.SYSTEM_WARNING,
                     f"portal session for {username!r} at {session.client_ip} ended: {reason}",
                 )
 
-    def _deauthorize(self, client_ip: IPv4Address) -> None:
-        """Drop a client's nft grant, tolerating a backend that is down (ADDENDUM.md A6)."""
+    def _deauthorize(self, client_ip: IPv4Address, client_mac: str | None = None) -> None:
+        """Drop a client's nft grant, tolerating a backend that is down (ADDENDUM.md A6).
+
+        Without `client_mac`, every grant the kernel holds for the address goes.
+        """
         try:
-            self._manager.deauthorize_portal_client(client_ip)
+            self._manager.deauthorize_portal_client(client_ip, client_mac)
         except FirewallError as exc:
             self._emit(
                 EventSeverity.ERROR,

@@ -156,6 +156,14 @@ protocol_signature_weight = 75.0
 evidence_maturity_consistency_windows = 3
 max_tracked_maturity_sources = 10000
 
+# Interim ADDENDUM_4.md D4 ceiling on the v1 path: while false, ML evidence
+# (LightGBM, Isolation Forest) can raise the reported score but cannot by
+# itself cause more than MONITOR. The action comes from behavior and
+# protocol-signature evidence. Both models are known to misclassify this
+# network's traffic (docs/KNOWN_ISSUES.md #1, #2); leave false until they
+# are retrained on it.
+ml_evidence_can_enforce = false
+
 # Points per detected behavior pattern (see behavior_weight above). Every
 # pattern must be listed; the config loader rejects a missing one.
 [threat.behavior_pattern_points]
@@ -415,8 +423,12 @@ adaptive_set_size = 4096
 
 [antispoof]
 # D3 — IP<->MAC bindings. NetworkManager shared mode keeps its dnsmasq leases
-# at /var/lib/NetworkManager/dnsmasq-<lan_interface>.leases.
-lease_file = "/var/lib/NetworkManager/dnsmasq-wlan0.leases"   # CHANGE_ME — match network.lan_interface
+# at /var/lib/NetworkManager/dnsmasq-<lan_interface>.leases, and lease_file
+# is derived from network.lan_interface when unset, so it follows the LAN.
+# Set it only for a DHCP server that writes somewhere else. Portal sign-in
+# needs a binding, so a wrong path signs nobody in; pirewall-start refuses
+# to bring the portal up when no running dnsmasq writes this file.
+# lease_file = "/var/lib/NetworkManager/dnsmasq-<lan_interface>.leases"
 # Added to a lease's expiry so a renewal written a moment late does not
 # briefly unbind the device.
 grace_seconds = 60

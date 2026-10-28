@@ -40,8 +40,15 @@ class PortalSessionRegistry:
         self._by_token: dict[str, PortalSession] = {}
         self._token_by_ip: dict[IPv4Address, str] = {}
 
-    def create(self, username: str, client_ip: IPv4Address, token: str, now: datetime) -> PortalSession:
-        """Issue a session for `client_ip`, replacing any existing one for that address."""
+    def create(
+        self,
+        username: str,
+        client_ip: IPv4Address,
+        token: str,
+        now: datetime,
+        client_mac: str | None = None,
+    ) -> PortalSession:
+        """Issue a session for `client_ip` (and its bound `client_mac`), replacing any for that address."""
         self.purge_expired(now)
         self.invalidate_ip(client_ip)
         if len(self._by_token) >= self._max_sessions:
@@ -56,6 +63,7 @@ class PortalSessionRegistry:
             client_ip=client_ip,
             issued_at=now,
             expires_at=now + timedelta(seconds=self._token_expiry_seconds),
+            client_mac=client_mac,
         )
         self._by_token[token] = session
         self._token_by_ip[client_ip] = token

@@ -11,7 +11,8 @@ Two steps, each applied only when the file needs it:
   this step, by design; retrain per docs/ML_PIPELINE.md.
 * **2.0 -> v2**: appends whichever of `[pipeline]`, `[guards]`, `[antispoof]`,
   `[policy]` and `[lab]` is absent, with the shipped defaults and their
-  comments. `antispoof.lease_file` is derived from `network.lan_interface`.
+  comments. `antispoof.lease_file` is left unset, so the config derives it
+  from `network.lan_interface` and it follows the LAN if that moves.
   A section that is already present is never touched; its missing keys take
   their model defaults.
 
@@ -123,8 +124,10 @@ adaptive_set_size = 4096
         "antispoof": f"""\
 [antispoof]
 # ADDENDUM_4.md D3 — IP<->MAC bindings: the NetworkManager dnsmasq lease file
-# for network.lan_interface, plus [[antispoof.static]] entries.
-lease_file = "/var/lib/NetworkManager/dnsmasq-{lan_interface}.leases"
+# for network.lan_interface, plus [[antispoof.static]] entries. lease_file is
+# derived from network.lan_interface when unset; set it only for a DHCP
+# server that writes somewhere else.
+# lease_file = "/var/lib/NetworkManager/dnsmasq-{lan_interface}.leases"
 grace_seconds = 60
 poll_seconds = 2.0
 static = []
@@ -292,7 +295,7 @@ def _migrate_2_0_to_v2(
 ) -> None:
     lan_interface = _section(document, "network").get("lan_interface")
     if not isinstance(lan_interface, str) or not lan_interface:
-        raise MigrationError("[network] lan_interface is missing; cannot derive antispoof.lease_file")
+        raise MigrationError("[network] lan_interface is missing; antispoof.lease_file is derived from it")
     for section in V2_SECTION_ORDER:
         if section not in document:
             _append_block(lines, v2_section_text(section, lan_interface))

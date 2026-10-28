@@ -33,7 +33,10 @@ def test_shipped_default_config_matches_the_model_defaults_for_every_v2_section(
     config = load_config(DEFAULT_CONFIG)
     assert config.pipeline == PipelineConfig()
     assert config.guards == GuardsConfig()
-    assert config.antispoof == AntispoofConfig()
+    # lease_file is derived from network.lan_interface; everything else is the model default.
+    assert config.antispoof.lease_file == "/var/lib/NetworkManager/dnsmasq-eth1.leases"
+    underived = config.antispoof.model_copy(update={"lease_file": AntispoofConfig().lease_file})
+    assert underived == AntispoofConfig()
     assert config.policy == PolicyConfig()
     assert config.lab == LabConfig()
     assert config.capture.replay_speed == "max"
@@ -156,3 +159,21 @@ def test_an_unknown_top_level_section_is_still_refused(tmp_path: Path) -> None:
     path.write_text(MINIMAL_VALID_TOML + "\n[sensor]\nenabled = true\n", encoding="utf-8")
     with pytest.raises(ConfigurationError):
         load_config(path)
+
+
+def test_the_lease_file_follows_the_lan_interface_unless_set_explicitly() -> None:
+    """KNOWN_ISSUES #23 follow-up: portal sign-in needs a binding, so a wrong path signs nobody in."""
+    document = _minimal()
+    document["network"]["lan_interface"] = "wlan1"
+    assert (
+        PirewallConfig.model_validate(document).antispoof.lease_file
+        == "/var/lib/NetworkManager/dnsmasq-wlan1.leases"
+    )
+
+    document["antispoof"] = {"lease_file": "/var/lib/misc/dnsmasq.leases"}
+    assert PirewallConfig.model_validate(document).antispoof.lease_file == "/var/lib/misc/dnsmasq.leases"
+
+
+def test_a_derived_lease_file_survives_a_dump_and_reload() -> None:
+    config = PirewallConfig.model_validate(_minimal())
+    assert PirewallConfig.model_validate(config.model_dump(mode="json")) == config

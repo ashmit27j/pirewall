@@ -32,6 +32,7 @@ from scripts.deployment.discovery import (
     discover,
     parse_addresses,
     parse_default_route,
+    parse_neighbour_macs,
     parse_neighbours,
 )
 
@@ -118,7 +119,7 @@ _WIRELESS_ADDRESSES = [
 
 _WIRELESS_NEIGHBOURS = [
     {"dst": "192.168.100.10", "state": ["REACHABLE"]},
-    {"dst": "192.168.100.23", "state": ["STALE"]},
+    {"dst": "192.168.100.23", "lladdr": "02:aa:00:00:00:23", "state": ["STALE"]},
 ]
 
 
@@ -201,6 +202,28 @@ class TestParseNeighbours:
 
     def test_ipv6_neighbours_are_ignored(self) -> None:
         assert parse_neighbours([{"dst": "fe80::abcd", "state": ["REACHABLE"]}]) == []
+
+
+class TestParseNeighbourMacs:
+    def test_keeps_the_link_layer_address_lowercased_sorted_and_deduplicated(self) -> None:
+        payload = [
+            {"dst": "192.168.100.20", "lladdr": "02:AA:00:00:00:20", "state": ["STALE"]},
+            {"dst": "192.168.100.10", "lladdr": "02:aa:00:00:00:10", "state": ["REACHABLE"]},
+            {"dst": "192.168.100.10", "lladdr": "02:aa:00:00:00:10", "state": ["DELAY"]},
+        ]
+        assert parse_neighbour_macs(payload) == [
+            (ipaddress.IPv4Address("192.168.100.10"), "02:aa:00:00:00:10"),
+            (ipaddress.IPv4Address("192.168.100.20"), "02:aa:00:00:00:20"),
+        ]
+
+    def test_unresolved_unreachable_and_ipv6_entries_are_skipped(self) -> None:
+        payload = [
+            {"dst": "192.168.100.30", "state": ["INCOMPLETE"]},
+            {"dst": "192.168.100.31", "lladdr": "02:aa:00:00:00:31", "state": ["FAILED"]},
+            {"dst": "fe80::abcd", "lladdr": "02:aa:00:00:00:32", "state": ["REACHABLE"]},
+            {"dst": "192.168.100.33", "lladdr": 7, "state": ["REACHABLE"]},
+        ]
+        assert parse_neighbour_macs(payload) == []
 
 
 class TestChooseLanInterface:
@@ -309,6 +332,9 @@ class TestWirelessLayout:
             ipaddress.IPv4Address("192.168.100.23"),
         )
         assert result.warnings == ()
+        assert result.neighbour_macs == (
+            (ipaddress.IPv4Address("192.168.100.23"), "02:aa:00:00:00:23"),
+        )
         # Neighbours are scanned on the AP interface, not the uplink radio:
         # the Admin PC lives on the protected LAN.
         assert ("neigh", "show", "dev", "wlan1") in seen

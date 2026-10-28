@@ -137,3 +137,46 @@ def test_it_does_not_blindly_load_nat_masquerade(script: str) -> None:
     """
     assert "nm_shared_nat_state" in script
     assert "unknown" in script
+
+
+def _function(script: str, name: str) -> str:
+    """One top-level function: up to the next top-level definition, past any heredoc braces."""
+    start = script.index(f"\n{name}() {{")
+    following = re.search(r"\n[a-z_]+\(\) \{", script[start + 1 :])
+    return script[start : start + 1 + following.start()] if following else script[start:]
+
+
+def test_preflight_checks_the_lease_file_and_refuses_with_the_portal_on(script: str) -> None:
+    """Portal sign-in needs a binding, and bindings come from this file (phase 14b).
+
+    A wrong or stale path fails silently: the file never changes and nobody
+    can sign in. So preflight runs the real check, and with the portal on a
+    problem is a refusal, not a warning.
+    """
+    assert "check_lease_file" in _function(script, "preflight")
+    check = _function(script, "check_lease_file")
+    assert "scripts.deployment.lease_check" in check
+    assert "--shell" in check
+    assert "runuser -u pirewall-core -- test -r" in check, "readable by root is not readable by core"
+    problem = _function(script, "lease_problem")
+    assert re.search(r"if \(\( WANT_PORTAL \)\); then\s+refuse", problem)
+
+
+def test_the_portal_migration_is_one_checked_transaction(script: str) -> None:
+    """v1 -> v2 changes the `authed` set's type, which nft cannot alter in place.
+
+    The table has to be deleted and reloaded. Doing it as two commands would
+    leave the LAN ungated, or with no table at all, if the load failed; one
+    `nft -f` file makes it all or nothing (sandbox-verified on nft 1.1.6).
+    """
+    gate = _function(script, "load_portal_gate")
+    assert "portal_table_state" in gate
+    assert not re.search(r"^\s*run nft delete table", script, re.M), "no bare table delete"
+    assert "'delete table inet pirewall_portal'" in gate
+    assert 'include \\"${portal}\\"' in gate
+    migration_check = gate.index('run nft -c -f "$migration"')
+    assert migration_check < gate.index('run nft -f "$migration"') < gate.index('run nft -f "$portal"')
+    # Only a v1 table is migrated; an unreadable ruleset is reported, never guessed at.
+    state = _function(script, "portal_table_state")
+    assert "ipv4_addr" in state and "ether_addr" in state
+    assert "echo unknown" in state

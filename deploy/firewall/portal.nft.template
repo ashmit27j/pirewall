@@ -33,14 +33,31 @@
 # Flushing the chains rather than deleting the table is deliberate: deleting
 # it would take the `authed` set with it and sign every LAN client out on
 # every reload.
+#
+# v2 (ADDENDUM_4.md D3): `authed` holds `ip . mac` pairs, and the gate
+# matches `ip saddr . ether saddr`, so a session is bound to the device that
+# signed in: another LAN client spoofing that address is still gated.
+# pirewall-core resolves the MAC from its lease bindings, never from the
+# login request.
+#
+# UPGRADING from the IP-only set: nft cannot change an existing set's type,
+# so loading this file over a v1 `pirewall_portal` table fails with a set
+# type mismatch. `pirewall-start` detects that and replaces the table in one
+# transaction (`delete table` plus an `include` of this file), so a failed
+# load leaves the old table in place. By hand, put these two lines in one
+# file and load it with `sudo nft -f`:
+#     delete table inet pirewall_portal
+#     include "/opt/pirewall/deploy/rendered/portal.nft"
+# That signs every LAN client out once; they sign in again. Only the first
+# v2 load needs it.
 
 # First ensure table, set and chains exist, so the flushes cannot fail on a
 # first load. Redeclaring them is a no-op when they are already there.
 table inet pirewall_portal {
 	set authed {
-		type ipv4_addr
+		type ipv4_addr . ether_addr
 		flags timeout
-		comment "captive portal: authenticated LAN clients"
+		comment "captive portal: authenticated LAN clients (ip . mac)"
 	}
 	chain forward {
 		type filter hook forward priority -10; policy accept;
@@ -65,7 +82,7 @@ table inet pirewall_portal {
 		# every *new* connection, which is where gating belongs.
 		ct state established,related return
 
-		ip saddr @authed return
+		ip saddr . ether saddr @authed return
 
 		# Rejected, not dropped. A reject makes the client's captive
 		# portal detection fail immediately and show the sign-in sheet;
@@ -78,7 +95,7 @@ table inet pirewall_portal {
 		iifname != "${LAN_INTERFACE}" return
 
 		# Already signed in: nothing to intercept.
-		ip saddr @authed return
+		ip saddr . ether saddr @authed return
 
 		# Let an unauthenticated client reach the Pi's own services, so
 		# it can resolve names, renew its lease, and actually load the

@@ -29,6 +29,10 @@ Threads, and why there is more than one
                      expiry, on `flow.cleanup_interval_seconds`.
 `rpc`                `UnixSocketRpcServer.serve_until_stopped` — pirewall-api's
                      only way in.
+`lease-sync`         Re-reads the dnsmasq lease file (inotify + poll) into the
+                     IP<->MAC `LeaseBindingTable` and writes changes to the
+                     kernel binding sets (`pirewall.runtime.lease_sync`,
+                     ADDENDUM_4.md D3). Never takes the RPC lock.
 main thread          `sd_notify` watchdog heartbeats, capture-statistics
                      refresh, and Netdata export.
 ===================  =========================================================
@@ -54,13 +58,16 @@ systemd `STOPPING=1`, stops capture (which unblocks the capture thread's
 `recv()`), joins every thread with a timeout, and closes the RPC socket.
 
 **On a clean shutdown under `failure.mode = fail_open` (the default, A6)
-the adaptive ruleset is reverted to base.** nftables rules live in the
-kernel and outlive the process that created them, so leaving them behind
-would mean a stopped pirewall keeps blocking traffic with nothing left
-running to expire it — the opposite of failing open. Under `fail_closed`
-they are deliberately left in place. Either way this goes through
-`FirewallManager.revert_to_base`, the normal A8 kill-switch path, not a
-special-cased backend call (CLAUDE.md).
+the adaptive ruleset is removed.** nftables rules live in the kernel and
+outlive the process that created them, so leaving them behind would mean a
+stopped pirewall keeps blocking traffic with nothing left running to expire
+it — the opposite of failing open. Under `fail_closed` they are
+deliberately left in place. This goes through
+`FirewallManager.fail_open_shutdown`, not a special-cased backend call
+(CLAUDE.md). With a set backend that flushes the adaptive sets and leaves
+every static guard's mode alone (D5), so a crash loop does not switch
+protection off (audit #17); it is not the kill switch, which would also set
+every guard to observe. Without a set backend it is the v1 revert.
 """
 
 import logging
@@ -83,6 +90,8 @@ from pirewall.capture.native import NativePacketCapture, native_capture_availabl
 from pirewall.capture.parser import extract_tcp_payload
 from pirewall.capture.pipeline import capture_packets
 from pirewall.config.models import PirewallConfig
+from pirewall.core.binding_table import BindingTable
+from pirewall.core.bindings import LeaseBindingTable, static_bindings
 from pirewall.core.enums import EventSeverity, FailureMode, Protocol, SecurityEventType
 from pirewall.core.exceptions import CaptureError, ModelInferenceError, PirewallError
 from pirewall.core.models.event import SecurityEvent
@@ -102,6 +111,7 @@ from pirewall.firewall.allowlist_store import AllowlistStore
 from pirewall.firewall.backend.nftables import NftablesBackend
 from pirewall.firewall.interface import FirewallBackend
 from pirewall.firewall.manager import FirewallManager
+from pirewall.firewall.sets import SetBackend
 from pirewall.flow.aggregator import FlowAggregator, NewFlowSignal, SlowConnectionCluster
 from pirewall.flow.key import FlowKey, compute_flow_key
 from pirewall.flow.native import NativeFlowAggregator, native_engine_available
@@ -115,6 +125,7 @@ from pirewall.ipc.server import UnixSocketRpcServer
 from pirewall.ipc.state import CoreStateStore
 from pirewall.portal.store import PortalUserStore
 from pirewall.runtime.forwarder import EventForwarder
+from pirewall.runtime.lease_sync import LeaseSync
 from pirewall.runtime.metrics import MetricsCollector, RuntimeCounters
 from pirewall.runtime.pipeline import FlowPipeline, PendingAnomalyScoring
 from pirewall.runtime.watchdog import SystemdNotifier
@@ -244,8 +255,15 @@ class CoreDaemon:
         flow_queue_max: int = _FLOW_QUEUE_MAX,
         anomaly_queue_max: int = _ANOMALY_QUEUE_MAX,
         native_aggregator: NativeFlowAggregator | None = None,
+        set_backend: SetBackend | None = None,
     ) -> None:
         """Build every subsystem. `capture`/`backend`/`notifier` are injectable for testing.
+
+        `set_backend` puts adaptive enforcement and the binding sets on the
+        v2 set path (`FirewallManager`'s docstring). It is a test seam until
+        phase 16 constructs `NftablesSetBackend` here by default; without
+        it, lease sync still keeps the binding table current (the portal, the
+        rule targets and the C4 checks read it) but writes no kernel sets.
 
         Injecting `FakePacketCapture` and `FakeFirewallBackend` is what lets
         the whole daemon run without root, without a NIC, and without
@@ -290,7 +308,17 @@ class CoreDaemon:
         # the same single-writer pattern as `PortalUserStore` (ADDENDUM_3.md
         # C3) — only pirewall-core ever opens this file.
         self._allowlist_store = AllowlistStore(config.firewall.allowlist_store_path)
-        self._manager = FirewallManager(config, firewall_backend, self._allowlist_store)
+        # ADDENDUM_4.md D3: IP<->MAC bindings, from `[[antispoof.static]]` now
+        # and the lease file once `start()` seeds it. Shared read-only with
+        # the manager, the pipeline and the portal; written only by lease sync.
+        self._bindings = LeaseBindingTable(static_bindings(config.antispoof.static))
+        self._manager = FirewallManager(
+            config,
+            firewall_backend,
+            self._allowlist_store,
+            set_backend=set_backend,
+            mac_resolver=self._bindings.resolve_mac,
+        )
         self._counters = RuntimeCounters()
         self._forwarder = EventForwarder(self._state, self._build_wazuh(), self._lock)
         # ADDENDUM_2.md B1: fed from the capture thread the instant a flow
@@ -366,6 +394,7 @@ class CoreDaemon:
             anomaly_scorer=(
                 self._enqueue_anomaly_scoring if models.isolation_forest is not None else None
             ),
+            resolve_mac=self._bindings.resolve_mac,
         )
         self._flow_queue: queue.Queue[Flow] = queue.Queue(maxsize=flow_queue_max)
         # Captive portal (ADDENDUM_3.md C1). `None` when disabled, so a
@@ -379,6 +408,7 @@ class CoreDaemon:
                 manager=self._manager,
                 store=PortalUserStore(config.portal.user_store_path),
                 on_event=self._forwarder.emit,
+                bindings=self._bindings,
             )
             # A *second* socket, in its own group, serving a dispatcher with
             # four operations. pirewall-portal is a member of only this
@@ -395,6 +425,7 @@ class CoreDaemon:
             config.api.rpc_socket_path,
             _SynchronizedDispatcher(self._lock, self._state, self._manager, config, self._portal),
         )
+        self._lease_sync = LeaseSync(config, self._bindings, self._manager, on_event=self._forwarder.emit)
         self._notifier = notifier or SystemdNotifier()
         self._metrics = MetricsCollector(
             self._counters, config.firewall.max_adaptive_rules_per_window
@@ -403,6 +434,11 @@ class CoreDaemon:
         self._threads: list[threading.Thread] = []
         self._capture_started = False
         self._backpressure_drops = 0
+
+    @property
+    def bindings(self) -> BindingTable:
+        """The live IP<->MAC binding table (read-only use: `snapshot`, `resolve_*`)."""
+        return self._bindings
 
     # ------------------------------------------------------------------ setup
 
@@ -566,6 +602,9 @@ class CoreDaemon:
                 )
             )
 
+        # Bindings before anything serves a request: the portal refuses a
+        # login without one, and the raw guard must not trust an unseeded set.
+        self._seed_bindings()
         self._spawn("pirewall-rpc", lambda: self._rpc_server.serve_until_stopped(self._stop))
         if self._portal_rpc_server is not None:
             portal_server = self._portal_rpc_server
@@ -574,6 +613,7 @@ class CoreDaemon:
             )
         self._spawn("pirewall-detection", self._detection_loop)
         self._spawn("pirewall-sweep", self._sweep_loop)
+        self._spawn("pirewall-lease-sync", lambda: self._lease_sync.run(self._stop))
         if self._coordinator.models.isolation_forest is not None:
             self._spawn("pirewall-anomaly-inference", self._anomaly_inference_loop)
         if self._capture_started:
@@ -602,6 +642,29 @@ class CoreDaemon:
             self._config.failure.mode.value,
             "loaded" if self._coordinator.models.any_loaded else "none",
         )
+
+    def _seed_bindings(self) -> None:
+        """Startup seed of the binding sets, then the allowlist pairs (ADDENDUM_4.md D3).
+
+        A failed seed is reported and leaves the raw guard in observe mode
+        (`LeaseSync.seed`); it never stops startup (A6).
+        """
+        seeded = self._lease_sync.seed()
+        _logger.info(
+            "binding seed %s: %d binding(s)", "done" if seeded else "FAILED", len(self._bindings.snapshot())
+        )
+        try:
+            self._manager.sync_allowlist()
+        except PirewallError as exc:
+            self._forwarder.emit(
+                SecurityEvent(
+                    timestamp=datetime.now(UTC),
+                    severity=EventSeverity.ERROR,
+                    event_type=SecurityEventType.FIREWALL_ERROR,
+                    subsystem=_SUBSYSTEM,
+                    reason=f"writing the allowlist's MAC+IP pairs to allow_bound failed: {exc}",
+                )
+            )
 
     def _spawn(self, name: str, target: Callable[[], None]) -> None:
         thread = threading.Thread(target=target, name=name, daemon=True)
@@ -707,10 +770,12 @@ class CoreDaemon:
             return
         with self._lock:
             active = len(self._manager.active_rules())
-            if active == 0:
+            # The adaptive sets can hold elements from a previous run that this
+            # process never tracked, so with a set backend flush regardless.
+            if active == 0 and not self._manager.uses_set_backend:
                 return
-            event = self._manager.revert_to_base(datetime.now(UTC))
-        _logger.info("failure.mode=fail_open: reverted %d adaptive rule(s) on shutdown", active)
+            event = self._manager.fail_open_shutdown(datetime.now(UTC))
+        _logger.info("failure.mode=fail_open: removed %d adaptive rule(s) on shutdown", active)
         self._forwarder.emit(event)
 
     # ------------------------------------------------------------------ loops

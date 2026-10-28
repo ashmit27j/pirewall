@@ -4,15 +4,21 @@ IPv4-only for v1 (ADDENDUM.md A5): `source`/`destination` are typed
 `IPv4Network`, so a rule targeting an IPv6 address/CIDR cannot be
 constructed at all — this is a belt-and-suspenders check enforced at the
 type level, on top of the explicit validator-stage rejection Phase 6 adds.
+
+`target` (ADDENDUM_4.md D3) names the *device* a rule acts on: the source
+address plus, when a binding or the evidence frame resolves one, its MAC.
+Optional so every v1 caller keeps working; `source`/`destination` keep their
+v1 meaning and stay authoritative for the v1 backend.
 """
 
 from ipaddress import IPv4Network
 from uuid import uuid4
 
-from pydantic import AwareDatetime, Field
+from pydantic import AwareDatetime, Field, model_validator
 
 from pirewall.core.enums import FirewallAction, Protocol, RuleDirection, RuleStatus
 from pirewall.core.models.common import PirewallModel
+from pirewall.core.models.identity import RuleTarget
 
 
 class _RuleFields(PirewallModel):
@@ -29,6 +35,16 @@ class _RuleFields(PirewallModel):
     threat_score: float | None = Field(default=None, ge=0.0, le=100.0)
     evidence: tuple[str, ...] = Field(default_factory=tuple)
     metadata: dict[str, str] = Field(default_factory=dict)
+    target: RuleTarget | None = None
+
+    @model_validator(mode="after")
+    def _check_target_is_the_source(self) -> "_RuleFields":
+        # A target is the device the rule is about, which is its source. One
+        # naming some other address would let enforcement (keyed on the
+        # target) and every IP-based check (keyed on `source`) disagree.
+        if self.target is not None and self.source != IPv4Network(f"{self.target.ip}/32"):
+            raise ValueError("target.ip must be the rule's /32 source")
+        return self
 
 
 class CandidateRule(_RuleFields):

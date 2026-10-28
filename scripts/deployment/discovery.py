@@ -99,6 +99,9 @@ class DiscoveredNetwork:
     protected_network: ipaddress.IPv4Network
     admin_pc_candidates: tuple[ipaddress.IPv4Address, ...] = ()
     warnings: tuple[str, ...] = ()
+    # (address, link-layer address) for the same reachable LAN neighbours, for
+    # offering `[[antispoof.static]]` candidates. Also candidates, never answers.
+    neighbour_macs: tuple[tuple[ipaddress.IPv4Address, str], ...] = ()
 
 
 def _run_ip(*arguments: str) -> Any:
@@ -254,6 +257,33 @@ def parse_neighbours(payload: Any) -> list[ipaddress.IPv4Address]:
     return sorted(set(neighbours))
 
 
+def parse_neighbour_macs(payload: Any) -> list[tuple[ipaddress.IPv4Address, str]]:
+    """Like `parse_neighbours`, but keep each neighbour's link-layer address (`lladdr`), lowercased.
+
+    Entries with no `lladdr` (an unresolved neighbour) are skipped. The MAC
+    is not validated here; `configure` refuses group and all-zero MACs.
+    """
+    entries = _as_array(payload)
+    if entries is None:
+        return []
+    found: set[tuple[ipaddress.IPv4Address, str]] = set()
+    for entry in entries:
+        neighbour = _as_object(entry)
+        if neighbour is None:
+            continue
+        destination = neighbour.get("dst")
+        lladdr = neighbour.get("lladdr")
+        if not isinstance(destination, str) or not isinstance(lladdr, str) or not lladdr:
+            continue
+        if not _string_set(neighbour.get("state")) & _USABLE_NEIGHBOUR_STATES:
+            continue
+        try:
+            found.add((ipaddress.IPv4Address(destination), lladdr.lower()))
+        except ValueError:
+            continue  # IPv6 neighbour
+    return sorted(found)
+
+
 def choose_lan_interface(
     addresses: list[InterfaceAddress], wan_interface: str
 ) -> tuple[InterfaceAddress, tuple[str, ...]]:
@@ -290,10 +320,16 @@ def discover() -> DiscoveredNetwork:
     addresses = parse_addresses(_run_ip("addr", "show"))
     lan, warnings = choose_lan_interface(addresses, wan_interface)
 
+    neighbour_payload = _run_ip("neigh", "show", "dev", lan.interface)
     candidates = [
         neighbour
-        for neighbour in parse_neighbours(_run_ip("neigh", "show", "dev", lan.interface))
+        for neighbour in parse_neighbours(neighbour_payload)
         if neighbour != lan.address and neighbour in lan.network
+    ]
+    neighbour_macs = [
+        (address, mac)
+        for address, mac in parse_neighbour_macs(neighbour_payload)
+        if address != lan.address and address in lan.network
     ]
     return DiscoveredNetwork(
         wan_interface=wan_interface,
@@ -303,4 +339,5 @@ def discover() -> DiscoveredNetwork:
         protected_network=lan.network,
         admin_pc_candidates=tuple(candidates),
         warnings=warnings,
+        neighbour_macs=tuple(neighbour_macs),
     )

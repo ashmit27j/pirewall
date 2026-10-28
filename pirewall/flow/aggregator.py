@@ -83,6 +83,10 @@ class NewFlowSignal:
     destination_port: int | None
     protocol: Protocol
     timestamp: datetime
+    # The opening frame's Ethernet addresses (ADDENDUM_4.md D3), normalised
+    # lowercase `aa:bb:cc:dd:ee:ff`; None when the packet had no frame.
+    source_mac: str | None = None
+    destination_mac: str | None = None
 
 
 type NewFlowSink = Callable[[NewFlowSignal], None]
@@ -185,6 +189,8 @@ class FlowAggregator:
                         destination_port=packet.destination_port,
                         protocol=packet.protocol,
                         timestamp=packet.timestamp,
+                        source_mac=packet.source_mac,
+                        destination_mac=packet.destination_mac,
                     )
                 )
             evicted = self._table.insert(key, state)

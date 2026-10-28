@@ -1,9 +1,12 @@
 """`generate_candidate_rule`: FirewallDecision -> CandidateRule (spec §22, §23)."""
 
 from datetime import UTC, datetime, timedelta
+from ipaddress import IPv4Address, IPv4Network
 
 from pirewall.core.enums import FirewallAction, Protocol, ThreatLevel
 from pirewall.core.models.decision import FirewallDecision
+from pirewall.core.models.flow import Flow
+from pirewall.core.models.identity import RuleTarget
 from pirewall.firewall.generator import generate_candidate_rule
 from tests.helpers.flows import make_flow
 
@@ -62,3 +65,66 @@ def test_monitor_and_rate_limit_also_produce_candidates() -> None:
         candidate = generate_candidate_rule(_decision(action), flow, NOW, 3600)
         assert candidate is not None
         assert candidate.action is action
+
+
+# ------------------------------------------------- device identity (ADDENDUM_4.md D3)
+
+_LAN_DEVICE = "192.168.1.20"
+_BOUND_MAC = "02:00:00:00:00:20"
+_ATTACKER_MAC = "02:00:00:00:00:ee"
+
+
+def _bound(ip: IPv4Address) -> str | None:
+    return _BOUND_MAC if str(ip) == _LAN_DEVICE else None
+
+
+def _lan_flow(frame_mac: str | None) -> Flow:
+    flow = make_flow(source_ip=_LAN_DEVICE, destination_ip="203.0.113.9")
+    return flow.model_copy(update={"source_mac": frame_mac})
+
+
+def test_without_a_resolver_the_target_is_the_source_address_alone() -> None:
+    candidate = generate_candidate_rule(_decision(FirewallAction.BLOCK), _lan_flow(_BOUND_MAC), NOW, 300)
+    assert candidate is not None
+    assert candidate.target == RuleTarget(ip=IPv4Address(_LAN_DEVICE))
+
+
+def test_a_bound_source_gets_its_binding_mac() -> None:
+    flow = _lan_flow(_BOUND_MAC)
+    candidate = generate_candidate_rule(_decision(FirewallAction.BLOCK), flow, NOW, 300, _bound)
+    assert candidate is not None and candidate.target is not None
+    assert candidate.target.mac == _BOUND_MAC
+
+
+def test_a_flow_without_a_frame_mac_still_gets_the_binding() -> None:
+    candidate = generate_candidate_rule(_decision(FirewallAction.BLOCK), _lan_flow(None), NOW, 300, _bound)
+    assert candidate is not None and candidate.target is not None
+    assert candidate.target.mac == _BOUND_MAC
+
+
+def test_a_spoofed_source_targets_the_frames_sender_not_the_addresss_owner() -> None:
+    """Audit item 16: the evidence came from the attacker's MAC; the owner must not be named."""
+    candidate = generate_candidate_rule(
+        _decision(FirewallAction.BLOCK), _lan_flow(_ATTACKER_MAC), NOW, 300, _bound
+    )
+    assert candidate is not None and candidate.target is not None
+    assert candidate.target.mac == _ATTACKER_MAC
+    assert candidate.source == IPv4Network(f"{_LAN_DEVICE}/32"), "the v1 fields are unchanged"
+
+
+def test_an_unbound_source_never_takes_the_frame_mac() -> None:
+    """With nothing to compare against, a frame MAC may be a router's: the target stays IP-only."""
+    flow = make_flow(source_ip="203.0.113.5", destination_ip=_LAN_DEVICE).model_copy(
+        update={"source_mac": _ATTACKER_MAC}
+    )
+    candidate = generate_candidate_rule(_decision(FirewallAction.BLOCK), flow, NOW, 300, _bound)
+    assert candidate is not None and candidate.target is not None
+    assert candidate.target.mac is None
+
+
+def test_a_group_frame_mac_is_never_a_target() -> None:
+    candidate = generate_candidate_rule(
+        _decision(FirewallAction.BLOCK), _lan_flow("ff:ff:ff:ff:ff:ff"), NOW, 300, _bound
+    )
+    assert candidate is not None and candidate.target is not None
+    assert candidate.target.mac == _BOUND_MAC

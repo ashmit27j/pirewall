@@ -12,9 +12,16 @@ from typing import Literal
 
 from pydantic import Field, model_validator
 
-from pirewall.core.enums import BehaviorPatternType, EnforcementMode, FailureMode
+from pirewall.core.enums import (
+    BehaviorPatternType,
+    EnforcementMode,
+    EnvTag,
+    FailureMode,
+    GuardMode,
+    PipelineEngine,
+)
 from pirewall.core.models.allowlist import AllowlistEntry
-from pirewall.core.models.common import PirewallModel
+from pirewall.core.models.common import PirewallModel, UnicastMacAddress
 
 
 class NetworkConfig(PirewallModel):
@@ -51,7 +58,18 @@ class CaptureConfig(PirewallModel):
     # latter; "native" asks for the former and reports a SYSTEM_WARNING
     # if it has to fall back. `snap_len`/`buffer_size_bytes` apply to the
     # Python path only; the ring_* fields to the native path only.
-    backend: Literal["auto", "native", "python"] = "auto"
+    #
+    # "replay" (ADDENDUM_4.md D7) feeds pcaps from `replay_path` through the
+    # same flow engine instead of a live interface: no root, no NIC. Accepted
+    # by validation since phase 11; the capture itself is phase 15 and its
+    # wiring into pirewall-core phase 16. Until then core does not read it.
+    backend: Literal["auto", "native", "python", "replay"] = "auto"
+    # A pcap/pcapng file or a directory of them. Required when backend is
+    # "replay", ignored otherwise.
+    replay_path: str | None = Field(default=None, min_length=1)
+    # "max" (virtual clock, as fast as possible), "realtime", or a multiplier
+    # such as "10x".
+    replay_speed: str = Field(default="max", pattern=r"^(max|realtime|[0-9]+(\.[0-9]+)?x)$")
     # TPACKET_V3 ring: block_count blocks of block_size bytes (a multiple
     # of the page size). 16 x 1 MiB holds tens of thousands of small
     # packets — seconds of a 10k pkt/s flood — in 16 MiB of a 768 MiB
@@ -69,6 +87,12 @@ class CaptureConfig(PirewallModel):
     # source-level fast path needs far fewer signals than this to see a flood.
     native_max_flows_per_drain: int = Field(default=1_000, gt=0)
     native_max_new_flows_per_drain: int = Field(default=5_000, gt=0)
+
+    @model_validator(mode="after")
+    def _check_replay_source(self) -> "CaptureConfig":
+        if self.backend == "replay" and self.replay_path is None:
+            raise ValueError('capture.backend = "replay" needs capture.replay_path')
+        return self
 
 
 class FlowConfig(PirewallModel):
@@ -483,6 +507,166 @@ class FailureConfig(PirewallModel):
     crash_loop_window_seconds: int = Field(default=300, gt=0)
 
 
+# --- v2 sections (ADDENDUM_4.md). All optional with defaults: a 1.x/2.0 file
+# --- without them still loads, and nothing reads them until a later phase.
+
+
+class PipelineConfig(PirewallModel):
+    """Which pipeline drives enforcement (ADDENDUM_4.md D4).
+
+    Stays "v1" (the merged-main pipeline) until phase 17 ships the v2 policy
+    engine; v1 then remains selectable as the evaluation baseline (G8).
+    """
+
+    engine: PipelineEngine = PipelineEngine.V1
+
+
+class MeterSetting(PirewallModel):
+    """One nft meter's `limit rate over <rate>/<unit> burst <burst> packets`.
+
+    A pair, not two independent knobs: the burst is part of the threshold.
+    A 3 s, 30k-packet flood once fitted entirely inside a 40k burst
+    (docs/v2/v2/RESULTS.md finding 2), so benign calibration fits both
+    together. The unit (per second, or per minute for DHCP) is fixed by the
+    template rule the setting renders into.
+    """
+
+    rate: int = Field(gt=0)
+    burst: int = Field(gt=0)
+
+
+class GuardsConfig(PirewallModel):
+    """Static kernel guards in `pirewall_static` (ADDENDUM_4.md D1, D2).
+
+    Defaults are the template starting values (`docs/v2/v2/render.py`), to be
+    replaced by benign-capture calibration. Rendered into the templates by
+    `pirewall-start`; core changes only the three modes at runtime, and only
+    through `FirewallManager.set_guard_mode`. docs/V2_CONTRACTS.md maps each
+    field to its template variable.
+    """
+
+    # D2 defaults. `raw_mode = "enforce"` is "enforce if seeded": when the
+    # bindings cannot be seeded at startup, the raw guard is forced to
+    # observe regardless of this value, because enforcing anti-spoof with an
+    # empty binding set would drop every client on the LAN.
+    raw_mode: GuardMode = GuardMode.ENFORCE
+    input_mode: GuardMode = GuardMode.ENFORCE
+    # Observe until the offline benign false-positive check (G5) passes.
+    forward_mode: GuardMode = GuardMode.OBSERVE
+
+    # Per-MAC meters. Rates are packets/second except `dhcp_per_minute`.
+    dhcp_per_minute: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=10, burst=5))
+    unbound: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=50, burst=100))
+    syn: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=200, burst=400))
+    icmp: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=50, burst=100))
+    udp_local: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=500, burst=1000))
+    local_pps: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=3000, burst=6000))
+    dns: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=100, burst=300))
+    closed_port: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=20, burst=40))
+    newconn: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=100, burst=200))
+    newconn_dst: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=50, burst=100))
+    udp_fwd: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=20000, burst=40000))
+    # Keyless global backstops: they engage when a meter set is full or many
+    # MACs flood together (RESULTS.md test 11).
+    global_unbound: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=500, burst=1000))
+    global_syn: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=2000, burst=4000))
+    global_icmp: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=500, burst=1000))
+    global_udp_local: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=3000, burst=6000))
+    global_newconn: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=1000, burst=2000))
+    # `ct count over` per MAC on the portal ports.
+    portal_concurrency: int = Field(default=20, gt=0)
+    # The adaptive table's `ratelimit_mac` meter (written by FirewallManager,
+    # rendered from here like the guards).
+    ratelimit: MeterSetting = Field(default_factory=lambda: MeterSetting(rate=20, burst=40))
+
+    # Set sizes. A full dynamic meter stops policing new keys (it fails open),
+    # so meter sets are sized to at least twice the DHCP pool and every class
+    # has a global backstop behind it.
+    binding_set_size: int = Field(default=1024, gt=0)
+    meter_set_size: int = Field(default=256, gt=0)
+    pair_meter_set_size: int = Field(default=4096, gt=0)
+    offender_set_size: int = Field(default=4096, gt=0)
+    adaptive_set_size: int = Field(default=4096, gt=0)
+
+
+class StaticBindingEntry(PirewallModel):
+    """One `[[antispoof.static]]` entry: a device with a fixed address and no DHCP lease (D3)."""
+
+    ip: IPv4Address
+    mac: UnicastMacAddress
+    reason: str = Field(min_length=1)
+
+
+class AntispoofConfig(PirewallModel):
+    """IP<->MAC binding sources for the anti-spoof guard (ADDENDUM_4.md D3)."""
+
+    # NetworkManager shared mode's dnsmasq lease file for the LAN interface:
+    # /var/lib/NetworkManager/dnsmasq-<lan_interface>.leases. Read-only; only
+    # the expiry, MAC and IP fields are parsed, never hostname or client-id.
+    lease_file: str = Field(default="/var/lib/NetworkManager/dnsmasq-wlan0.leases", min_length=1)
+    static: tuple[StaticBindingEntry, ...] = Field(default_factory=tuple)
+    # Added to a lease's expiry when it becomes the binding's element timeout,
+    # so a renewal that lands in the lease file a moment late (file-write lag
+    # plus the poll interval) does not briefly unbind the device.
+    grace_seconds: int = Field(default=60, ge=0)
+    # Lease-file poll interval, alongside inotify where available.
+    poll_seconds: float = Field(default=2.0, gt=0.0)
+
+    @model_validator(mode="after")
+    def _check_static_unique(self) -> "AntispoofConfig":
+        ips = [entry.ip for entry in self.static]
+        macs = [entry.mac for entry in self.static]
+        if len(set(ips)) != len(ips) or len(set(macs)) != len(macs):
+            raise ValueError("antispoof.static: each IP and each MAC may appear in only one entry")
+        return self
+
+
+class PolicyConfig(PirewallModel):
+    """v2 policy-table parameters (ADDENDUM_4.md D4, PLAN_FINAL §4.6)."""
+
+    rate_limit_ttl_seconds: int = Field(default=300, gt=0)
+    block_ttl_seconds: int = Field(default=300, gt=0)
+    # A repeat with new independent evidence multiplies the TTL by this,
+    # capped at `max_ttl_seconds`.
+    escalation_ttl_multiplier: int = Field(default=2, ge=1)
+    # Every adaptive element expires; 3600 s is also the template ceiling.
+    max_ttl_seconds: int = Field(default=3600, gt=0, le=3600)
+    # Consecutive 1 s polls an enforce-mode offender must persist before it
+    # may cause RATE_LIMIT. Never below 2 (critique_round2.md item 6).
+    sustained_polls: int = Field(default=2, ge=2)
+
+    @model_validator(mode="after")
+    def _check_ttls_within_cap(self) -> "PolicyConfig":
+        if max(self.rate_limit_ttl_seconds, self.block_ttl_seconds) > self.max_ttl_seconds:
+            raise ValueError("policy TTLs must not exceed policy.max_ttl_seconds")
+        return self
+
+
+class LabConfig(PirewallModel):
+    """Evaluation provenance and the on-Pi forward-path victim (ADDENDUM_4.md D7).
+
+    `env_tag` labels every artifact this process writes. It defaults to
+    "sandbox", never a `pi-*` tag: a Pi result has to be claimed explicitly
+    (pirewall-start sets it per `--data-mode`), so a forgotten setting can
+    only under-claim.
+    """
+
+    env_tag: EnvTag = EnvTag.SANDBOX
+    victim_netns: str = Field(default="labvictim", min_length=1)
+    # Host side of the veth into the victim namespace. LAN -> lab0 crosses
+    # the forward hook exactly as Internet-bound traffic does.
+    victim_host_interface: str = Field(default="lab0", min_length=1, max_length=15)
+    # A routed /30: the host side takes the first usable address, the victim
+    # the second.
+    victim_network: IPv4Network = IPv4Network("10.250.0.0/30")
+
+    @model_validator(mode="after")
+    def _check_victim_network(self) -> "LabConfig":
+        if self.victim_network.prefixlen != 30:
+            raise ValueError("lab.victim_network must be a /30")
+        return self
+
+
 class PirewallConfig(PirewallModel):
     """The complete, validated configuration tree (spec §37)."""
 
@@ -502,3 +686,8 @@ class PirewallConfig(PirewallModel):
     integration: IntegrationConfig
     security: SecurityConfig
     failure: FailureConfig
+    pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
+    guards: GuardsConfig = Field(default_factory=GuardsConfig)
+    antispoof: AntispoofConfig = Field(default_factory=AntispoofConfig)
+    policy: PolicyConfig = Field(default_factory=PolicyConfig)
+    lab: LabConfig = Field(default_factory=LabConfig)

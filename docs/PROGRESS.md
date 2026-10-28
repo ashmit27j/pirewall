@@ -23,6 +23,169 @@ Environment-dependent / Not yet validated.
 | — | Setup tooling (`scripts/deployment/configure.py`, `discovery.py`, `make_certs.sh`, `docs/SETUP.md`) | Complete | Network layout detected from `ip -j` instead of retyped; Admin PC and password asked for, never guessed. Tested: 35 tests over discovery parsing (captured `ip -j` fixtures), config generation and validate-then-write, the Admin-PC prompt, and `--set-admin-pc` as a targeted edit. Also run for real against a stubbed `ip` reproducing a Pi 4 gateway, end to end through both entry points and real TLS 1.3. Environment-dependent: `ip -j` output from a real Pi (fixtures are captured, not synthesized from imagination — but no Pi was available to confirm). |
 
 
+## v2 (docs/ADDENDUM_4.md, docs/V2_CONTRACTS.md) — phases 11–20
+
+Design: `docs/v2/PLAN_v3.md` (authoritative) and `docs/v2/PLAN_FINAL.md`.
+Prompts: `docs/v2/prompts/`. **Env tags (ADDENDUM_4 D7):** a number in this
+section is a Pi result only if it is tagged `pi-*`. Sandbox and mock numbers
+are regression evidence and are labelled as such.
+
+| # | Phase | Status | Notes |
+|---|-------|--------|-------|
+| 11 | v2 contracts, project rules, additive config, `migrate_config.py` | Complete | See "Phase 11 details" below. No runtime behaviour changed. |
+| 12 | Access hardening and hygiene (P0) | Not started | Prompt: `phase-12-access-hygiene.md`. Can run in parallel with 13 and 15. |
+| 13 | Kernel data plane, set backend, guard modes, kill switch, panic | Not started | Prompt: `phase-13-kernel-data-plane.md`. Integrator for `firewall/manager.py`. |
+| 14 | MAC identity end to end, bindings, anti-spoof, portal binding | Not started | Prompt: `phase-14-mac-identity-antispoof.md`. Depends on 13. Integrator for `runtime/core.py` and `firewall/manager.py`. |
+| 15 | Native hardening, pcap reader, replay capture backend | Not started | Prompt: `phase-15-native-hardening-replay.md`. Can run in parallel with 12 and 13. Also implements `pirewall/flow/connection_start.py` (V2_CONTRACTS §11). |
+| 16 | `pirewall-start` v2, deployment templates, systemd, data modes, lab victim | Not started | Prompt: `phase-16-startup-deploy.md`. Depends on 13, 14, 15. Marks **v2.0 deployable**. |
+| 17 | D1 detectors, kernel offender poller, policy engine | Not started | Prompt: `phase-17-detection-policy.md`. Depends on 16. Marks **v2.1 (engine)**. |
+| 18 | Lab harness and data modes | Not started; **prompt not yet written** | Planned in PLAN_v3 §8. `docs/v2/prompts/phase-18-*.md` does not exist yet. |
+| 19 | ML on feature schema 3.0.0, from own pcaps | Not started; **prompt not yet written** | Planned in PLAN_v3 §8. |
+| 20 | Evaluation support, docs reconciliation, paper tables | Not started; **prompt not yet written** | Planned in PLAN_v3 §8. |
+
+### Phase 11 details
+
+**Scope.** Contracts, documents, typed stubs and additive config only. No
+runtime wiring: nothing in `pirewall-core`, `pirewall-api` or
+`pirewall-portal` reads any of the new types or config keys yet, and
+`runtime/core.py`, `firewall/manager.py` and `ipc/dispatcher.py` are
+untouched.
+
+| Deliverable | Label | Evidence |
+|---|---|---|
+| `docs/ADDENDUM_4.md` (D1–D9, in ADDENDUM_3's style) | Implemented (documentation) | D8 is copied verbatim from PLAN_v3 §1. |
+| `docs/V2_CONTRACTS.md` | Implemented (documentation) | Types, nft names, offender codes, config → template-variable map, RPC signatures, native MAC fields, connection-start definition, file-ownership map. |
+| `MacAddress` / `UnicastMacAddress` (`core/models/common.py`) | Tested | Normalisation; malformed input refused; multicast, broadcast and all-zero refused as identity in every identity model; locally administered accepted. |
+| `RuleTarget`, `Binding`, `BindingChange` (`core/models/identity.py`); `BindingTable` Protocol (`core/binding_table.py`) | Tested (models); Implemented (Protocol, no implementation until phase 14) | JSON round-trips; lease-needs-expiry and static-has-none invariants. |
+| Evidence variants (`core/models/evidence_v2.py`): `KernelGuardEvidence`, `D1Evidence`, `ClassifierEvidence`, the reused `AnomalyEvidence`, the `EvidenceV2` union and `evidence_id` | Tested | Round-trips; the union resolves each variant to its own type; code ↔ guard consistency; classifier self-consistency. |
+| `PolicyDecision` (`core/models/policy.py`) and the action → `threat_level` mapping | Tested | Derived `threat_level` for every action, contradictions refused, TTL/evidence/approval invariants. |
+| Offender codes and nft names (`core/nft_names.py`) | Tested | The tests parse `docs/v2/v2/*.nft.template` as text: tables, chains, sets, counters, offender code → guard verdict chain, dynamic (kernel-written) vs manager-written sets, panic table list. The same tests will cover `deploy/firewall/` copies once phase 13 ports them. |
+| v2 RPC signatures (`ipc/protocol_v2.py`) | Tested (result models round-trip); Implemented (signatures only) | Deliberately not in `RpcOperation` yet (see deviations). |
+| `ConnectionStartTracker` stub (`flow/connection_start.py`) | Implemented (stub; raises `NotImplementedError`) | Phase 15 implements it. |
+| Config: `[pipeline]`, `[guards]`, `[antispoof]`, `[policy]`, `[lab]`, `capture.backend = "replay"` | Tested | Default config loads and matches model defaults section by section; a config with no v2 section loads; the frozen 1.x and 2.0 sample configs load unmigrated; invalid values refused. |
+| `scripts/deployment/migrate_config.py` (`--check` / `--write`) | Tested | 1.x sample, 2.0 sample, already-migrated, idempotency, comment and hand-tuned-value preservation, backup + permission preservation (POSIX), error exits. |
+| `CLAUDE.md` v2 section | Implemented (documentation) | Appended; existing rules unchanged. |
+
+**Verification (2026-10-28).** `ruff check .` clean; `pyright --strict`
+0 errors.
+
+* **POSIX (WSL2 Ubuntu 26.04, Python 3.12.16, run as root, `env=sandbox`):**
+  1052 passed, 10 skipped, 1 failed. The 10 skips are the
+  `pirewall_native` tests; the extension was not built in this venv. The
+  failure is `test_portal_rpc_socket.py::test_a_socket_in_the_wrong_group_is_refused`,
+  and it happens only because the run was root: root may chown the socket
+  into the `root` group, so the expected refusal never fires. Rerun as an
+  unprivileged user, all 10 tests in that file pass. Pre-existing and
+  unrelated to this phase.
+* **Windows (native Python):** 986 passed, 12 skipped, 3 failed, 8
+  collection errors. These are the same 3 failures and 8 errors as HEAD
+  with this phase's changes stashed (878 passed there; the difference is
+  the new tests). The failures are POSIX file-mode checks, and the errors
+  are modules importing `fcntl` (`core/network_drift.py`). The three new
+  test files alone give 108 passed, 1 skipped (POSIX permission case) on
+  Windows, and pass in full on POSIX.
+
+**Deviations and choices made where the prompt was ambiguous.**
+
+1. **Three edits outside this phase's files, each approved by the human
+   first:** `pyproject.toml` excludes `docs/v2/` from ruff (the design
+   bundle's scripts are frozen sandbox evidence and already failed
+   `ruff check .` on HEAD); `.gitignore` ignores
+   `config/local_config.toml.*` (migration backups hold the password hash);
+   and installing WSL Ubuntu for the POSIX test run. That is a dev-machine
+   tool, not a project dependency: Ubuntu 26.04 under WSL2, plus `uv` in
+   it, with the Linux venv kept outside the repo so the Windows `.venv` is
+   untouched.
+2. **New stub files beyond the four the prompt names**
+   (`core/nft_names.py`, `core/binding_table.py`, `ipc/protocol_v2.py`,
+   `flow/connection_start.py`), plus new members in `core/enums.py`. The
+   prompt asks for these contracts without naming files. They sit in
+   `pirewall/core` where two layers need them, because detection importing
+   from `firewall` would point the dependency arrow backwards.
+3. **The v2 RPC operations are not added to `RpcOperation`.** An enum member
+   with no dispatcher handler would be a live operation that fails at
+   runtime, and `ipc/dispatcher.py` belongs to phase 16. Phase 16 adds both
+   together.
+4. **`capture.backend = "replay"` is accepted, but core does not read it
+   yet.** `runtime/core.py`'s capture selection treats any value other than
+   `"python"` like `"auto"`. A config that selects `replay` before phase 16
+   would therefore capture live, if run as root on a real interface. This
+   is documented in the model, the default config and V2_CONTRACTS. Two
+   companion keys were frozen now so phase 15 doesn't need to edit the
+   config models: `replay_path` (required for replay) and `replay_speed`.
+5. **D1 vs the template, on static-set writers.** The prompt's "single
+   permitted runtime write" is read as applying to the *ruleset* (rules and
+   chains). Set elements in `pirewall_static` still have their own single
+   writers: the kernel for meters and offenders, and `FirewallManager` for
+   bindings and the allowlist copy. The template header names a separate
+   `pirewall-leases` process; PLAN_v3 §3 folded that into core, so the
+   writer is `FirewallManager.sync_bindings`.
+6. **Panic deletes the ARP companion table too**
+   (`arp pirewall_static_arp`), unlike the template comment, which lists
+   only the two `inet` tables. Reason: once core is gone, nothing keeps that
+   table's bindings current (ADDENDUM_4 D5).
+7. **Template vs plan discrepancies recorded for phase 13, not resolved
+   here:**
+   * the raw source-validation drops are bare `drop`s in the template;
+     PLAN_FINAL §4.2 has them jump to `guard_verdict_raw`;
+   * the adaptive template has an `ip saddr @infra4 return`, which the plan
+     forbids;
+   * the adaptive template lacks the DHCP/DNS/portal exemption the C4 block
+     notice needs;
+   * `pi_addrs` and `ratelimit4` are planned set names not yet in any
+     template.
+8. **Config shape.** Each meter is a `{rate, burst}` pair (`MeterSetting`),
+   so the "calibrated together" rule is structural. Guard modes are
+   `raw_mode`/`input_mode`/`forward_mode`. `raw_mode = "enforce"` means
+   enforce-if-seeded; the downgrade on a failed seed is unconditional
+   behaviour for phases 14 and 16, not a config value. Set sizes,
+   `portal_concurrency` and the adaptive `ratelimit` meter were added to
+   `[guards]` so `render_templates.py` needs no literals.
+   `antispoof.poll_seconds` was added (the phase-14 prompt names it).
+9. **Invented defaults** (the prompt and plan give none):
+   * `antispoof.grace_seconds = 60`, meaning the slack added to a lease's
+     expiry for the element timeout;
+   * `antispoof.lease_file`, the NetworkManager path for `wlan0`
+     (`migrate_config.py` derives it from `network.lan_interface`);
+   * `lab.victim_network = 10.250.0.0/30` and
+     `lab.victim_host_interface = "lab0"`;
+   * `policy.rate_limit_ttl_seconds` and `block_ttl_seconds = 300`, from the
+     policy table's "5 min".
+10. **`lab.env_tag` defaults to `"sandbox"`.** It must never default to a
+    `pi-*` tag. `mock` would be wrong for a real-nft Linux run.
+11. **`PolicyDecision.threat_level` is a stored, validated field, not a
+    computed property.** A computed field breaks JSON round-trips under
+    `extra="forbid"`.
+12. **The native MAC fields are specified as 48-bit integers**
+    (`src_mac`/`dst_mac: int`), like the existing `src`/`dst`. The `.pyi`
+    stub is left alone, because the extension doesn't have the fields yet.
+13. **Which policy column a SHADOW decision uses** is left to phase 17 and
+    noted in V2_CONTRACTS §5. It is engine behaviour, not a type.
+14. **File ownership.** The prompts give the integrator files to different
+    phases at different times. The map records them in order: `manager.py`
+    13 → 14, `core.py` 14 → 16 → 17, `dispatcher.py` 16. Phase 15's
+    "plugs into CoreDaemon" is assigned to phase 16, which owns `core.py`
+    then.
+15. **`/api/v1/config` now also shows the v2 sections**, because it dumps
+    the whole model. This is additive output with default values, and the
+    sections hold nothing secret.
+
+**Skipped, because the referenced files don't exist yet:**
+
+* `docs/v2/RUNBOOK_PI.md`;
+* the phase 18–20 prompts;
+* `lab/`, and the `lab/mock/out` outputs.
+
+Nothing was invented for them; `lab.*` config only names where the phase-16
+victim namespace will live.
+
+**Environment-dependent (unchanged by this phase).** Every v2 claim about
+the Pi: nft 1.0.6 compatibility of the templates, `ether saddr` being the
+station MAC on brcmfmac `wlan0`, IPv6 drop (RESULTS.md 10b), and all
+throughput figures. The sandbox results in `docs/v2/v2/RESULTS.md` are
+`env=sandbox`.
+
+
 ### Detection-quality and native capture overhaul (2026-10-15)
 
 Operator request: find out why outputs and performance were poor, refactor

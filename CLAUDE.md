@@ -194,3 +194,100 @@ A phase is not done until:
 - Do not commit secrets, private keys, certificates, or raw dataset files.
 - Do not add a dependency, database, message broker, or frontend framework
   not listed above without asking.
+
+## v2 (phases 11–20)
+
+### Precedence and reading checklist
+
+**`docs/ADDENDUM_4.md` is the v2 rulebook (D1–D9) and wins over every
+earlier document**: `MASTER_SPEC.md`, `ADDENDUM.md`, `ADDENDUM_2.md`,
+`ADDENDUM_3.md`, and this file's v1 rules above, wherever they conflict.
+**`docs/V2_CONTRACTS.md`** freezes the exact types, nft names, RPC
+signatures and **file ownership** that ADDENDUM_4 relies on. Behind them,
+`docs/v2/PLAN_v3.md` is the authoritative design, and `docs/v2/PLAN_FINAL.md`
+fills in what PLAN_v3 leaves unchanged.
+
+For any v2 phase, in addition to the session checklist above:
+
+1. Read `docs/ADDENDUM_4.md` and `docs/V2_CONTRACTS.md` in full.
+2. Check the ownership table in `docs/V2_CONTRACTS.md` §12. Edit only the
+   files your phase owns. `pirewall/runtime/core.py`,
+   `pirewall/firewall/manager.py` and `pirewall/ipc/dispatcher.py` belong to
+   the integrator phase named there and to no other.
+3. Import the contract types (`pirewall/core/nft_names.py`,
+   `pirewall/core/models/{identity,evidence_v2,policy}.py`,
+   `pirewall/core/binding_table.py`, `pirewall/ipc/protocol_v2.py`). Never
+   redefine them or spell an nft name inline. You may *add* to a contract,
+   with its doc and pinning test in the same commit. Changing or removing
+   one is the human's call: stop and ask.
+4. Treat files named in a prompt that do not exist yet (later phases'
+   prompts, `docs/v2/RUNBOOK_PI.md`, `lab/` outputs) as not yet written.
+   Skip those steps and list them in the summary; never invent their
+   contents.
+
+### v2 invariants (non-negotiable, in addition to the rules above)
+
+- **Two kernel tables (D1).** `inet pirewall_static` (+ `arp
+  pirewall_static_arp`) is template-only reviewed policy, loaded by
+  `pirewall-start`. `inet pirewall_adaptive`'s enforcement sets are written
+  **only by `FirewallManager`**, after the full validator chain, as elements
+  with a timeout ≤ 3600 s, never as rules. Every set has exactly one writer.
+  Reloads flush chains and never delete a table.
+- **The single static-table write (D1).** The only runtime change core may
+  make to `pirewall_static`'s ruleset is replacing a `guard_verdict_*`
+  chain's contents (`drop` or empty), through
+  `FirewallManager.set_guard_mode`, in one atomic batch. The only other
+  change is panic. A ruleset-diff test enforces this.
+- **Guards are static policy (D2).** Their modes are separate from
+  `enforcement_mode`. The defaults are input enforce, raw enforce-if-seeded
+  and forward observe; don't quietly change them, any more than the A1/A6
+  defaults. The kill switch sets SHADOW **and** every guard to observe.
+  Fail-open shutdown flushes the adaptive sets only.
+- **ML ⇒ at most MONITOR (D4).** Under `pipeline.engine = "v2"`, a policy
+  table picks the action and scores are for explanation and the UI only.
+  Evidence that is ML-only or anomaly-only (Isolation Forest and/or
+  LightGBM) can never cause more than MONITOR. Neither can an observe-mode
+  guard's offender. Only D1 and enforce-mode kernel evidence may act.
+- **MAC identity (D3).** Device identity is `RuleTarget{ip, mac | None}`.
+  MACs are normalised `UnicastMacAddress` values, and multicast, broadcast
+  or all-zero MACs never identify a device. Bindings come only from the
+  lease file and `[[antispoof.static]]`, written through
+  `FirewallManager.sync_bindings`, deleting the old pair before adding the
+  new one. Lease hostnames and client-ids are never parsed or logged. MAC is
+  never a model feature.
+- **Env tags (D7).** Every measurement artifact carries exactly one tag:
+  `pi-live`, `pi-scripted`, `sandbox` or `mock`. Aggregation never mixes
+  tags, and `lab.env_tag` never defaults to a `pi-*` tag.
+- **v1 stays runnable.** `pipeline.engine = "v1"` is the evaluation
+  baseline, and the v1 test suite stays green throughout.
+
+### v2 dependency additions
+
+Approved as part of the v2 plan. Each is recorded here with its reason;
+nothing else is added without asking.
+
+- **`python3-nftables`** (Debian package). The uv 3.12 venv reaches it
+  through a `.pth` file, installed by phase 16's
+  `scripts/deployment/install_nftables_pth.sh`. It is ctypes over the
+  system `libnftables`, so it works from the venv. Set updates take a median
+  of about 0.36 ms, against about 10 ms through an `nft` subprocess
+  (`docs/v2/v2/RESULTS.md`; sandbox numbers, not Pi numbers). The
+  `nft -j -f -` subprocess stays as the batched fallback, and preflight
+  reports which transport is in use. Structured JSON commands only, never
+  string-built nft commands (spec §20).
+- **`scapy`**, as a **dev/lab-only** extra, for the mock pcap generator and
+  lab traffic. It is never imported by anything under `pirewall/`, and never
+  installed on the Pi's runtime path.
+- **The existing Rust `native/` extension** (PyO3, TPACKET_V3). v2 makes it
+  the only flow and feature producer for both live capture and training
+  (pcap replay through `FlowEngine.feed`), hardened per ADDENDUM_4 D6.
+
+### v2 honesty rule
+
+**`mock` and `sandbox` numbers are never Pi results.** The netns testbed,
+any x86 or WSL/Docker run, and synthetic pcaps are regression evidence.
+Label them with their env tag wherever they appear, and never report them
+as, average them with, or substitute them for Pi measurements. Only `pi-*`
+tagged numbers, from the real Pi, may fill a Pi result in `docs/PROGRESS.md`,
+the README or the paper. A v2 deliverable that has not run on the Pi is
+**Environment-dependent**, whatever the sandbox showed.

@@ -33,6 +33,11 @@ ring_block_timeout_ms = 50
 # Native path: per-drain conversion caps; excess is shed and counted.
 native_max_flows_per_drain = 1000
 native_max_new_flows_per_drain = 5000
+# backend = "replay" (ADDENDUM_4.md D7) replays pcaps through the same flow
+# engine with no root and no NIC. Accepted by validation; implemented in v2
+# phases 15/16 and not read by pirewall-core before then.
+# replay_path = "lab/mock/out"   # a pcap/pcapng file or a directory of them
+replay_speed = "max"             # "max", "realtime", or a multiplier like "10x"
 
 [flow]
 # 120 = CICFlowMeter's flow timeout: no CICIDS2017 training flow is longer.
@@ -317,3 +322,96 @@ mode = "fail_open"
 watchdog_sec = 30
 crash_loop_restart_count = 3
 crash_loop_window_seconds = 300
+
+# ---------------------------------------------------------------------------
+# v2 sections (docs/ADDENDUM_4.md). Every key has a default in
+# pirewall/config/models.py, so a config without these sections still loads.
+# `python -m scripts.deployment.migrate_config` adds them to an older
+# local_config.toml.
+# ---------------------------------------------------------------------------
+
+[pipeline]
+# D4 — "v1" is the merged-main pipeline and stays the default until the v2
+# policy engine ships (phase 17). v1 then remains selectable as the baseline.
+engine = "v1"
+
+[guards]
+# D1/D2 — static kernel guards in `table inet pirewall_static`. Rendered into
+# the templates by pirewall-start; at runtime pirewall-core may change only
+# the three modes below. Reviewed static policy, not adaptive rules, so they
+# are not governed by [firewall] enforcement_mode (see ADDENDUM_4.md D2).
+# raw = anti-spoof + per-MAC flood meters. "enforce" means enforce IF the
+# bindings were seeded; otherwise it is forced to observe at startup.
+raw_mode = "enforce"
+input_mode = "enforce"
+# Observe until the offline benign false-positive check (G5) has passed.
+forward_mode = "observe"
+
+# Meter thresholds: template starting values, to be replaced by benign
+# calibration. rate and burst are ONE threshold and are fitted together (a
+# burst larger than the flood hides the flood). packets/second, except
+# dhcp_per_minute.
+dhcp_per_minute = { rate = 10, burst = 5 }
+unbound = { rate = 50, burst = 100 }
+syn = { rate = 200, burst = 400 }
+icmp = { rate = 50, burst = 100 }
+udp_local = { rate = 500, burst = 1000 }
+local_pps = { rate = 3000, burst = 6000 }
+dns = { rate = 100, burst = 300 }
+closed_port = { rate = 20, burst = 40 }
+newconn = { rate = 100, burst = 200 }
+newconn_dst = { rate = 50, burst = 100 }
+udp_fwd = { rate = 20000, burst = 40000 }
+# Keyless global backstops: engage when a meter set is full or many MACs
+# flood together.
+global_unbound = { rate = 500, burst = 1000 }
+global_syn = { rate = 2000, burst = 4000 }
+global_icmp = { rate = 500, burst = 1000 }
+global_udp_local = { rate = 3000, burst = 6000 }
+global_newconn = { rate = 1000, burst = 2000 }
+portal_concurrency = 20
+# The adaptive table's ratelimit_mac meter.
+ratelimit = { rate = 20, burst = 40 }
+
+# A full dynamic meter stops policing new keys, so meters are sized to at
+# least twice the DHCP pool and backed by the global backstops above.
+binding_set_size = 1024
+meter_set_size = 256
+pair_meter_set_size = 4096
+offender_set_size = 4096
+adaptive_set_size = 4096
+
+[antispoof]
+# D3 — IP<->MAC bindings. NetworkManager shared mode keeps its dnsmasq leases
+# at /var/lib/NetworkManager/dnsmasq-<lan_interface>.leases.
+lease_file = "/var/lib/NetworkManager/dnsmasq-wlan0.leases"   # CHANGE_ME — match network.lan_interface
+# Added to a lease's expiry so a renewal written a moment late does not
+# briefly unbind the device.
+grace_seconds = 60
+poll_seconds = 2.0
+# Devices with a fixed address and no lease. Without an entry they fall into
+# the tightly metered "unbound" class.
+static = []
+# [[antispoof.static]]
+# ip = "192.0.2.20"
+# mac = "02:00:00:00:00:20"
+# reason = "CHANGE_ME — e.g. NAS with a static address"
+
+[policy]
+# D4 — v2 policy table. Read only when [pipeline] engine = "v2".
+rate_limit_ttl_seconds = 300
+block_ttl_seconds = 300
+escalation_ttl_multiplier = 2     # only on NEW independent evidence
+max_ttl_seconds = 3600            # every adaptive element expires; 3600 is also the ceiling
+sustained_polls = 2               # an enforce-mode offender must persist this many 1 s polls; >= 2
+
+[lab]
+# D7 — provenance tag on every artifact: "pi-live", "pi-scripted", "sandbox"
+# or "mock". Never defaults to a pi-* tag; pirewall-start sets it per
+# --data-mode. Aggregation refuses to mix tags, and only pi-* numbers are
+# Pi results.
+env_tag = "sandbox"
+# The on-Pi forward-path victim (pirewall-start --lab-victim up|down).
+victim_netns = "labvictim"
+victim_host_interface = "lab0"
+victim_network = "10.250.0.0/30"

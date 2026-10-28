@@ -41,6 +41,9 @@ packages = ["pirewall"]
 line-length = 110
 target-version = "py312"
 src = ["pirewall", "tests", "scripts"]
+# docs/v2/ is the frozen v2 design bundle: its scripts are sandbox evidence
+# (docs/v2/v2/RESULTS.md) and are kept byte-for-byte as tested, not linted.
+extend-exclude = ["docs/v2"]
 
 [tool.ruff.lint]
 select = [

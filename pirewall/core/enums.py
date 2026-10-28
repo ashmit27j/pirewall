@@ -168,3 +168,63 @@ class AddressFamily(StrEnum):
 
     IPV4 = "ipv4"
     IPV6 = "ipv6"
+
+
+# --- v2 vocabulary (docs/ADDENDUM_4.md, docs/V2_CONTRACTS.md) ---------------
+
+
+class PipelineEngine(StrEnum):
+    """Which detection/decision pipeline drives enforcement (ADDENDUM_4.md D4).
+
+    V1 is the merged-main pipeline, kept runnable as the evaluation baseline.
+    V2 is the policy-table pipeline (phase 17). Both deploy through the same
+    set backend.
+    """
+
+    V1 = "v1"
+    V2 = "v2"
+
+
+class GuardName(StrEnum):
+    """A static guard, named after its `guard_verdict_<name>` chain in `pirewall_static` (D1, D2)."""
+
+    RAW = "raw"
+    INPUT = "input"
+    FORWARD = "forward"
+
+
+class GuardMode(StrEnum):
+    """Whether a guard's meter hits drop (ENFORCE) or are only recorded (OBSERVE) (ADDENDUM_4.md D2)."""
+
+    OBSERVE = "observe"
+    ENFORCE = "enforce"
+
+
+class BindingSource(StrEnum):
+    """Where an IP<->MAC binding came from (ADDENDUM_4.md D3)."""
+
+    LEASE = "lease"
+    STATIC = "static"
+
+
+class EnvTag(StrEnum):
+    """Provenance of every measurement artifact (ADDENDUM_4.md D7). Never mixed in one aggregate."""
+
+    PI_LIVE = "pi-live"
+    PI_SCRIPTED = "pi-scripted"
+    SANDBOX = "sandbox"
+    MOCK = "mock"
+
+
+class D1Detector(StrEnum):
+    """The deterministic, MAC-keyed detectors of `pipeline.engine = "v2"` (PLAN_FINAL §4.5)."""
+
+    VERTICAL_SCAN = "vertical_scan"
+    HORIZONTAL_SCAN = "horizontal_scan"
+    FAILED_HANDSHAKE = "failed_handshake"
+    BRUTE_FORCE = "brute_force"
+    SLOW_RATE_DOS = "slow_rate_dos"
+    FAN_IN = "fan_in"
+    NEW_MAC_RATE = "new_mac_rate"
+    NEW_LEASE_RATE = "new_lease_rate"
+    PORTAL_AUTH_FAILURES = "portal_auth_failures"

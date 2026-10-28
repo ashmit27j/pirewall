@@ -1,6 +1,49 @@
 """Shared value objects reused by several domain models."""
 
-from pydantic import BaseModel, ConfigDict, Field, NonNegativeInt
+import re
+from typing import Annotated
+
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, NonNegativeInt
+
+# Six octets, one separator style throughout: `aa:bb:cc:dd:ee:ff` or
+# `aa-bb-cc-dd-ee-ff`, any case. Dotted Cisco form and bare 12-digit hex are
+# refused on purpose: a MAC arrives here from config, the lease file, nft JSON
+# and the native engine, and none of those emit them, so accepting them would
+# only widen what a malformed input can be mistaken for.
+_MAC_PATTERN = re.compile(r"^[0-9A-Fa-f]{2}([:-])(?:[0-9A-Fa-f]{2}\1){4}[0-9A-Fa-f]{2}$")
+
+
+def _normalise_mac(value: object) -> str:
+    if not isinstance(value, str) or _MAC_PATTERN.fullmatch(value) is None:
+        raise ValueError("a MAC address must be six hex octets separated by ':' or '-'")
+    return value.lower().replace("-", ":")
+
+
+def _require_unicast_identity(value: str) -> str:
+    first_octet = int(value[:2], 16)
+    if first_octet & 0x01:
+        # The I/G bit: group (multicast) addresses, broadcast included. No
+        # single device owns one, so binding, blocking or allowlisting by
+        # one would act on every listener at once (ADDENDUM_4.md D3).
+        raise ValueError("a multicast or broadcast MAC cannot identify a device")
+    if value == "00:00:00:00:00:00":
+        raise ValueError("the all-zero MAC cannot identify a device")
+    return value
+
+
+MacAddress = Annotated[str, BeforeValidator(_normalise_mac)]
+"""Any EUI-48, normalised to lowercase `aa:bb:cc:dd:ee:ff` (ADDENDUM_4.md D3).
+
+Use for observed frame fields (`Flow.destination_mac` may legitimately be
+broadcast). Anything that *identifies a device* uses `UnicastMacAddress`.
+"""
+
+UnicastMacAddress = Annotated[MacAddress, AfterValidator(_require_unicast_identity)]
+"""A `MacAddress` that can name one device: not multicast, broadcast or all-zero.
+
+Locally administered addresses are accepted: phones randomise their MAC per
+network, and those randomised addresses are exactly what pirewall sees.
+"""
 
 
 class PirewallModel(BaseModel):

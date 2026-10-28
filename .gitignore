@@ -65,6 +65,9 @@ Thumbs.db
 
 # Local config overrides
 config/local_config.toml
+# migrate_config.py --write backups and staging files: they hold the same
+# admin password hash.
+config/local_config.toml.*
 
 # scripts/deployment/render_templates.py output — real interface names/IPs
 # substituted from config/local_config.toml, never applied automatically

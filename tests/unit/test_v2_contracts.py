@@ -333,12 +333,14 @@ def test_policy_decision_invariants(overrides: dict[str, object], message: str) 
         _decision(**overrides)
 
 
-def test_the_connection_start_tracker_is_a_stub_until_phase_15() -> None:
+def test_the_connection_start_tracker_keeps_its_frozen_interface() -> None:
+    # Phase 15 implemented it (tests/unit/test_connection_start.py); the
+    # constructor contract and the two members phase 17 relies on stay put.
     with pytest.raises(ValueError, match="positive"):
         ConnectionStartTracker(max_tracked=0)
     tracker = ConnectionStartTracker(max_tracked=10)
-    with pytest.raises(NotImplementedError):
-        _ = tracker.evictions
+    assert tracker.evictions == 0
+    assert callable(tracker.observe)
 
 
 # --------------------------------------------------------------------- nft names vs templates

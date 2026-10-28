@@ -31,6 +31,16 @@ class CaptureError(PirewallError):
     """Raised when the packet capture layer fails (socket setup, read, interface down)."""
 
 
+class NativeEngineError(CaptureError):
+    """A panic inside the native engine, caught at the Python boundary (ADDENDUM_4.md D6).
+
+    The extension's own `pirewall_native.NativeEngineError`, re-raised by
+    `pirewall.flow.native` and `pirewall.capture.native` so callers never
+    import the optional extension to catch it. The engine has already
+    recovered when this is raised; the frame or batch in flight is lost.
+    """
+
+
 class PacketParseError(PirewallError):
     """Raised when a captured packet cannot be parsed into `PacketMetadata`.
 

@@ -292,8 +292,40 @@ of spending the GIL building objects the bounded queues would drop anyway.
 The source-level fast path needs far fewer signals than that to see a
 flood.
 
-**Layering.** `pirewall.capture.native` imports nothing from
-`pirewall.flow` — the engine is an opaque handle — and the
+**Panics are survivable (ADDENDUM_4.md D6, v2 phase 15).** The engine runs
+inside pirewall-core, so before phase 15 a Rust panic (`panic = "abort"`)
+killed core, which fails open, and three crashes in 300 s stop systemd
+restarting it: a potential remote off-switch. Now the crate builds with
+`panic = "unwind"` and every Python-callable entry point (`feed`, `drain`,
+`sweep`, the ring's `poll`, and the queries) runs inside `catch_unwind`. A
+panic becomes `pirewall_native.NativeEngineError`, re-raised by the Python
+wrappers as `pirewall.core.exceptions.NativeEngineError` (a
+`CaptureError`). A panic that unwound while the engine was locked may have
+torn the flow table, so the next lock discards the table and counts the
+open flows lost (`FlowEngine.panic_stats`). The ring walker clamps every
+kernel-written offset and `snaplen` to its block (`walk_block`), and a
+panic mid-block still hands the block back to the kernel.
+`pirewall.flow.fallback` holds the policy: count the panic, drop the frame
+or batch, emit a `CAPTURE_ERROR` event, and after
+`capture.native_max_panics_per_minute` in 60 s abandon the native engine
+for the Python path with a CRITICAL event. `FallbackFlowEngine` applies it
+to frame feeding (replay, the dataset tool). The live ring's switch to
+`AFPacketCapture` is a capture swap inside `CoreDaemon`, which phase 16
+wires with the same `NativePanicBudget`. Until then a panic in the live
+loop stops capture with a CRITICAL `CAPTURE_ERROR` event, and core keeps
+running and enforcing. `parse::parse` and `Engine::feed` are fuzzed
+(`native/fuzz/`) and property-tested (`native/tests/properties.rs`).
+
+**One producer for training and runtime (D6).** `pirewall.capture.pcapio`
+reads pcap/pcapng with the stdlib. `pirewall.capture.replay` feeds captures
+through the same `FlowEngine.feed` live capture uses (`capture.backend =
+"replay"`, no root, no NIC), and `scripts/dataset/pcap_to_flows.py` turns
+captures into training rows that way, with the runtime's own flow config
+and extractor. `tests/integration/test_pcap_to_flows_parity.py` holds its
+rows equal to the live path's feature vectors, exactly.
+
+**Layering.** `pirewall.capture.native` takes only the error translation
+from `pirewall.flow.native`; the engine itself is an opaque handle. The
 `FlowCapture` protocol (`capture.interfaces`) has a test double,
 `capture.fake.FakeFlowCapture`, that drives the real engine without a NIC
 (`tests/integration/test_core_daemon_native.py`). Every mutex in the
@@ -506,6 +538,18 @@ stay behind the optional `native` extra: a plain `uv sync` installs none of
 them and pirewall runs its pure-Python path. A C extension was the
 alternative and was rejected: the same FFI with none of Rust's bounds
 checking, in the one component that parses attacker-controlled bytes.
+
+### `proptest` and cargo-fuzz (`libfuzzer-sys`) for the native engine (v2 phase 15)
+
+Named by the phase-15 prompt and ADDENDUM_4.md D6: the engine parses
+attacker-controlled bytes inside pirewall-core, so "nothing can panic it"
+has to be tested, not assumed. `proptest` is a Rust **dev-dependency**
+(`native/Cargo.toml`): it runs in `cargo test` and is never built into the
+extension. `libfuzzer-sys` lives only in the separate `native/fuzz/` crate,
+which has its own workspace and is built only by `cargo +nightly fuzz`.
+Neither reaches the Pi, the wheel, or any Python environment. The property
+test caught a real defect on its first run (timestamp subtraction overflow
+in the flow table, now saturating).
 
 ## Process split (ADDENDUM.md A4)
 

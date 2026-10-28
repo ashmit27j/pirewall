@@ -1,0 +1,33 @@
+[package]
+name = "pirewall-native-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.pirewall-native]
+path = ".."
+
+# Kept out of the native crate's build: `cargo +nightly fuzz run <target>`
+# from native/ (see native/fuzz/README.md).
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "engine"
+path = "fuzz_targets/engine.rs"
+test = false
+doc = false
+bench = false

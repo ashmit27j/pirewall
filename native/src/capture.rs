@@ -10,6 +10,13 @@
 //! Every packet seen by the kernel is either placed in the ring or counted as
 //! a drop (`PACKET_STATISTICS`), so drops stay measurable exactly as with
 //! the Python socket.
+//!
+//! Defensive bounds (ADDENDUM_4.md D6): the kernel writes every offset and
+//! length the ring walker reads, and the kernel is trusted, but
+//! `walk_block` still clamps each of them to the block it lives in, so no
+//! value read from the ring can make it read outside the mapping. A panic
+//! while feeding a block costs the rest of that block: the block is handed
+//! back to the kernel regardless and the panic becomes `NativeEngineError`.
 
 use std::sync::atomic::{fence, AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -17,7 +24,7 @@ use std::sync::Mutex;
 use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
 
-use crate::FlowEngine;
+use crate::{guarded, FlowEngine};
 
 const ETH_P_ALL: u16 = 0x0003;
 const SOL_PACKET: libc::c_int = 263;
@@ -43,6 +50,67 @@ const PKT_SEC: usize = 4;
 const PKT_NSEC: usize = 8;
 const PKT_SNAPLEN: usize = 12;
 const PKT_MAC: usize = 24;
+// The smallest packet header the walker reads (through `tp_mac`, a u16).
+const PKT_HEADER_MIN: usize = PKT_MAC + 2;
+
+fn u32_at(block: &[u8], at: usize) -> Option<u32> {
+    block.get(at..at + 4).map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn u16_at(block: &[u8], at: usize) -> Option<u16> {
+    block.get(at..at + 2).map(|b| u16::from_ne_bytes([b[0], b[1]]))
+}
+
+/// Walk one user-owned `TPACKET_V3` block, calling `on_frame(frame, ts_us)`
+/// for each packet, and return how many were visited.
+///
+/// Every offset and length is read from the block itself and clamped to
+/// it: a first-packet offset or `tp_next_offset` that leaves the block ends
+/// the walk, a `tp_mac` that leaves it skips the packet, and `tp_snaplen`
+/// is truncated to the bytes left in the block. At most `tp_num_pkts`
+/// packets are visited. Never reads outside `block`.
+pub(crate) fn walk_block(block: &[u8], mut on_frame: impl FnMut(&[u8], i64)) -> usize {
+    let Some(count) = u32_at(block, BLOCK_NUM_PKTS_OFFSET) else { return 0 };
+    let Some(first) = u32_at(block, BLOCK_FIRST_PKT_OFFSET) else { return 0 };
+    let mut offset = first as usize;
+    let mut visited = 0usize;
+    for _ in 0..count {
+        if offset.checked_add(PKT_HEADER_MIN).is_none_or(|end| end > block.len()) {
+            break;
+        }
+        let header = &block[offset..];
+        let (Some(sec), Some(nsec), Some(snaplen), Some(mac), Some(next)) = (
+            u32_at(header, PKT_SEC),
+            u32_at(header, PKT_NSEC),
+            u32_at(header, PKT_SNAPLEN),
+            u16_at(header, PKT_MAC),
+            u32_at(header, PKT_NEXT_OFFSET),
+        ) else {
+            break;
+        };
+        let mac = mac as usize;
+        if mac <= header.len() {
+            let available = header.len() - mac;
+            let length = (snaplen as usize).min(available);
+            on_frame(&header[mac..mac + length], i64::from(sec) * 1_000_000 + i64::from(nsec) / 1_000);
+        }
+        visited += 1;
+        if next == 0 {
+            break;
+        }
+        offset = match offset.checked_add(next as usize) {
+            Some(next_offset) if next_offset < block.len() => next_offset,
+            _ => break,
+        };
+    }
+    visited
+}
+
+/// Why a `poll` stopped early.
+enum PollFailure {
+    Os(PyErr),
+    Panic(String),
+}
 
 #[repr(C)]
 struct TpacketReq3 {
@@ -201,6 +269,8 @@ impl PacketRing {
     /// Wait up to `timeout_ms` for packets, then feed every ready block into
     /// `engine` (up to roughly `max_packets`), with the GIL released.
     /// Returns the number of packets processed; 0 on timeout or once stopped.
+    /// Raises `NativeEngineError` if feeding panicked; the block it was in is
+    /// returned to the kernel first, so the ring keeps moving.
     fn poll(
         &self,
         py: Python<'_>,
@@ -208,8 +278,8 @@ impl PacketRing {
         timeout_ms: i32,
         max_packets: usize,
     ) -> PyResult<usize> {
-        py.allow_threads(|| {
-            let mut guard = self.ring.lock().expect("ring mutex poisoned");
+        let outcome = py.allow_threads(|| {
+            let mut guard = self.ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(ring) = guard.as_mut() else { return Ok(0) };
             let mut processed = 0usize;
             let mut waited = false;
@@ -225,51 +295,44 @@ impl PacketRing {
                         libc::pollfd { fd: ring.fd, events: libc::POLLIN | libc::POLLERR, revents: 0 };
                     let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
                     if rc < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-                        return Err(os_error("poll on capture ring"));
+                        return Err(PollFailure::Os(os_error("poll on capture ring")));
                     }
                     waited = true;
                     continue;
                 }
-                let packets = unsafe { ring.read_u32(block.add(BLOCK_NUM_PKTS_OFFSET)) } as usize;
-                let mut cursor =
-                    unsafe { block.add(ring.read_u32(block.add(BLOCK_FIRST_PKT_OFFSET)) as usize) };
-                {
+                // The block is user-owned until its status is handed back,
+                // so the kernel does not write it while we read it.
+                let bytes = unsafe { std::slice::from_raw_parts(block.cast_const(), ring.block_size) };
+                let fed = guarded(|| {
                     let mut engine = engine.lock();
-                    for _ in 0..packets {
-                        unsafe {
-                            let sec = i64::from(ring.read_u32(cursor.add(PKT_SEC)));
-                            let nsec = i64::from(ring.read_u32(cursor.add(PKT_NSEC)));
-                            let snaplen = ring.read_u32(cursor.add(PKT_SNAPLEN)) as usize;
-                            let mac = std::ptr::read_volatile(cursor.add(PKT_MAC).cast::<u16>()) as usize;
-                            let frame = std::slice::from_raw_parts(cursor.add(mac), snaplen);
-                            engine.feed(frame, sec * 1_000_000 + nsec / 1_000);
-                            let next = ring.read_u32(cursor.add(PKT_NEXT_OFFSET)) as usize;
-                            if next == 0 {
-                                break;
-                            }
-                            cursor = cursor.add(next);
-                        }
-                    }
-                }
+                    walk_block(bytes, |frame, ts_us| engine.feed(frame, ts_us))
+                });
                 fence(Ordering::Release);
                 unsafe {
                     std::ptr::write_volatile(block.add(BLOCK_STATUS_OFFSET).cast::<u32>(), TP_STATUS_KERNEL)
                 };
                 ring.current = (ring.current + 1) % ring.block_count;
-                processed += packets;
+                match fed {
+                    Ok(packets) => processed += packets,
+                    Err(message) => return Err(PollFailure::Panic(message)),
+                }
                 if processed >= max_packets {
                     break;
                 }
             }
             Ok(processed)
+        });
+        outcome.map_err(|failure| match failure {
+            PollFailure::Os(error) => error,
+            PollFailure::Panic(message) => engine.panicked("ring poll", &message),
         })
     }
 
     /// Cumulative packets the kernel dropped because the ring was full.
     fn kernel_drops(&self, py: Python<'_>) -> u64 {
         py.allow_threads(|| {
-            let mut guard = self.ring.lock().expect("ring mutex poisoned");
-            let mut total = self.drops.lock().expect("drops mutex poisoned");
+            let mut guard = self.ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut total = self.drops.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(ring) = guard.as_mut() {
                 *total = ring.kernel_drops();
             }
@@ -281,9 +344,9 @@ impl PacketRing {
     fn close(&self, py: Python<'_>) {
         self.running.store(false, Ordering::Relaxed);
         py.allow_threads(|| {
-            let mut guard = self.ring.lock().expect("ring mutex poisoned");
+            let mut guard = self.ring.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(mut ring) = guard.take() {
-                *self.drops.lock().expect("drops mutex poisoned") = ring.kernel_drops();
+                *self.drops.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ring.kernel_drops();
                 ring.close();
             }
         });
@@ -365,4 +428,81 @@ fn open_ring(
         setsockopt(fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &membership, "promiscuous mode")?;
     }
     Ok(ring)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A block holding `frames` laid out like the kernel does, header then frame.
+    fn block(size: usize, frames: &[&[u8]]) -> Vec<u8> {
+        let mut out = vec![0u8; size];
+        let first = 48usize;
+        out[BLOCK_NUM_PKTS_OFFSET..BLOCK_NUM_PKTS_OFFSET + 4]
+            .copy_from_slice(&(frames.len() as u32).to_ne_bytes());
+        out[BLOCK_FIRST_PKT_OFFSET..BLOCK_FIRST_PKT_OFFSET + 4]
+            .copy_from_slice(&(first as u32).to_ne_bytes());
+        let mut offset = first;
+        for (i, frame) in frames.iter().enumerate() {
+            let mac = 32usize;
+            let next = if i + 1 == frames.len() { 0 } else { (mac + frame.len() + 15) & !15 };
+            let h = &mut out[offset..];
+            h[PKT_NEXT_OFFSET..PKT_NEXT_OFFSET + 4].copy_from_slice(&(next as u32).to_ne_bytes());
+            h[PKT_SEC..PKT_SEC + 4].copy_from_slice(&7u32.to_ne_bytes());
+            h[PKT_NSEC..PKT_NSEC + 4].copy_from_slice(&((i as u32) * 1000).to_ne_bytes());
+            h[PKT_SNAPLEN..PKT_SNAPLEN + 4].copy_from_slice(&(frame.len() as u32).to_ne_bytes());
+            h[PKT_MAC..PKT_MAC + 2].copy_from_slice(&(mac as u16).to_ne_bytes());
+            h[mac..mac + frame.len()].copy_from_slice(frame);
+            offset += next;
+        }
+        out
+    }
+
+    fn collect(block: &[u8]) -> (usize, Vec<(Vec<u8>, i64)>) {
+        let mut seen = Vec::new();
+        let n = walk_block(block, |frame, ts| seen.push((frame.to_vec(), ts)));
+        (n, seen)
+    }
+
+    #[test]
+    fn a_well_formed_block_yields_every_frame_with_its_timestamp() {
+        let (n, seen) = collect(&block(4096, &[b"first", b"second!", b"3"]));
+        assert_eq!(n, 3);
+        assert_eq!(seen[0], (b"first".to_vec(), 7_000_000));
+        assert_eq!(seen[1], (b"second!".to_vec(), 7_000_001));
+        assert_eq!(seen[2].0, b"3".to_vec());
+    }
+
+    #[test]
+    fn an_oversized_snaplen_is_clamped_to_the_block() {
+        let mut b = block(256, &[b"abc"]);
+        b[48 + PKT_SNAPLEN..48 + PKT_SNAPLEN + 4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        let (n, seen) = collect(&b);
+        assert_eq!(n, 1);
+        assert_eq!(seen[0].0.len(), 256 - 48 - 32);
+    }
+
+    #[test]
+    fn offsets_that_leave_the_block_end_the_walk() {
+        let mut b = block(256, &[b"abc", b"def"]);
+        b[BLOCK_FIRST_PKT_OFFSET..BLOCK_FIRST_PKT_OFFSET + 4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert_eq!(collect(&b).0, 0);
+
+        let mut b = block(256, &[b"abc", b"def"]);
+        b[48 + PKT_NEXT_OFFSET..48 + PKT_NEXT_OFFSET + 4].copy_from_slice(&10_000u32.to_ne_bytes());
+        assert_eq!(collect(&b).0, 1);
+
+        let mut b = block(256, &[b"abc"]);
+        b[48 + PKT_MAC..48 + PKT_MAC + 2].copy_from_slice(&u16::MAX.to_ne_bytes());
+        let (n, seen) = collect(&b);
+        assert_eq!((n, seen.len()), (1, 0));
+    }
+
+    #[test]
+    fn a_packet_count_beyond_the_chain_stops_at_the_last_packet() {
+        let mut b = block(512, &[b"abc", b"def"]);
+        b[BLOCK_NUM_PKTS_OFFSET..BLOCK_NUM_PKTS_OFFSET + 4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert_eq!(collect(&b).0, 2);
+        assert_eq!(collect(&[0u8; 8]).0, 0);
+    }
 }

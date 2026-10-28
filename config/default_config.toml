@@ -33,9 +33,12 @@ ring_block_timeout_ms = 50
 # Native path: per-drain conversion caps; excess is shed and counted.
 native_max_flows_per_drain = 1000
 native_max_new_flows_per_drain = 5000
+# Native engine panics (caught, ADDENDUM_4.md D6) tolerated within 60 s
+# before falling back to the Python path with a CRITICAL event.
+native_max_panics_per_minute = 5
 # backend = "replay" (ADDENDUM_4.md D7) replays pcaps through the same flow
-# engine with no root and no NIC. Accepted by validation; implemented in v2
-# phases 15/16 and not read by pirewall-core before then.
+# engine with no root and no NIC (pirewall/capture/replay.py, phase 15).
+# pirewall-core selects it from this setting from phase 16 on.
 # replay_path = "lab/mock/out"   # a pcap/pcapng file or a directory of them
 replay_speed = "max"             # "max", "realtime", or a multiplier like "10x"
 
@@ -45,6 +48,8 @@ active_timeout_seconds = 120
 inactive_timeout_seconds = 60
 max_flows = 100000
 cleanup_interval_seconds = 30
+# 5-tuples remembered when deciding "connection start" (V2_CONTRACTS §11).
+connection_start_max_tracked = 100000
 
 [features]
 # Pinned schema version — bump only when pirewall/features/schema.py changes

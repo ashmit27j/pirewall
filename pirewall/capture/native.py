@@ -10,8 +10,10 @@ flood (benchmarks/2026-09-10-attack-lab: 94% dropped).
 
 Linux-only and privileged (`CAP_NET_RAW`), like `AFPacketCapture`;
 Environment-dependent — see docs/PROGRESS.md for what has and has not been
-exercised on real hardware. Deliberately imports nothing from
-`pirewall.flow`: the engine arrives as an opaque handle.
+exercised on real hardware. The engine arrives as an opaque handle; the
+only thing taken from `pirewall.flow.native` is the error translation, so a
+panic while feeding the ring surfaces as
+`pirewall.core.exceptions.NativeEngineError` (a `CaptureError`).
 """
 
 import importlib
@@ -19,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from pirewall.core.exceptions import CaptureError
 from pirewall.core.models.capture_stats import CaptureStatistics
+from pirewall.flow.native import translate_native_errors
 
 if TYPE_CHECKING:
     from pirewall_native import (  # pyright: ignore[reportMissingModuleSource]
@@ -103,18 +106,24 @@ class NativePacketCapture:
         self._ring = None
 
     def poll(self, timeout_ms: int) -> int:
-        """Feed every ready packet into the engine; 0 on timeout or once stopped."""
+        """Feed every ready packet into the engine; 0 on timeout or once stopped.
+
+        Raises `NativeEngineError` if the engine panicked mid-block (the rest
+        of that block is lost; the ring itself keeps moving).
+        """
         ring = self._ring
         if ring is None:
             return 0
         try:
-            return ring.poll(self._engine, timeout_ms, _MAX_PACKETS_PER_POLL)
+            with translate_native_errors():
+                return ring.poll(self._engine, timeout_ms, _MAX_PACKETS_PER_POLL)
         except OSError as exc:
             raise CaptureError(f"error reading capture ring on {self._interface}: {exc}") from exc
 
     def statistics(self) -> CaptureStatistics:
         """Seen/malformed from the engine (live, not tick-sampled); drops from the kernel."""
-        seen, malformed = self._engine.counters()
+        with translate_native_errors():
+            seen, malformed = self._engine.counters()
         ring = self._ring
         if ring is not None:
             self._kernel_drops = ring.kernel_drops()

@@ -11,20 +11,57 @@
 //!
 //! Locking discipline: every mutex here is only ever taken while the GIL is
 //! released, and dropped before the GIL is re-acquired, so no thread can hold
-//! one while waiting for the other.
+//! one while waiting for the other. (`feed` is the one exception: it holds
+//! the GIL throughout and never waits for it, so it cannot deadlock either.)
+//!
+//! Panic discipline (ADDENDUM_4.md D6): the crate builds with
+//! `panic = "unwind"`, and every Python-callable entry point runs inside
+//! `std::panic::catch_unwind`. A panic surfaces in Python as
+//! `NativeEngineError` (an ordinary `RuntimeError` subclass, not PyO3's
+//! `BaseException`-derived `PanicException`), is counted in
+//! `panic_stats()`, and costs the frame or batch it interrupted. A panic
+//! that unwound while the engine was locked may have left the flow table
+//! half-updated, so the next lock clears the table (`Engine::recover`)
+//! before anything reads it; the open flows lost are counted, never silent.
 
-mod flow;
-mod parse;
+pub mod flow;
+pub mod parse;
 
 #[cfg(target_os = "linux")]
 mod capture;
 
-use std::sync::Mutex;
+use std::any::Any;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use flow::{Engine, FlowState};
+
+pyo3::create_exception!(
+    pirewall_native,
+    NativeEngineError,
+    pyo3::exceptions::PyRuntimeError,
+    "A panic inside the native engine, caught at the Python boundary (ADDENDUM_4.md D6)."
+);
+
+/// The panic payload as text, for the `NativeEngineError` message.
+pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
+/// Run `f`, turning a panic into `Err(message)`.
+pub(crate) fn guarded<R>(f: impl FnOnce() -> R) -> Result<R, String> {
+    catch_unwind(AssertUnwindSafe(f)).map_err(|payload| panic_message(payload.as_ref()))
+}
 
 /// A finalized flow's accumulated statistics (everything `Flow` needs).
 #[pyclass(frozen, get_all, module = "pirewall_native")]
@@ -139,15 +176,46 @@ type Drained = (Vec<FlowState>, Vec<flow::NewFlow>, Vec<flow::TlsCandidate>);
 #[pyclass(frozen, module = "pirewall_native")]
 pub struct FlowEngine {
     inner: Mutex<Engine>,
+    panics: AtomicU64,
 }
 
 impl FlowEngine {
-    fn with<R: Send>(&self, py: Python<'_>, f: impl FnOnce(&mut Engine) -> R + Send) -> R {
-        py.allow_threads(|| f(&mut self.inner.lock().expect("engine mutex poisoned")))
+    /// Run `f` on the engine with the GIL released, inside `catch_unwind`.
+    fn with<R: Send>(
+        &self,
+        py: Python<'_>,
+        what: &str,
+        f: impl FnOnce(&mut Engine) -> R + Send,
+    ) -> PyResult<R> {
+        let outcome = py.allow_threads(|| {
+            guarded(|| {
+                let mut engine = self.lock();
+                #[cfg(feature = "panic-injection")]
+                engine.injected_panic(what);
+                f(&mut engine)
+            })
+        });
+        outcome.map_err(|message| self.panicked(what, &message))
     }
 
-    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Engine> {
-        self.inner.lock().expect("engine mutex poisoned")
+    /// Lock the engine. A lock poisoned by a caught panic is recovered: the
+    /// table is cleared (it may be half-updated) and the poison flag reset.
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Engine> {
+        match self.inner.lock() {
+            Ok(engine) => engine,
+            Err(poisoned) => {
+                let mut engine = poisoned.into_inner();
+                engine.recover();
+                self.inner.clear_poison();
+                engine
+            }
+        }
+    }
+
+    /// Count a caught panic and build the error Python sees.
+    pub(crate) fn panicked(&self, what: &str, message: &str) -> PyErr {
+        self.panics.fetch_add(1, Ordering::Relaxed);
+        NativeEngineError::new_err(format!("native engine panicked in {what}: {message}"))
     }
 }
 
@@ -196,21 +264,23 @@ impl FlowEngine {
             max_pending_completed.unwrap_or(usize::MAX),
             max_pending_new_flows.unwrap_or(usize::MAX),
         );
-        Ok(Self { inner: Mutex::new(engine) })
+        Ok(Self { inner: Mutex::new(engine), panics: AtomicU64::new(0) })
     }
 
     /// Feed one Ethernet frame captured at `ts_us` (Unix microseconds). For
     /// replay and tests; live capture feeds the engine from Rust directly.
-    fn feed(&self, frame: &[u8], ts_us: i64) {
-        self.lock().feed(frame, ts_us);
+    /// Keeps the GIL (one frame is cheaper than a GIL round trip). Raises
+    /// `NativeEngineError` if the engine panicked on this frame.
+    fn feed(&self, frame: &[u8], ts_us: i64) -> PyResult<()> {
+        guarded(|| self.lock().feed(frame, ts_us)).map_err(|message| self.panicked("feed", &message))
     }
 
     /// Take everything produced since the last drain:
     /// `(completed flows, new-flow signals, TLS candidates)`.
     fn drain(&self, py: Python<'_>) -> PyResult<(Vec<FlowRecord>, Vec<NewFlowRecord>, Vec<TlsRecord>)> {
-        let (completed, new_flows, tls): Drained = self.with(py, |e| {
+        let (completed, new_flows, tls): Drained = self.with(py, "drain", |e| {
             (std::mem::take(&mut e.completed), std::mem::take(&mut e.new_flows), std::mem::take(&mut e.tls))
-        });
+        })?;
         let new_flows = new_flows
             .into_iter()
             .map(|n| NewFlowRecord {
@@ -238,8 +308,8 @@ impl FlowEngine {
     }
 
     /// Close every flow that has timed out as of `now_us`.
-    fn sweep(&self, py: Python<'_>, now_us: i64) -> Vec<FlowRecord> {
-        records(&self.with(py, |e| e.sweep(now_us)))
+    fn sweep(&self, py: Python<'_>, now_us: i64) -> PyResult<Vec<FlowRecord>> {
+        Ok(records(&self.with(py, "sweep", |e| e.sweep(now_us))?))
     }
 
     /// `(source, destination, concurrent count, representative flow)` per qualifying pair.
@@ -250,8 +320,8 @@ impl FlowEngine {
         min_duration_seconds: f64,
         max_bytes_per_second: f64,
         concurrent_threshold: usize,
-    ) -> Vec<(u32, u32, usize, FlowRecord)> {
-        self.with(py, |e| {
+    ) -> PyResult<Vec<(u32, u32, usize, FlowRecord)>> {
+        self.with(py, "slow_clusters", |e| {
             e.slow_clusters(now_us, min_duration_seconds, max_bytes_per_second, concurrent_threshold)
                 .into_iter()
                 .map(|c| (c.src, c.dst, c.count, FlowRecord::from(&c.representative)))
@@ -260,27 +330,42 @@ impl FlowEngine {
     }
 
     /// Snapshot of `src`'s most recently active open flow, if any.
-    fn snapshot_open_flow_from(&self, py: Python<'_>, src: u32) -> Option<FlowRecord> {
-        self.with(py, |e| e.snapshot_from(src).as_ref().map(FlowRecord::from))
+    fn snapshot_open_flow_from(&self, py: Python<'_>, src: u32) -> PyResult<Option<FlowRecord>> {
+        self.with(py, "snapshot_open_flow_from", |e| e.snapshot_from(src).as_ref().map(FlowRecord::from))
     }
 
     /// Finalize every open flow (graceful shutdown).
-    fn flush(&self, py: Python<'_>) -> Vec<FlowRecord> {
-        records(&self.with(py, |e| e.flush()))
+    fn flush(&self, py: Python<'_>) -> PyResult<Vec<FlowRecord>> {
+        Ok(records(&self.with(py, "flush", |e| e.flush())?))
     }
 
     /// `(packets seen, packets malformed or unsupported)`, cumulative.
-    fn counters(&self, py: Python<'_>) -> (u64, u64) {
-        self.with(py, |e| (e.packets_seen, e.packets_malformed))
+    fn counters(&self, py: Python<'_>) -> PyResult<(u64, u64)> {
+        self.with(py, "counters", |e| (e.packets_seen, e.packets_malformed))
     }
 
     /// `(completed flows shed, new-flow signals shed)` by the per-drain caps, cumulative.
-    fn shed(&self, py: Python<'_>) -> (u64, u64) {
-        self.with(py, |e| (e.completed_shed, e.new_flows_shed))
+    fn shed(&self, py: Python<'_>) -> PyResult<(u64, u64)> {
+        self.with(py, "shed", |e| (e.completed_shed, e.new_flows_shed))
     }
 
-    fn __len__(&self, py: Python<'_>) -> usize {
-        self.with(py, |e| e.len())
+    /// `(panics caught, open flows discarded recovering from them)`, cumulative.
+    fn panic_stats(&self, py: Python<'_>) -> PyResult<(u64, u64)> {
+        let lost = self.with(py, "panic_stats", |e| e.flows_lost_to_panics)?;
+        Ok((self.panics.load(Ordering::Relaxed), lost))
+    }
+
+    /// Test-only (`panic-injection` feature): make the next `count` engine
+    /// calls at `site` panic while holding the engine lock. `site` is an
+    /// entry point name (`"feed"`, `"drain"`, `"sweep"`, ...); `"feed"`
+    /// also covers frames fed from a `PacketRing`.
+    #[cfg(feature = "panic-injection")]
+    fn _arm_test_panic(&self, py: Python<'_>, site: String, count: u32) -> PyResult<()> {
+        self.with(py, "_arm_test_panic", move |e| e.arm_panic(site, count))
+    }
+
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        self.with(py, "__len__", |e| e.len())
     }
 }
 
@@ -290,8 +375,70 @@ fn pirewall_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FlowRecord>()?;
     m.add_class::<NewFlowRecord>()?;
     m.add_class::<TlsRecord>()?;
+    m.add("NativeEngineError", m.py().get_type::<NativeEngineError>())?;
+    m.add("HAS_PANIC_INJECTION", cfg!(feature = "panic-injection"))?;
     #[cfg(target_os = "linux")]
     m.add_class::<capture::PacketRing>()?;
     m.add("HAS_PACKET_RING", cfg!(target_os = "linux"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine() -> FlowEngine {
+        FlowEngine { inner: Mutex::new(Engine::new(120.0, 60.0, 100, None, 443)), panics: AtomicU64::new(0) }
+    }
+
+    fn syn(src: u8, sport: u16) -> Vec<u8> {
+        let mut f = vec![0x02, 0, 0, 0, 0, 1, 0x02, 0, 0, 0, 0, src, 0x08, 0x00];
+        f.extend_from_slice(&[0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0, 10, 0, 0, src, 10, 0, 0, 1]);
+        f.extend_from_slice(&sport.to_be_bytes());
+        f.extend_from_slice(&[0, 80, 0, 0, 0, 0, 0, 0, 0, 0, 0x50, parse::TCP_SYN, 4, 0, 0, 0, 0, 0]);
+        f
+    }
+
+    #[test]
+    fn guarded_turns_a_panic_into_its_message() {
+        assert_eq!(guarded(|| 5), Ok(5));
+        assert_eq!(guarded(|| -> u8 { panic!("boom {}", 1) }), Err("boom 1".to_owned()));
+        assert_eq!(
+            guarded(|| -> u8 { std::panic::panic_any(3_u8) }),
+            Err("non-string panic payload".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_panic_while_locked_clears_the_table_and_the_lock_stays_usable() {
+        let e = engine();
+        e.lock().feed(&syn(5, 1000), 0);
+        e.lock().feed(&syn(6, 1001), 1);
+        assert_eq!(e.lock().len(), 2);
+        let caught = guarded(|| {
+            let _held = e.lock();
+            panic!("mid-update");
+        });
+        assert!(caught.is_err());
+        assert!(e.inner.is_poisoned());
+        let mut recovered = e.lock();
+        assert!(!e.inner.is_poisoned());
+        assert_eq!(recovered.len(), 0);
+        assert_eq!(recovered.flows_lost_to_panics, 2);
+        // Pending output and counters survive; the engine keeps working.
+        assert_eq!(recovered.new_flows.len(), 2);
+        assert_eq!(recovered.packets_seen, 2);
+        recovered.feed(&syn(7, 1002), 2);
+        assert_eq!(recovered.len(), 1);
+    }
+
+    #[cfg(feature = "panic-injection")]
+    #[test]
+    fn an_armed_panic_fires_once_at_its_site() {
+        let e = engine();
+        e.lock().arm_panic("feed".to_owned(), 1);
+        assert!(guarded(|| e.lock().feed(&syn(5, 1000), 0)).is_err());
+        assert!(guarded(|| e.lock().feed(&syn(5, 1000), 0)).is_ok());
+        assert_eq!(e.lock().len(), 1);
+    }
 }

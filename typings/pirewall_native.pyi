@@ -8,6 +8,11 @@ is guarded at runtime (`pirewall.flow.native`, `pirewall.capture.native`).
 from typing import final
 
 HAS_PACKET_RING: bool
+# True only in a build with the test-only `panic-injection` cargo feature.
+HAS_PANIC_INJECTION: bool
+
+class NativeEngineError(RuntimeError):
+    """A panic inside the engine, caught at the Python boundary (ADDENDUM_4.md D6)."""
 
 @final
 class FlowRecord:
@@ -94,6 +99,9 @@ class FlowEngine:
     def flush(self) -> list[FlowRecord]: ...
     def counters(self) -> tuple[int, int]: ...
     def shed(self) -> tuple[int, int]: ...
+    def panic_stats(self) -> tuple[int, int]: ...
+    # Present only when HAS_PANIC_INJECTION is True.
+    def _arm_test_panic(self, site: str, count: int) -> None: ...
     def __len__(self) -> int: ...
 
 @final

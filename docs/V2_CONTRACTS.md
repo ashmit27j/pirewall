@@ -249,7 +249,8 @@ loads unchanged, and no existing key was renamed or removed.
 | `[antispoof]` | `lease_file`: when unset, derived from `network.lan_interface` as `/var/lib/NetworkManager/dnsmasq-<lan_interface>.leases` (phase 14b; was a fixed `dnsmasq-wlan0.leases`, the same file for the default LAN), and an explicit value wins; `static = []` (`{ip, mac, reason}`; each IP and MAC once), `grace_seconds = 60`, `poll_seconds = 2.0` |
 | `[policy]` | `rate_limit_ttl_seconds = 300`, `block_ttl_seconds = 300`, `escalation_ttl_multiplier = 2`, `max_ttl_seconds = 3600` (≤ 3600), `sustained_polls = 2` (≥ 2) |
 | `[lab]` | `env_tag = "sandbox"`, `victim_netns = "labvictim"`, `victim_host_interface = "lab0"`, `victim_network = "10.250.0.0/30"` (must be a /30) |
-| `[capture]` additions | `backend` also accepts `"replay"`, which needs `replay_path`. `replay_speed = "max"` (also `"realtime"` or `"<N>x"`). Validation only: core does not read these before phases 15 and 16. |
+| `[capture]` additions | `backend` also accepts `"replay"`, which needs `replay_path`. `replay_speed = "max"` (also `"realtime"` or `"<N>x"`). Phase 15 implements the replay (`pirewall/capture/replay.py`); core selects it from these settings from phase 16. Phase 15 adds `native_max_panics_per_minute = 5` (D6 fallback threshold). |
+| `[flow]` addition (phase 15) | `connection_start_max_tracked = 100000`, the `ConnectionStartTracker` bound (§11). |
 
 **`[guards]` → template variable** (for `render_templates.py`, phase 13).
 Each `{rate, burst}` pair renders into `<VAR>` and `<VAR>_BURST`. Rates are
@@ -342,6 +343,15 @@ actually has them, in phase 14. Until then the stub must not claim them.
 MAC is never a model feature. Phase 14 adds a test that `FEATURE_NAMES`
 contains no MAC or OUI field.
 
+**Phase 15 additions (D6).** The module exports `NativeEngineError` (a
+`RuntimeError` subclass) and `HAS_PANIC_INJECTION`. Every `FlowEngine`
+method and `PacketRing.poll` raise `NativeEngineError` on a caught panic.
+`FlowEngine.panic_stats() -> (panics caught, open flows discarded)`. The
+test-only `FlowEngine._arm_test_panic(site, count)` exists only in a build
+with the `panic-injection` cargo feature, which maturin never enables.
+`pirewall.flow.native` re-raises the error as
+`pirewall.core.exceptions.NativeEngineError`.
+
 ## 11. Connection start — `pirewall/flow/connection_start.py`
 
 D1 counts **connection starts**, not flow records. A record is a connection
@@ -363,8 +373,9 @@ evicting the least recently seen. An evicted tuple seen again counts as a
 new start, which errs toward over-counting and shows up in an eviction
 counter.
 
-`ConnectionStartTracker(max_tracked).observe(flow) -> bool` is a stub.
-**Phase 15** implements it (`pcap_to_flows.py` writes a `connection_start`
+`ConnectionStartTracker(max_tracked).observe(flow) -> bool`, with
+`max_tracked` from `flow.connection_start_max_tracked`.
+**Phase 15** implemented it (`pcap_to_flows.py` writes a `connection_start`
 column), and **phase 17** imports the same class. There is one
 definition: thresholds learned offline must mean the same thing live.
 

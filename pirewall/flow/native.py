@@ -17,9 +17,15 @@ reopen exactly that gap.
 Optional: when the extension is not built (`uv sync --extra native`, see
 docs/ARCHITECTURE.md), `native_engine_available()` is False and the daemon
 uses the Python path.
+
+Every engine call can raise `pirewall.core.exceptions.NativeEngineError`: a
+panic inside the engine, caught there and re-raised here (ADDENDUM_4.md
+D6). The engine has already recovered; what was in flight is lost.
 """
 
 import importlib
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from ipaddress import IPv4Address, IPv4Network
 from typing import TYPE_CHECKING
@@ -28,6 +34,7 @@ from uuid import uuid4
 from pirewall.capture.interfaces import TcpPayload
 from pirewall.config.models import FlowConfig
 from pirewall.core.enums import Protocol
+from pirewall.core.exceptions import NativeEngineError
 from pirewall.core.models.flow import Flow
 from pirewall.flow.aggregator import NewFlowSignal, SlowConnectionCluster
 
@@ -38,18 +45,36 @@ if TYPE_CHECKING:
     )
 
 
-def _load_engine_class() -> "type[FlowEngine] | None":
+def _load_engine_class() -> "tuple[type[FlowEngine], type[Exception]] | None":
     try:
         module = importlib.import_module("pirewall_native")
     except ImportError:  # the extension is optional; see the module docstring
         return None
     # `ModuleType` attributes are `Any` to the type checker; the stub in
-    # typings/pirewall_native.pyi pins what this actually is.
+    # typings/pirewall_native.pyi pins what these actually are.
     engine_class: type[FlowEngine] = module.FlowEngine
-    return engine_class
+    error_class: type[Exception] = module.NativeEngineError
+    return engine_class, error_class
 
 
-_ENGINE_CLASS = _load_engine_class()
+_LOADED = _load_engine_class()
+_ENGINE_CLASS = None if _LOADED is None else _LOADED[0]
+# Never matches anything when the extension is absent (no engine call can run then).
+_NATIVE_ERROR: type[Exception] = NativeEngineError if _LOADED is None else _LOADED[1]
+
+
+@contextmanager
+def translate_native_errors() -> Generator[None]:
+    """Re-raise the extension's `NativeEngineError` as `pirewall.core.exceptions.NativeEngineError`."""
+    try:
+        yield
+    except _NATIVE_ERROR as exc:
+        raise NativeEngineError(str(exc)) from exc
+
+
+def _call[T](call: Callable[[], T]) -> T:
+    with translate_native_errors():
+        return call()
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _TLS_PORT = 443
@@ -188,15 +213,19 @@ class NativeFlowAggregator:
         return self._engine
 
     def __len__(self) -> int:
-        return len(self._engine)
+        return _call(lambda: len(self._engine))
 
     def feed(self, raw: bytes, captured_at: datetime) -> None:
         """Parse and aggregate one frame (replay and tests; live capture feeds from Rust)."""
-        self._engine.feed(raw, to_microseconds(captured_at))
+        self.feed_us(raw, to_microseconds(captured_at))
+
+    def feed_us(self, raw: bytes, ts_us: int) -> None:
+        """`feed` with the engine's own clock: whole microseconds since the Unix epoch."""
+        _call(lambda: self._engine.feed(raw, ts_us))
 
     def drain(self) -> NativeBatch:
         """Take every completed flow, new-flow signal and TLS candidate produced so far."""
-        completed, new_flows, tls = self._engine.drain()
+        completed, new_flows, tls = _call(self._engine.drain)
         return NativeBatch(
             completed=[_flow_from_record(record) for record in completed],
             new_flows=[
@@ -226,15 +255,20 @@ class NativeFlowAggregator:
 
     def counters(self) -> tuple[int, int]:
         """`(packets seen, packets malformed or unsupported)`, cumulative."""
-        return self._engine.counters()
+        return _call(self._engine.counters)
 
     def shed(self) -> tuple[int, int]:
         """`(completed flows, new-flow signals)` discarded by the per-drain caps, cumulative."""
-        return self._engine.shed()
+        return _call(self._engine.shed)
+
+    def panic_stats(self) -> tuple[int, int]:
+        """`(panics caught, open flows discarded recovering from them)`, cumulative."""
+        return _call(self._engine.panic_stats)
 
     def sweep_timeouts(self, now: datetime) -> list[Flow]:
         """Same contract as `FlowAggregator.sweep_timeouts`."""
-        return [_flow_from_record(record) for record in self._engine.sweep(to_microseconds(now))]
+        records = _call(lambda: self._engine.sweep(to_microseconds(now)))
+        return [_flow_from_record(record) for record in records]
 
     def snapshot_slow_connection_clusters(
         self,
@@ -251,16 +285,18 @@ class NativeFlowAggregator:
                 concurrent_count=count,
                 representative_flow=_flow_from_record(record),
             )
-            for source, destination, count, record in self._engine.slow_clusters(
-                to_microseconds(now), min_duration_seconds, max_bytes_per_second, concurrent_threshold
+            for source, destination, count, record in _call(
+                lambda: self._engine.slow_clusters(
+                    to_microseconds(now), min_duration_seconds, max_bytes_per_second, concurrent_threshold
+                )
             )
         ]
 
     def snapshot_open_flow_from(self, source_ip: IPv4Address) -> Flow | None:
         """Same contract as `FlowAggregator.snapshot_open_flow_from`."""
-        record = self._engine.snapshot_open_flow_from(int(source_ip))
+        record = _call(lambda: self._engine.snapshot_open_flow_from(int(source_ip)))
         return None if record is None else _flow_from_record(record)
 
     def flush(self) -> list[Flow]:
         """Same contract as `FlowAggregator.flush`."""
-        return [_flow_from_record(record) for record in self._engine.flush()]
+        return [_flow_from_record(record) for record in _call(self._engine.flush)]

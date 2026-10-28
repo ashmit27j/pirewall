@@ -17,11 +17,23 @@ crate-type = ["cdylib", "rlib"]
 pyo3 = { version = "0.25", features = ["abi3-py312"] }
 libc = "0.2"
 
+[dev-dependencies]
+# Property tests for the parser and the engine (ADDENDUM_4.md D6). The
+# coverage-guided fuzz target lives in native/fuzz/ (cargo-fuzz, nightly).
+proptest = { version = "1", default-features = false, features = ["std"] }
+
 [features]
 extension-module = ["pyo3/extension-module"]
+# Test-only: exposes `FlowEngine._arm_test_panic`, which makes the next
+# engine call panic, so the panic -> NativeEngineError -> fallback path can
+# be exercised end to end. Never enabled by maturin's build (pyproject.toml).
+panic-injection = []
 
 [profile.release]
 lto = "fat"
 codegen-units = 1
 opt-level = 3
-panic = "abort"
+# "unwind", not "abort" (ADDENDUM_4.md D6): every PyO3 entry point runs
+# inside catch_unwind, so a panic becomes a NativeEngineError that core
+# counts and survives, instead of killing pirewall-core outright.
+panic = "unwind"

@@ -93,6 +93,11 @@ class CaptureConfig(PirewallModel):
     # source-level fast path needs far fewer signals than this to see a flood.
     native_max_flows_per_drain: int = Field(default=1_000, gt=0)
     native_max_new_flows_per_drain: int = Field(default=5_000, gt=0)
+    # ADDENDUM_4.md D6: a panic inside the native engine is caught, counted
+    # and costs only the frame or batch in flight. This many within any 60 s
+    # means the engine is not recovering, and the native path is abandoned
+    # for the Python one (`pirewall.flow.fallback`), with a CRITICAL event.
+    native_max_panics_per_minute: int = Field(default=5, gt=0)
 
     @model_validator(mode="after")
     def _check_replay_source(self) -> "CaptureConfig":
@@ -111,6 +116,9 @@ class FlowConfig(PirewallModel):
     inactive_timeout_seconds: int = Field(default=60, gt=0)
     max_flows: int = Field(default=100_000, gt=0)
     cleanup_interval_seconds: int = Field(default=30, gt=0)
+    # Bound on the 5-tuples `ConnectionStartTracker` remembers (V2_CONTRACTS
+    # §11); a forgotten tuple seen again counts as a new start, visibly.
+    connection_start_max_tracked: int = Field(default=100_000, gt=0)
 
 
 class FeaturesConfig(PirewallModel):

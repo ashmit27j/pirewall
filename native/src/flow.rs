@@ -227,7 +227,7 @@ impl FlowState {
         self.packet_size.add(length as f64);
         self.payload_size.add(payload as f64);
         if let Some(previous) = self.last_packet_us {
-            let delta = packet.ts_us - previous;
+            let delta = packet.ts_us.saturating_sub(previous);
             if delta >= 0 {
                 self.inter_arrival.add(delta as f64 / 1e6);
             }
@@ -239,10 +239,13 @@ impl FlowState {
         self.proto == Proto::Tcp && (self.saw_rst || (self.saw_fin_forward && self.saw_fin_backward))
     }
 
+    /// Clock differences saturate rather than overflow: a replayed capture
+    /// can carry any timestamp, and no frame may panic the engine (D6). For
+    /// every clock a real capture produces the result equals plain `-`.
     fn should_close(&self, now_us: i64, active_s: f64, inactive_s: f64) -> bool {
         self.tcp_completed()
-            || (now_us - self.first_seen_us) as f64 / 1e6 >= active_s
-            || (now_us - self.last_seen_us) as f64 / 1e6 >= inactive_s
+            || now_us.saturating_sub(self.first_seen_us) as f64 / 1e6 >= active_s
+            || now_us.saturating_sub(self.last_seen_us) as f64 / 1e6 >= inactive_s
     }
 }
 
@@ -428,6 +431,11 @@ pub struct Engine {
     max_pending_new_flows: usize,
     pub completed_shed: u64,
     pub new_flows_shed: u64,
+    /// Open flows discarded by `recover` after a caught panic (ADDENDUM_4.md D6).
+    pub flows_lost_to_panics: u64,
+    /// Test-only (`panic-injection`): entry point name -> panics still armed.
+    #[cfg(feature = "panic-injection")]
+    armed_panics: HashMap<String, u32>,
 }
 
 fn in_prefix(address: u32, network: u32, prefix: u8) -> bool {
@@ -458,6 +466,35 @@ impl Engine {
             max_pending_new_flows: usize::MAX,
             completed_shed: 0,
             new_flows_shed: 0,
+            flows_lost_to_panics: 0,
+            #[cfg(feature = "panic-injection")]
+            armed_panics: HashMap::new(),
+        }
+    }
+
+    /// Restore the table's invariants after a panic unwound through a call
+    /// holding the engine: the LRU links may be half-updated, so every open
+    /// flow is discarded (and counted). Pending output, counters and limits
+    /// are plain values a panic cannot tear, and are kept.
+    pub fn recover(&mut self) {
+        self.flows_lost_to_panics += self.table.len() as u64;
+        self.table.clear();
+    }
+
+    /// Test-only: make the next `count` calls at `site` panic.
+    #[cfg(feature = "panic-injection")]
+    pub fn arm_panic(&mut self, site: String, count: u32) {
+        self.armed_panics.insert(site, count);
+    }
+
+    /// Test-only: panic here if a panic is armed for `site`.
+    #[cfg(feature = "panic-injection")]
+    pub fn injected_panic(&mut self, site: &str) {
+        if let Some(remaining) = self.armed_panics.get_mut(site) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                panic!("injected test panic at {site}");
+            }
         }
     }
 
@@ -477,6 +514,10 @@ impl Engine {
 
     pub fn len(&self) -> usize {
         self.table.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table.len() == 0
     }
 
     /// `is_routable_unicast`: not unspecified, loopback, multicast,
@@ -504,6 +545,8 @@ impl Engine {
     /// One captured frame through `capture_packets` + `FlowAggregator.process_packet`.
     pub fn feed(&mut self, raw: &[u8], ts_us: i64) {
         self.packets_seen += 1;
+        #[cfg(feature = "panic-injection")]
+        self.injected_panic("feed");
         let packet = match parse::parse(raw, ts_us) {
             Ok(packet) => packet,
             Err(ParseError::Malformed | ParseError::Unsupported) => {
@@ -599,7 +642,7 @@ impl Engine {
         let mut groups: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
         for slot in self.table.slots() {
             let state = &self.table.node(slot).state;
-            let duration = (now_us - state.first_seen_us) as f64 / 1e6;
+            let duration = now_us.saturating_sub(state.first_seen_us) as f64 / 1e6;
             if duration < min_duration_s {
                 continue;
             }

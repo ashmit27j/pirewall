@@ -38,7 +38,7 @@ are regression evidence and are labelled as such.
 | 14 | MAC identity end to end, bindings, anti-spoof, portal binding | Complete | See "Phase 14 details" below. Lease sync runs in core now. Its kernel writes happen only with a set backend, which phase 16 makes the default. Netns tier 31/31 passed, env=sandbox only. `ether saddr` on brcmfmac `wlan0` is Environment-dependent. |
 | 14b | Interim: four live risks on today's v1 Pi (fail-open guards, ML ceiling, lease-file path, portal migration) | Complete | See "Phase 14b details" below. Not a planned phase; approved by the human 2026-10-28. Edits two phase 16 files (deviation 1). Netns tier 31/31, env=sandbox only. Nothing ran on the Pi. |
 | — | Known-issues pass: KNOWN_ISSUES #12, #18, #19, #21 | Complete | See "Known-issues pass (2026-10-28)" below. Not a planned phase. No nft, native or config change. Nothing ran on the Pi. |
-| 15 | Native hardening, pcap reader, replay capture backend | Not started | Prompt: `phase-15-native-hardening-replay.md`. Can run in parallel with 12 and 13. Also implements `pirewall/flow/connection_start.py` (V2_CONTRACTS §11). |
+| 15 | Native hardening, pcap reader, replay capture backend | Complete | See "Phase 15 details" below. `panic = "unwind"` + `catch_unwind` everywhere; fuzzed 2 × 631 s with no crash (env=sandbox). Pcap replay and `pcap_to_flows.py` give rows equal to live features. Live-ring fallback is wired into core by phase 16. The Pi benchmark is written, not run. |
 | 16 | `pirewall-start` v2, deployment templates, systemd, data modes, lab victim | Not started | Prompt: `phase-16-startup-deploy.md`. Depends on 13, 14, 15. Marks **v2.0 deployable**. |
 | 17 | D1 detectors, kernel offender poller, policy engine | Not started | Prompt: `phase-17-detection-policy.md`. Depends on 16. Marks **v2.1 (engine)**. |
 | 18 | Lab harness and data modes | Not started; **prompt not yet written** | Planned in PLAN_v3 §8. `docs/v2/prompts/phase-18-*.md` does not exist yet. |
@@ -683,6 +683,119 @@ phase 15 or 16 forward:
 - calibrating the Isolation Forest threshold, which needs a Pi baseline;
 - KNOWN_ISSUES #6 (demo portal accounts), the operator's step on the Pi;
 - any Pi run.
+
+### Phase 15 details
+
+**Scope** (`docs/v2/prompts/phase-15-native-hardening-replay.md`, ADDENDUM_4.md
+D6/D7). Remove the native engine's crash-to-off-switch path, make the native
+engine the only flow and feature producer for training, and give developers
+a no-root, no-Pi mode. Phase 14's MAC fields were already merged, so nothing
+here re-adds them.
+
+**Gates (2026-10-28, env=sandbox: WSL2 Ubuntu 26.04, x86_64, rustc 1.99.1):**
+- `ruff check .` clean, and `pyright` (strict) 0 errors.
+- `pytest` as `pw` with the rebuilt extension: **1511 passed, 36 skipped**
+  (31 netns tests need root, 3 need `node`, and 2 need the test-only
+  `panic-injection` build, which ran separately below).
+- With the extension rebuilt with `--features panic-injection`: the fallback,
+  parity, replay, pcap-to-flows and native-daemon tests, **49 passed, 0
+  skipped**. The normal build was restored afterwards
+  (`HAS_PANIC_INJECTION = False`).
+- `tests/netns` as root: **31/31 passed** (nothing nft-related changed).
+- `cargo test` (12 unit + 2 property tests, 256 cases each) and
+  `cargo test --features panic-injection` (13 unit + 2 property tests) pass.
+  `cargo clippy --all-targets -D warnings` is clean with and without the
+  feature, and `cargo fmt --check` is clean.
+
+**Fuzz result** (cargo-fuzz 0.13.2, rustc 1.101.0-nightly 2026-10-27,
+libFuzzer, `-max_len=4096`, debug assertions on, env=sandbox WSL2 x86_64):
+
+| Target | Time | Executions | Coverage | Corpus | Crashes |
+|---|---|---|---|---|---|
+| `parse` (`parse::parse`, payload offsets inside the frame) | 631 s | 323,012,479 (511,905/s) | 166 edges, 169 features | 25 inputs | **0** (no artifacts) |
+| `engine` (`Engine::feed` on frame/timestamp sequences, then every query) | 631 s | 59,230,403 (93,867/s) | n/a | 347 inputs | **0** (no artifacts) |
+
+Before the fuzz run, the new `proptest` property found one real panic on
+its first run: `now_us - first_seen_us` overflowed for extreme timestamps
+(`flow.rs`, three places plus `slow_clusters`). Release builds would have
+wrapped silently rather than panicked. These now use `saturating_sub`, which
+is identical to `-` for every clock a real capture produces, so parity is
+unchanged. A replayed pcap can carry any timestamp, which is why it mattered.
+
+| Deliverable | Label | Evidence |
+|---|---|---|
+| 1. `panic = "unwind"`; `catch_unwind` around every PyO3 entry point (`feed`, `drain`, `sweep`, `flush`, `slow_clusters`, `snapshot_open_flow_from`, `counters`, `shed`, `__len__`, `PacketRing.poll`). A panic is `pirewall_native.NativeEngineError`, re-raised as `pirewall.core.exceptions.NativeEngineError` (a `CaptureError`). A lock poisoned by a panic is recovered by discarding the possibly torn table, and the open flows lost are counted (`panic_stats`). | Tested (Rust and Python) | `lib.rs` tests `guarded_turns_a_panic_into_its_message` and `a_panic_while_locked_clears_the_table_and_the_lock_stays_usable`. `test_native_fallback.py::test_a_real_rust_panic_surfaces_as_native_engine_error_and_the_engine_recovers` panics inside Rust at `feed`, `drain` and `sweep` (injection build). The release wheel was used, so `unwind` in the release profile is exercised. |
+| 1. Count, drop the frame or batch, emit `CAPTURE_ERROR`, and after `capture.native_max_panics_per_minute` (default 5) in 60 s fall back to Python with a CRITICAL event: `pirewall/flow/fallback.py` (`NativePanicBudget`, `FallbackFlowEngine`). | Tested for frame feeding (replay, dataset tool); **live ring: Not wired** | `test_native_fallback.py` (8 tests): a sliding-window, sticky budget; one panic costs one frame; a panicking drain costs one batch; too many panics fall back, salvaging pending output and open flows, with every frame counted by one path or the other; and `test_real_rust_panics_drive_the_fallback_to_python` with the real engine. **Live ring path:** the swap to `AFPacketCapture` happens inside `CoreDaemon`, which V2_CONTRACTS §12 gives to phase 16 (deviation 1). Until then a live-ring panic surfaces as a `CaptureError`. The capture loop stops with a CRITICAL `CAPTURE_ERROR`, and core stays up, serving RPC and enforcing. Before this phase the process aborted. |
+| 1. TPACKET_V3 offsets and `snaplen` clamped to the block (`capture.rs::walk_block`: the first-packet offset, `tp_next_offset`, `tp_mac`, `tp_snaplen` and `tp_num_pkts`). A panic mid-block still returns the block to the kernel. | Tested (pure walker); ring itself Environment-dependent | 4 Rust tests over hand-built blocks: well-formed; `snaplen = u32::MAX` clamped; offsets out of the block end the walk; a packet count beyond the chain. The kernel ring path (`PacketRing.poll`) was not run here (no `CAP_NET_RAW` tier). Verify on the Pi with `benchmarks/v2-native-pi/run.sh`. |
+| 1. Fuzz target for `parse::parse` (and the engine), run ≥ 10 min | Tested (env=sandbox) | `native/fuzz/` and the table above. `native/tests/properties.rs` covers the same claims on every `cargo test`. |
+| 2. `pirewall/capture/pcapio.py`: stdlib pcap reader (both byte orders, µs/ns) and pcapng reader (SHB in either byte order, IDB `if_tsresol`/`if_tsoffset`, EPB, obsolete PB; SPB skipped and counted; non-Ethernet skipped and counted; snaplen-truncated records kept and counted; a cut-off tail ends cleanly; absurd lengths refused). Classic pcap writer, µs or ns. | Tested | `test_pcapio.py` (18 tests). Fixtures are generated in the test with the writer, or packed block by block for pcapng; no binaries are committed. |
+| 3. `capture.backend = "replay"`: `ReplayCapture` (`FlowCapture`, feeds the same `NativeFlowAggregator`) and `ReplayPacketCapture` (`PacketCapture`, Python path). Speeds `max` / `realtime` / `<N>x` on a virtual clock (pacing never touches timestamps); optional rebasing by one constant; a directory is one capture in name order. `build_replay_capture(config)` returns core's `(capture, native_aggregator)` pair. | Tested | `test_replay.py` (19 tests, fake wall clock): order, pacing at 1× and 4×, idle behaviour when finished, rebasing, stop, protocol conformance, determinism on both paths, and native == Python on the same pcap. `test_core_daemon_replay.py` runs the **whole `CoreDaemon` on a replay** (fake backend, no root, no nft) on the native and the Python path, through to the flow and its assessment over the real RPC socket. Selecting it from `capture.backend` inside core is phase 16's. |
+| 4. `scripts/dataset/pcap_to_flows.py`: replays through the engine with the runtime flow config, sweeping on the capture clock every `cleanup_interval_seconds`. Rows hold the schema features, metadata (capture file, MACs, 5-tuple, first/last seen) and `connection_start`. Optional `ground_truth.jsonl` labels (MAC + window → label, else `benign`, or `unlabelled` with `--strict`). `manifest.json` records input SHA-256s, the engine and its version, panics, the config and its SHA-256, the env tag (D7) and row counts. | Tested (CSV); Parquet **Not yet validated** | `test_pcap_to_flows_parity.py` (11 tests): manifest contents, the config hash moving only with a row-shaping setting, labels (case-insensitive MAC, strict, no match), bad ground truth refused with its line number, and the CLI. pyarrow is installed in no environment here, so the Parquet branch has not run. |
+| 4. `ConnectionStartTracker` (V2_CONTRACTS §11), bound `flow.connection_start_max_tracked` (default 100000). | Tested | `test_connection_start.py` (6 tests): timeout splits count once, a responder-opened record is remembered, UDP/ICMP are never starts, and LRU eviction over-counts visibly. The phase-11 stub test now pins the interface. |
+| 5. Parity proof | Tested | `test_pcap_to_flows_rows_equal_live_path_feature_vectors` (3 seeds, µs and ns pcaps, ~1,200 sessions each). Rows read back from the CSV equal, float for float, `extract_features` of the flows from `FlowEngine.feed` driven as the ring drives it, with the same drain and sweep cadence. The connection-start flag and metadata match too. `test_the_python_engine_produces_the_same_rows`: `--engine python` gives identical rows. |
+| 6. `benchmarks/v2-native-pi/run.sh` (+ `gen_pcap.py`, README) | **Environment-dependent; not run** | Generates deterministic SYN and UDP floods. Replays them at fixed rates with `tcpreplay` across its own netns/veth, and measures both paths with and without GIL contention using the existing `bench_capture.py`. `ENV_TAG` defaults to `sandbox` and must be set to `pi-scripted` to claim a Pi result. Only the generator was smoke-run (1,000 frames, parsed back). No benchmark number exists. |
+
+**Audit items:** "native panic=abort" (audit §0, #17's new trigger) is
+**fixed** in the engine. Its last step, the live ring's fallback, is
+phase 16 wiring. v1 #4 (train/serve skew) is **fixed in tooling**: training
+rows now come from the runtime engine and extractor. The retraining itself
+is phase 19.
+
+**Deviations and choices:**
+
+1. **`runtime/core.py` not edited** (V2_CONTRACTS §12: "Phase 15 … must not
+   edit `runtime/core.py`. Its `ReplayCapture` is wired into capture
+   selection by phase 16"). The prompt's "plugs into CoreDaemon capture
+   selection" is met by `build_replay_capture`, which returns exactly what
+   `CoreDaemon(capture=…, native_aggregator=…)` takes, and is proven
+   end to end by injection. Handed to phase 16:
+   * select replay from `capture.backend`;
+   * in `_native_capture_loop`, catch `NativeEngineError` from `poll` and
+     `drain`, count it in a `NativePanicBudget`, and swap to
+     `AFPacketCapture` + `FlowAggregator` when it is exhausted;
+   * report `panics_caught` in `EngineStats`;
+   * at `max` replay speed, sweep on `ReplayCapture.virtual_now_us` rather
+     than the wall clock.
+2. **Files outside the phase-15 list**, all additive. Phase 14 (owner of
+   `pirewall/capture/**` and `pirewall/flow/**`) is complete. The files:
+   * new `pirewall/flow/fallback.py`;
+   * error translation in `pirewall/flow/native.py` and
+     `pirewall/capture/native.py` (plus `NativeFlowAggregator.feed_us` and
+     `panic_stats`);
+   * `NativeEngineError` in `pirewall/core/exceptions.py`;
+   * the stub in `typings/pirewall_native.pyi`;
+   * two config keys (models, `default_config.toml`; `[flow]` and
+     `[capture]` are not v2 sections, so `migrate_config.py` needs nothing);
+   * `tests/helpers/traffic.py`;
+   * doc additions in `docs/ARCHITECTURE.md` and `docs/V2_CONTRACTS.md`
+     (§8, §10, §11, additive).
+3. **The dataset tool feeds through `FallbackFlowEngine`.** If the engine
+   ever panicked mid-dataset, the rows would still come from code with
+   identical semantics (the parity test), and the manifest records
+   `panics_caught` and `fell_back_to_python`. Any non-zero value there
+   means the flows open at the switch were closed early, so check it before
+   training.
+4. **Clock semantics, chosen and documented.** Replay pacing never alters
+   timestamps, so features are speed-independent. `pcap_to_flows` sweeps on
+   the capture clock. Each input file is its own stream unless
+   `--continuous`. Labels match a window by source **or** destination MAC
+   and time overlap.
+5. **Rust test and dev tooling:** `proptest` (dev-dependency) and
+   `libfuzzer-sys` (separate `native/fuzz` crate). Neither reaches the
+   wheel or the Pi. Recorded in `docs/ARCHITECTURE.md`.
+6. **Environment set-up, not product changes.**
+   * Installed a Rust toolchain (stable 1.99.1 + nightly + cargo-fuzz) for
+     WSL user `pw`.
+   * `cargo test` links libpython, so it needs `PYO3_PYTHON` and
+     `LD_LIBRARY_PATH` (see `native/fuzz/README.md`).
+   * A root-owned `native/target/` from an earlier session blocks `pw`'s
+     build, so `CARGO_TARGET_DIR` points elsewhere.
+
+**Not done here, by design:**
+- detection, D1 detectors and ML training (phases 17 and 19);
+- `pirewall-start` and `--data-mode mock` (phase 16);
+- the mock pcap generator (phase 18). The writer it needs exists.
+- any Pi run, including the benchmark.
 
 ### Known-issues pass (2026-10-28)
 

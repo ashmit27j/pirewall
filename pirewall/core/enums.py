@@ -86,6 +86,8 @@ class SecurityEventType(StrEnum):
     FIREWALL_ERROR = "firewall_error"
     AUTHENTICATION_FAILURE = "authentication_failure"
     SYSTEM_WARNING = "system_warning"
+    # Phase 17 (ADDENDUM_4.md D4): one v2 policy-table decision, before validation.
+    POLICY_DECISION = "policy_decision"
 
 
 class EventSeverity(StrEnum):

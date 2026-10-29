@@ -79,11 +79,16 @@ class PortalService:
         on_event: Callable[[SecurityEvent], None],
         now_fn: Callable[[], datetime] = lambda: datetime.now(UTC),
         bindings: BindingTable | None = None,
+        on_login_failure: Callable[[str, IPv4Address, str | None, datetime], None] | None = None,
     ) -> None:
         """`bindings` makes sessions MAC-bound (module docstring); pirewall-core always passes one.
 
         Without it, sessions and grants are IP-only, the pre-v2 behaviour.
+        `on_login_failure(account, client_ip, client_mac, at)` is told of
+        every wrong-password attempt (phase 17's D1 portal detector); it
+        receives the account name, never the password.
         """
+        self._on_login_failure = on_login_failure
         self._config = config
         self._bindings = bindings
         self._manager = manager
@@ -154,6 +159,8 @@ class PortalService:
 
         if not self._store.verify(username, password):
             newly_locked = self._throttle.record_failure(client_ip, now, username)
+            if self._on_login_failure is not None:
+                self._on_login_failure(username, client_ip, client_mac, now)
             self._emit(
                 EventSeverity.WARNING,
                 SecurityEventType.AUTHENTICATION_FAILURE,

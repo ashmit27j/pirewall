@@ -227,6 +227,16 @@ class SetBackend(Protocol):
         """Element count and declared size."""
         ...
 
+    def read_counters(
+        self,
+        names: Iterable[str],
+        *,
+        table: str = nft_names.STATIC_TABLE,
+        family: str = nft_names.INET_FAMILY,
+    ) -> dict[str, int]:
+        """Packet counts of these named counters (phase 17's kernel poller). Missing ones are omitted."""
+        ...
+
     def set_guard_modes(self, modes: Mapping[GuardName, GuardMode]) -> None:
         """Replace these guards' verdict chains (`counter` + `drop`, or `counter` alone) in ONE batch."""
         ...

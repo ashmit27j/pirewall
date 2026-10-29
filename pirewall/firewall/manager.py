@@ -161,9 +161,19 @@ class _SerializedSetBackend:
         with self._lock:
             return self._backend.list_set(set_name, table=table, family=family)
 
-    def set_fill(self, set_name: str) -> SetFill:
+    def set_fill(self, set_name: str, *, table: str = nft_names.ADAPTIVE_TABLE) -> SetFill:
         with self._lock:
-            return self._backend.set_fill(set_name)
+            return self._backend.set_fill(set_name, table=table)
+
+    def read_counters(
+        self,
+        names: Iterable[str],
+        *,
+        table: str = nft_names.STATIC_TABLE,
+        family: str = nft_names.INET_FAMILY,
+    ) -> dict[str, int]:
+        with self._lock:
+            return self._backend.read_counters(names, table=table, family=family)
 
     def set_guard_modes(self, modes: Mapping[GuardName, GuardMode]) -> None:
         with self._lock:
@@ -1071,6 +1081,37 @@ class FirewallManager:
         if sets is None:
             raise FirewallError("set fill needs the v2 set backend")
         return sets.set_fill(set_name)
+
+    # ---------------------------------------------- read-only kernel views (phase 17)
+
+    def kernel_offenders(self) -> list[tuple[str, int]]:
+        """`@offenders` as (MAC, offender code) pairs, for the tier-K poller. Reads only.
+
+        The kernel is the set's only writer (D1); this never writes it.
+        """
+        sets = self.__sets
+        if sets is None:
+            return []
+        found: list[tuple[str, int]] = []
+        for state in sets.list_set(
+            nft_names.SET_OFFENDERS, table=nft_names.STATIC_TABLE, family=nft_names.INET_FAMILY
+        ):
+            key = state.key
+            if isinstance(key, tuple) and key[1].isdigit():
+                found.append((key[0], int(key[1])))
+        return found
+
+    def kernel_counters(self, names: Iterable[str]) -> dict[str, int]:
+        """Packet counts of named `pirewall_static` counters. Reads only; {} on the v1 path."""
+        sets = self.__sets
+        return {} if sets is None else sets.read_counters(names)
+
+    def kernel_set_fill(self, table: str, set_name: str) -> SetFill:
+        """How full one `inet` set in `table` is (adaptive or static). Reads only."""
+        sets = self.__sets
+        if sets is None:
+            raise FirewallError("set fill needs the v2 set backend")
+        return sets.set_fill(set_name, table=table)
 
     def set_backend_metrics(self) -> TransportMetrics | None:
         """The set backend's transport and counters, or None on the v1 path."""

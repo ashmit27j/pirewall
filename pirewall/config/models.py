@@ -707,11 +707,58 @@ class PolicyConfig(PirewallModel):
     # Consecutive 1 s polls an enforce-mode offender must persist before it
     # may cause RATE_LIMIT. Never below 2 (critique_round2.md item 6).
     sustained_polls: int = Field(default=2, ge=2)
+    # The reviewable policy table (D4): data, not code (phase 17).
+    table_path: str = Field(default="pirewall/policy/table.toml", min_length=1)
+    # Per-device escalation memory (strikes, evidence ids already acted on).
+    max_tracked_devices: int = Field(default=4096, gt=0)
+    max_evidence_ids_per_device: int = Field(default=256, gt=0)
 
     @model_validator(mode="after")
     def _check_ttls_within_cap(self) -> "PolicyConfig":
         if max(self.rate_limit_ttl_seconds, self.block_ttl_seconds) > self.max_ttl_seconds:
             raise ValueError("policy TTLs must not exceed policy.max_ttl_seconds")
+        return self
+
+
+class D1Config(PirewallModel):
+    """The v2 deterministic detectors and kernel poller (ADDENDUM_4.md D4, PLAN_FINAL §4.5; phase 17).
+
+    Thresholds are not here: they are learned from benign traffic and live
+    in `thresholds_path` (`pirewall.detection_v2.thresholds`). These are the
+    bounds and shapes of the detector state.
+    """
+
+    thresholds_path: str = Field(default="config/d1_thresholds.toml", min_length=1)
+    # Sliding windows, seconds. 10 s and 60 s are required; 1 h is optional
+    # and cuttable (PLAN_FINAL cut order), so it is opt-in.
+    windows_seconds: tuple[int, ...] = (10, 60)
+    # Bounded state (LRU per MAC, per destination), with eviction counters.
+    max_tracked_macs: int = Field(default=4096, gt=0)
+    max_tracked_destinations: int = Field(default=4096, gt=0)
+    max_events_per_mac: int = Field(default=4096, gt=0)
+    max_tracked_accounts: int = Field(default=1024, gt=0)
+    # Each MAC is evaluated at most this often from the detection thread.
+    evaluation_cooldown_seconds: float = Field(default=1.0, ge=0.0)
+    # Brute force: short, similar-size connection starts to one of these
+    # ports (the portal's listen port is added at runtime).
+    brute_force_ports: tuple[int, ...] = (22, 80, 443, 8080)
+    brute_force_max_duration_seconds: float = Field(default=5.0, gt=0.0)
+    # "Similar size": within this fraction of the window's median bytes.
+    brute_force_size_tolerance: float = Field(default=0.25, gt=0.0, le=1.0)
+    # The failed-handshake ratio is meaningless on a handful of starts.
+    failed_handshake_min_starts: int = Field(default=10, gt=0)
+    # Kernel poller (tier K).
+    kernel_poll_interval_seconds: float = Field(default=1.0, gt=0.0)
+    set_fill_warning_ratio: float = Field(default=0.8, gt=0.0, le=1.0)
+    # Remembered MACs/leases for the new-MAC and new-lease rates.
+    max_known_macs: int = Field(default=16_384, gt=0)
+
+    @model_validator(mode="after")
+    def _check_windows(self) -> "D1Config":
+        if not {10, 60} <= set(self.windows_seconds):
+            raise ValueError("d1.windows_seconds must include 10 and 60")
+        if any(window <= 0 for window in self.windows_seconds):
+            raise ValueError("d1.windows_seconds must be positive")
         return self
 
 
@@ -763,6 +810,7 @@ class PirewallConfig(PirewallModel):
     guards: GuardsConfig = Field(default_factory=GuardsConfig)
     antispoof: AntispoofConfig = Field(default_factory=AntispoofConfig)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
+    d1: D1Config = Field(default_factory=D1Config)
     lab: LabConfig = Field(default_factory=LabConfig)
 
     @model_validator(mode="after")

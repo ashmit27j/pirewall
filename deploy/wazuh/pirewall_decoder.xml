@@ -1,0 +1,85 @@
+<!--
+  Wazuh decoder and rules for pirewall's v2 event JSON (phase 17,
+  PLAN_FINAL §4.8 "Wazuh decoder written for the v2 event JSON").
+
+  pirewall-core sends one JSON object per line to Wazuh's remote syslog
+  collector (pirewall/integration/wazuh.py; docs/DEPLOYMENT.md §8). Every
+  object carries "source": "pirewall" (keys are sorted, so not necessarily
+  first), which is what the decoder keys on; Wazuh's JSON_Decoder then exposes every field (event_type, severity,
+  decision, mac, engine, policy_decision_id, evidence_ids,
+  requires_approval, source_ip, reason, ...) to the rules below.
+
+  Install on the Wazuh manager (Admin PC):
+    sudo cp pirewall_decoder.xml /var/ossec/etc/decoders/pirewall_decoder.xml
+    sudo cp pirewall_decoder.xml /var/ossec/etc/rules/pirewall_rules.xml
+    sudo /var/ossec/bin/wazuh-logtest     # paste a pirewall line to check
+    sudo systemctl restart wazuh-manager
+  (The file holds both the decoder and the rule group; Wazuh reads each
+  part from the directory it belongs to and ignores the other.)
+
+  Environment-dependent: not loaded into a real Wazuh manager in this
+  repository; tests/unit/test_wazuh_decoder.py checks it is well-formed and
+  that every field and event type it names is one pirewall emits.
+-->
+<decoder name="pirewall">
+  <prematch type="pcre2">^\{.*"source": "pirewall"</prematch>
+  <plugin_decoder>JSON_Decoder</plugin_decoder>
+</decoder>
+
+<group name="pirewall,">
+  <rule id="100700" level="0">
+    <decoded_as>pirewall</decoded_as>
+    <description>pirewall: event</description>
+  </rule>
+
+  <!-- v2 policy-table decisions (ADDENDUM_4.md D4). -->
+  <rule id="100710" level="4">
+    <if_sid>100700</if_sid>
+    <field name="event_type" type="pcre2">^policy_decision$</field>
+    <description>pirewall: policy decision $(decision) for $(mac)</description>
+  </rule>
+  <rule id="100711" level="8">
+    <if_sid>100710</if_sid>
+    <field name="decision" type="pcre2">^rate_limit$</field>
+    <description>pirewall: device $(mac) rate-limited by the policy table</description>
+  </rule>
+  <rule id="100712" level="10">
+    <if_sid>100710</if_sid>
+    <field name="decision" type="pcre2">^block$</field>
+    <description>pirewall: device $(mac) blocked by the policy table</description>
+  </rule>
+  <rule id="100713" level="9">
+    <if_sid>100712</if_sid>
+    <field name="requires_approval" type="pcre2">^true$</field>
+    <description>pirewall: BLOCK of $(mac) waiting in the approval queue</description>
+  </rule>
+
+  <!-- Rule lifecycle (both engines). -->
+  <rule id="100720" level="6">
+    <if_sid>100700</if_sid>
+    <field name="event_type" type="pcre2">^rule_deployed$</field>
+    <description>pirewall: adaptive element deployed ($(decision))</description>
+  </rule>
+  <rule id="100721" level="3">
+    <if_sid>100700</if_sid>
+    <field name="event_type" type="pcre2">^rule_rejected$</field>
+    <description>pirewall: candidate refused by the validator: $(reason)</description>
+  </rule>
+
+  <!-- Health and safety. -->
+  <rule id="100730" level="7">
+    <if_sid>100700</if_sid>
+    <field name="event_type" type="pcre2">^system_warning$</field>
+    <description>pirewall: $(reason)</description>
+  </rule>
+  <rule id="100731" level="12">
+    <if_sid>100700</if_sid>
+    <field name="severity" type="pcre2">^critical$</field>
+    <description>pirewall CRITICAL: $(reason)</description>
+  </rule>
+  <rule id="100732" level="5">
+    <if_sid>100700</if_sid>
+    <field name="event_type" type="pcre2">^authentication_failure$</field>
+    <description>pirewall: authentication failure: $(reason)</description>
+  </rule>
+</group>

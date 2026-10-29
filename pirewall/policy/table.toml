@@ -1,0 +1,78 @@
+# The v2 policy table (ADDENDUM_4.md D4, PLAN_FINAL §4.6). Data, not code:
+# review it here. pirewall.policy.table validates it at startup, and
+# tests/unit/test_policy_matrix.py checks every evidence combination against
+# the D4 ceilings.
+#
+# Cells name actions:
+#   "log"             SHADOW (A1): the decision is computed from the ACTIVE
+#                     column and recorded SHADOWED; nothing is written.
+#   "monitor"         MONITOR: recorded and reported, no kernel element.
+#   "rate_limit"      RATE_LIMIT the device, policy.rate_limit_ttl_seconds.
+#   "block"           BLOCK the device, policy.block_ttl_seconds.
+#   "block_approval"  a BLOCK held in the A7 approval queue (ASSISTED).
+# A row with escalate = true multiplies the BLOCK TTL by
+# policy.escalation_ttl_multiplier per earlier enforcing D1 decision on the
+# same device, capped at policy.max_ttl_seconds. It only matches on NEW
+# independent evidence.
+#
+# When several rows match one device, the strongest action wins.
+# Hard ceilings the loader refuses to let this file break:
+#   ml_only, k_observe and k_enforce_pending  ->  at most "monitor".
+
+version = 1
+
+[d1]
+# D1 detectors by certainty. Aggregate detectors with no single device
+# (fan_in, new_mac_rate, new_lease_rate, LAN-wide portal failures) are
+# reported, never acted on.
+high = ["vertical_scan", "horizontal_scan", "brute_force"]
+standard = ["failed_handshake", "slow_rate_dos", "portal_auth_failures"]
+
+[[row]]
+evidence = "k_observe"           # @offenders from an observe-mode guard
+shadow = ["log"]
+assisted = ["monitor"]
+active = ["monitor"]
+
+[[row]]
+evidence = "k_enforce_pending"   # enforce-mode guard, not yet policy.sustained_polls
+shadow = ["log"]
+assisted = ["monitor"]
+active = ["monitor"]
+
+[[row]]
+evidence = "k_enforce_sustained" # enforce-mode guard, >= policy.sustained_polls
+shadow = ["log"]
+assisted = ["rate_limit"]
+active = ["rate_limit"]
+
+[[row]]
+evidence = "d1_high"             # fast scan, brute force
+shadow = ["log"]
+assisted = ["rate_limit", "block_approval"]
+active = ["block"]
+
+[[row]]
+evidence = "d1_standard"         # failed handshakes, slow-rate DoS, one account's portal failures
+shadow = ["log"]
+assisted = ["rate_limit"]
+active = ["rate_limit"]
+
+[[row]]
+evidence = "d1_escalated"        # D1 + sustained enforce-mode K, or D1 repeated with new evidence
+shadow = ["log"]
+assisted = ["block_approval"]
+active = ["block"]
+escalate = true
+
+[[row]]
+evidence = "ml_only"             # D2 and/or D3 with no D1
+shadow = ["log"]
+assisted = ["monitor"]
+active = ["monitor"]
+
+[[row]]
+evidence = "ml_with_d1"          # D2/D3 corroborating D1
+shadow = ["log"]
+assisted = ["rate_limit"]
+active = ["rate_limit"]

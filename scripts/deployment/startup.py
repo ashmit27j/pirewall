@@ -66,11 +66,20 @@ from pirewall.config.loader import load_config
 from pirewall.config.models import PirewallConfig
 from pirewall.core import nft_names
 from pirewall.core.bindings import LeaseBindingTable, static_bindings
-from pirewall.core.enums import EnvTag, EventSeverity, GuardMode, GuardName, PipelineEngine, SecurityEventType
+from pirewall.core.enums import (
+    EnforcementMode,
+    EnvTag,
+    EventSeverity,
+    GuardMode,
+    GuardName,
+    PipelineEngine,
+    SecurityEventType,
+)
 from pirewall.core.exceptions import ConfigurationError, FirewallError, IntegrationError, RpcError
 from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.model_metadata import ModelMetadata
 from pirewall.core.passwords import hash_password
+from pirewall.detection_v2.thresholds import load_thresholds
 from pirewall.firewall.allowlist_store import AllowlistStore
 from pirewall.firewall.backend.nftables import NftablesBackend
 from pirewall.firewall.backend.nftables_sets import NftablesSetBackend
@@ -249,6 +258,28 @@ def check_models(config: PirewallConfig, repo_root: Path = REPO_ROOT) -> list[Mo
     return checks
 
 
+def _d1_thresholds_finding(config: PirewallConfig, repo_root: Path) -> Finding:
+    """`engine = "v2"` in ASSISTED/ACTIVE needs a valid D1 thresholds file (phase 17); SHADOW warns."""
+    path = Path(config.d1.thresholds_path)
+    if not path.is_absolute():
+        path = repo_root / path
+    try:
+        thresholds = load_thresholds(path)
+    except ConfigurationError as exc:
+        if config.firewall.enforcement_mode is EnforcementMode.SHADOW:
+            return Finding("warn", f"{exc}; SHADOW runs on the documented D1 floors")
+        return Finding(
+            "refuse",
+            f"engine v2 in {config.firewall.enforcement_mode.value} mode needs the D1 thresholds: {exc}",
+            "Write it with `uv run python -m scripts.train.fit_d1_thresholds --floors-only`, or fit it "
+            "from benign pcap_to_flows output (RUNBOOK H20).",
+        )
+    state = "frozen" if thresholds.frozen else "not frozen"
+    source = thresholds.provenance.get("source", "fitted")
+    count = len(thresholds.thresholds)
+    return Finding("ok", f"D1 thresholds {path.name}: {count} entries, {source}, {state}")
+
+
 def requested_engine(config: PirewallConfig, engine: str | None) -> PipelineEngine:
     return PipelineEngine(engine) if engine is not None else config.pipeline.engine
 
@@ -271,13 +302,14 @@ def preflight(
         findings.append(
             Finding(
                 "refuse",
-                f"pipeline engine {chosen.value!r} is not implemented yet (the v2 policy engine ships "
-                "in phase 17)",
-                "Run with --engine v1, or leave [pipeline] engine = \"v1\" in the config.",
+                f"pipeline engine {chosen.value!r} is not implemented in this pirewall-core",
+                "Run with --engine v1 or --engine v2.",
             )
         )
     else:
         findings.append(Finding("ok", f"pipeline engine {chosen.value}"))
+    if chosen is PipelineEngine.V2:
+        findings.append(_d1_thresholds_finding(config, repo_root))
 
     if not mock:
         try:

@@ -275,13 +275,29 @@ def test_repeated_native_panics_fall_back_to_the_python_capture_path(
         daemon.stop()
 
 
-def test_an_engine_this_core_does_not_have_is_refused_at_construction(workdir: Path) -> None:
-    config = _config(workdir, pipeline={"engine": PipelineEngine.V2.value})
+def test_engine_v2_is_implemented_but_assisted_needs_the_d1_thresholds(workdir: Path) -> None:
+    missing = str(workdir / "no_thresholds.toml")
+    config = _config(
+        workdir,
+        pipeline={"engine": PipelineEngine.V2.value},
+        d1={"thresholds_path": missing},
+        firewall={"enforcement_mode": "assisted"},
+    )
 
-    with pytest.raises(ConfigurationError, match="phase 17"):
-        check_engine_implemented(config)
-    with pytest.raises(ConfigurationError):
+    check_engine_implemented(config)  # v2 ships in phase 17
+    with pytest.raises(ConfigurationError, match="D1 thresholds"):
         _daemon(config, None)
+
+
+def test_engine_v2_in_shadow_falls_back_to_the_floors(workdir: Path) -> None:
+    config = _config(
+        workdir, pipeline={"engine": PipelineEngine.V2.value}, d1={"thresholds_path": str(workdir / "none")}
+    )
+
+    daemon = _daemon(config, FakeSetBackend(lambda: datetime.now(UTC)))
+
+    assert daemon.v2_pipeline is not None
+    assert daemon.v2_pipeline.d1.thresholds.provenance["source"] == "floors"
 
 
 def test_mock_firewall_runs_on_fakes_without_any_injection(workdir: Path) -> None:

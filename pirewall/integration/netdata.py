@@ -35,7 +35,7 @@ def snapshot_to_metrics(snapshot: NetdataMetricsSnapshot) -> dict[str, float]:
     gauges are numeric-only.
     """
     prefix = _METRIC_PREFIX
-    return {
+    metrics = {
         f"{prefix}.cpu_percent": snapshot.cpu_percent,
         f"{prefix}.memory_percent": snapshot.memory_percent,
         f"{prefix}.packet_rate_per_second": snapshot.packet_rate_per_second,
@@ -58,6 +58,11 @@ def snapshot_to_metrics(snapshot: NetdataMetricsSnapshot) -> dict[str, float]:
         ),
         f"{prefix}.adaptive_rule_budget_fraction": snapshot.adaptive_rule_budget_fraction,
     }
+    if snapshot.v2 is not None:
+        # Phase 17: re-sourced from the kernel poller and the v2 engine.
+        gauges = snapshot.v2.model_dump().items()
+        metrics.update({f"{prefix}.v2.{name}": float(value) for name, value in gauges})
+    return metrics
 
 
 class NetdataExporter:

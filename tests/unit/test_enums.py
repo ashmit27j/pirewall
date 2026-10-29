@@ -63,6 +63,7 @@ def test_security_event_type_values() -> None:
         "firewall_error",
         "authentication_failure",
         "system_warning",
+        "policy_decision",
     }
 
 

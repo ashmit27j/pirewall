@@ -79,6 +79,17 @@ def format_event(event: SecurityEvent) -> dict[str, object]:
         payload["reason"] = event.reason
     if event.model_version is not None:
         payload["model_version"] = event.model_version
+    # v2 policy fields (phase 17); `deploy/wazuh/pirewall_decoder.xml` matches them.
+    if event.mac is not None:
+        payload["mac"] = event.mac
+    if event.engine is not None:
+        payload["engine"] = event.engine.value
+    if event.policy_decision_id is not None:
+        payload["policy_decision_id"] = event.policy_decision_id
+    if event.evidence_ids:
+        payload["evidence_ids"] = list(event.evidence_ids)
+    if event.requires_approval is not None:
+        payload["requires_approval"] = event.requires_approval
     return payload
 
 

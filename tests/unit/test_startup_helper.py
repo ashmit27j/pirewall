@@ -211,11 +211,33 @@ def test_a_matching_hash_passes_and_a_missing_one_only_warns(tmp_path: Path, pro
     assert any("records no artifact_sha256" in f.message and f.level == "warn" for f in findings)
 
 
-def test_engine_v2_is_refused_until_phase_17(tmp_path: Path, proc: Path) -> None:
-    refusals = _refusals(_preflight(_config(tmp_path), _probe(proc), engine=PipelineEngine.V2.value))
+def test_engine_v2_runs_on_the_shipped_thresholds(tmp_path: Path, proc: Path) -> None:
+    findings = _preflight(_config(tmp_path), _probe(proc), engine=PipelineEngine.V2.value)
+
+    assert _refusals(findings) == []
+    assert any("D1 thresholds d1_thresholds.toml" in finding.message for finding in findings)
+
+
+def test_engine_v2_in_assisted_without_thresholds_is_refused(tmp_path: Path, proc: Path) -> None:
+    config = _config(
+        tmp_path,
+        firewall={"enforcement_mode": "assisted"},
+        d1={"thresholds_path": str(tmp_path / "missing.toml")},
+    )
+
+    refusals = _refusals(_preflight(config, _probe(proc), engine=PipelineEngine.V2.value))
 
     assert len(refusals) == 1
-    assert "phase 17" in refusals[0]
+    assert "D1 thresholds" in refusals[0]
+
+
+def test_engine_v2_in_shadow_without_thresholds_only_warns(tmp_path: Path, proc: Path) -> None:
+    config = _config(tmp_path, d1={"thresholds_path": str(tmp_path / "missing.toml")})
+
+    findings = _preflight(config, _probe(proc), engine=PipelineEngine.V2.value)
+
+    assert _refusals(findings) == []
+    assert any(finding.level == "warn" and "D1 floors" in finding.message for finding in findings)
 
 
 @pytest.mark.parametrize("data_mode", ["live", "scripted"])

@@ -128,11 +128,14 @@ from pirewall.capture.parser import extract_tcp_payload
 from pirewall.capture.pipeline import capture_packets
 from pirewall.capture.replay import ReplayCapture, ReplayPacketCapture, build_replay_capture
 from pirewall.config.models import PirewallConfig
+from pirewall.core import nft_names
 from pirewall.core.binding_table import BindingTable
 from pirewall.core.bindings import LeaseBindingTable, static_bindings
 from pirewall.core.enums import (
+    EnforcementMode,
     EventSeverity,
     FailureMode,
+    GuardMode,
     GuardName,
     PipelineEngine,
     Protocol,
@@ -159,6 +162,8 @@ from pirewall.detection.tls_fingerprint import (
     match_known_tool,
 )
 from pirewall.detection.tls_heartbeat import check_heartbleed
+from pirewall.detection_v2.kernel import KernelPoller
+from pirewall.detection_v2.thresholds import D1ThresholdFile, floors_file, load_thresholds
 from pirewall.firewall.allowlist_store import AllowlistStore
 from pirewall.firewall.backend.fake import FakeFirewallBackend
 from pirewall.firewall.backend.fake_sets import FakeSetBackend
@@ -177,15 +182,17 @@ from pirewall.ipc.dispatcher import CoreRpcDispatcher
 from pirewall.ipc.portal_dispatcher import PortalRpcDispatcher
 from pirewall.ipc.portal_service import PortalService
 from pirewall.ipc.protocol import RpcRequest, RpcResponse
-from pirewall.ipc.protocol_v2 import EngineStats
+from pirewall.ipc.protocol_v2 import EngineStats, OffenderEntry
 from pirewall.ipc.server import UnixSocketRpcServer
 from pirewall.ipc.snapshots import V2Snapshots
 from pirewall.ipc.state import CoreStateStore
+from pirewall.policy.table import load_policy_table
 from pirewall.portal.store import PortalUserStore
 from pirewall.runtime.forwarder import EventForwarder
 from pirewall.runtime.lease_sync import LeaseSync
 from pirewall.runtime.metrics import MetricsCollector, RuntimeCounters
 from pirewall.runtime.pipeline import FlowPipeline, PendingAnomalyScoring
+from pirewall.runtime.pipeline_v2 import V2Pipeline
 from pirewall.runtime.watchdog import SystemdNotifier
 
 _logger = logging.getLogger(__name__)
@@ -235,10 +242,10 @@ _BACKPRESSURE_REPORT_INTERVAL = 1000
 # ADDENDUM_4.md D5: "core checks every second that both tables exist".
 _V2_WATCH_INTERVAL_SECONDS = 1.0
 
-# The pipelines this core can run. `pipeline.engine = "v2"` is phase 17's
-# policy engine; until it ships, a config asking for it is refused at
-# startup rather than silently run as v1 (`check_engine_implemented`).
-IMPLEMENTED_ENGINES: frozenset[PipelineEngine] = frozenset({PipelineEngine.V1})
+# The pipelines this core can run: v1 (the merged-main baseline) and,
+# since phase 17, v2 (the policy engine). A config naming anything else is
+# refused at startup rather than silently run as something else.
+IMPLEMENTED_ENGINES: frozenset[PipelineEngine] = frozenset({PipelineEngine.V1, PipelineEngine.V2})
 
 
 def check_engine_implemented(config: PirewallConfig) -> None:
@@ -248,8 +255,52 @@ def check_engine_implemented(config: PirewallConfig) -> None:
         available = ", ".join(sorted(item.value for item in IMPLEMENTED_ENGINES))
         raise ConfigurationError(
             f'pipeline.engine = "{engine.value}" is not implemented in this pirewall-core '
-            f"(available: {available}). The v2 policy engine ships in phase 17."
+            f"(available: {available})."
         )
+
+
+def load_v2_thresholds(config: PirewallConfig) -> D1ThresholdFile:
+    """The D1 thresholds `engine = "v2"` runs with, or `ConfigurationError`.
+
+    ASSISTED and ACTIVE refuse to start without a valid `d1.thresholds_path`
+    (phase 17): an enforcing engine must not run on thresholds nobody
+    reviewed. SHADOW falls back to the documented floors, which can only
+    produce SHADOWED records.
+    """
+    try:
+        return load_thresholds(config.d1.thresholds_path)
+    except ConfigurationError as exc:
+        if config.firewall.enforcement_mode is EnforcementMode.SHADOW:
+            _logger.warning("%s; SHADOW mode runs on the documented D1 floors", exc)
+            return floors_file(config.d1.windows_seconds, {"reason": "thresholds file unavailable"})
+        raise ConfigurationError(
+            f'pipeline.engine = "v2" in {config.firewall.enforcement_mode.value} mode needs the D1 '
+            f"thresholds file: {exc}. Write it with scripts/train/fit_d1_thresholds.py."
+        ) from exc
+
+
+class _ManagerKernelReader:
+    """`KernelReader` over `FirewallManager`'s read-only kernel views (phase 17's tier-K poller)."""
+
+    def __init__(self, manager: FirewallManager) -> None:
+        self._manager = manager
+
+    def offenders(self) -> list[tuple[str, int]]:
+        return self._manager.kernel_offenders()
+
+    def counters(self, names: Iterable[str]) -> dict[str, int]:
+        return self._manager.kernel_counters(names)
+
+    def guard_modes(self) -> dict[GuardName, GuardMode]:
+        modes = self._manager.guard_modes(datetime.now(UTC))
+        return {GuardName.RAW: modes.raw, GuardName.INPUT: modes.input, GuardName.FORWARD: modes.forward}
+
+    def static_table_present(self) -> bool:
+        return (nft_names.INET_FAMILY, nft_names.STATIC_TABLE) not in self._manager.missing_tables()
+
+    def set_fill(self, table: str, set_name: str) -> tuple[int, int | None]:
+        fill = self._manager.kernel_set_fill(table, set_name)
+        return fill.count, fill.size
 
 
 def _describe_tables(tables: Iterable[tuple[str, str]]) -> str:
@@ -545,6 +596,31 @@ class CoreDaemon:
             ),
             resolve_mac=self._bindings.resolve_mac,
         )
+        # Phase 17: `pipeline.engine = "v2"` (ADDENDUM_4.md D4). The v1
+        # pipeline above stays built either way: it is the baseline, and its
+        # anomaly path is idle under v2.
+        self._engine = config.pipeline.engine
+        self._v2: V2Pipeline | None = None
+        self._kernel_poller: KernelPoller | None = None
+        if self._engine is PipelineEngine.V2:
+            self._v2 = V2Pipeline(
+                config=config,
+                thresholds=load_v2_thresholds(config),
+                table=load_policy_table(config.policy.table_path),
+                manager=self._manager,
+                state=self._state,
+                forwarder=self._forwarder,
+                counters=self._counters,
+                lock=self._lock,
+                resolve_ip=self._resolve_bound_ip,
+                coordinator=self._coordinator if models.lightgbm is not None else None,
+            )
+            if self._manager.uses_set_backend:
+                self._kernel_poller = KernelPoller(
+                    _ManagerKernelReader(self._manager),
+                    sustained_polls=config.policy.sustained_polls,
+                    set_fill_warning_ratio=config.d1.set_fill_warning_ratio,
+                )
         self._flow_queue: queue.Queue[Flow] = queue.Queue(maxsize=flow_queue_max)
         # Captive portal (ADDENDUM_3.md C1). `None` when disabled, so a
         # deployment that does not want a portal pays nothing for it: no
@@ -558,6 +634,7 @@ class CoreDaemon:
                 store=PortalUserStore(config.portal.user_store_path),
                 on_event=self._forwarder.emit,
                 bindings=self._bindings,
+                on_login_failure=None if self._v2 is None else self._v2.submit_portal_failure,
             )
             # A *second* socket, in its own group, serving a dispatcher with
             # four operations. pirewall-portal is a member of only this
@@ -604,6 +681,14 @@ class CoreDaemon:
     def bindings(self) -> BindingTable:
         """The live IP<->MAC binding table (read-only use: `snapshot`, `resolve_*`)."""
         return self._bindings
+
+    @property
+    def v2_pipeline(self) -> V2Pipeline | None:
+        """The `engine = "v2"` pipeline, or None under v1."""
+        return self._v2
+
+    def _resolve_bound_ip(self, mac: str) -> IPv4Address | None:
+        return self._bindings.resolve_ip(mac)
 
     @property
     def snapshots(self) -> V2Snapshots:
@@ -922,6 +1007,32 @@ class CoreDaemon:
             self._snapshots.publish_guard_modes(self._manager.guard_modes(now))
         except FirewallError as exc:
             self._snapshots.publish_guard_modes(None, str(exc))
+        self._poll_kernel(now)
+
+    def _poll_kernel(self, now: datetime) -> None:
+        """Tier K (phase 17): poll `@offenders`, counters and set fill; hand the result to the v2 pipeline.
+
+        Runs on the watch thread. Table loss is reported by
+        `_refresh_v2_snapshots` above, for both engines.
+        """
+        if self._kernel_poller is None or self._v2 is None:
+            return
+        result = self._kernel_poller.poll(now)
+        self._snapshots.publish_offenders(
+            tuple(
+                OffenderEntry(
+                    mac=item.mac,
+                    code=item.code,
+                    guard=item.guard,
+                    guard_mode=item.guard_mode,
+                    sustained_polls=item.sustained_polls,
+                    first_seen=result.started_at.get(item.id, item.observed_at),
+                    last_seen=item.observed_at,
+                )
+                for item in result.evidence
+            )
+        )
+        self._v2.submit_kernel_poll(result, self._bindings.snapshot(), now)
 
     def _report_table_change(self, missing: tuple[tuple[str, str], ...]) -> None:
         """CRITICAL when a v2 table disappears (D5 "table loss"); INFO when they are all back."""
@@ -1029,6 +1140,8 @@ class CoreDaemon:
             firewall_health=self._manager.backend_health(),
             api_health=True,  # see pirewall.runtime.metrics' docstring
         )
+        if self._v2 is not None:
+            snapshot = snapshot.model_copy(update={"v2": self._v2.gauges()})
         try:
             self._netdata.export(snapshot)
         except PirewallError as exc:
@@ -1497,6 +1610,10 @@ class CoreDaemon:
                 signal = self._new_flow_queue.get_nowait()
             except queue.Empty:
                 break
+            if self._v2 is not None:
+                # v2: the fast path feeds D1's cardinality detectors (phase 17).
+                self._v2.observe_signal(signal)
+                continue
             self._coordinator.behavior_analyzer.observe_new_connection(
                 signal.source_ip, signal.destination_ip, signal.destination_port, signal.timestamp
             )
@@ -1552,6 +1669,9 @@ class CoreDaemon:
             except queue.Empty:
                 return
             now = datetime.now(UTC)
+            if self._v2 is not None:
+                self._v2.observe_slow_cluster(cluster, now)  # D1 slow-rate DoS (ported B2)
+                continue
             self._coordinator.behavior_analyzer.note_slow_connections(
                 cluster.source_ip, cluster.destination_ip, cluster.concurrent_count, now
             )
@@ -1749,17 +1869,39 @@ class CoreDaemon:
             try:
                 flow = self._flow_queue.get(timeout=_QUEUE_POLL_SECONDS)
             except queue.Empty:
+                if self._v2 is not None:
+                    self._process_v2(None)
                 continue
             self._drain_new_flow_signals()
             self._drain_slow_clusters()
             try:
-                protocol_signature = self._pop_tls_evidence(flow)
-                self._pipeline.process(flow, datetime.now(UTC), protocol_signature)
+                if self._v2 is not None:
+                    self._process_v2(flow)
+                else:
+                    protocol_signature = self._pop_tls_evidence(flow)
+                    self._pipeline.process(flow, datetime.now(UTC), protocol_signature)
             finally:
                 self._flow_queue.task_done()
         self._drain_new_flow_signals()
         self._drain_slow_clusters()
         _logger.info("detection loop exited")
+
+    def _process_v2(self, flow: Flow | None) -> None:
+        """One v2 detection step: a completed record (if any), the inbox, then D1 + policy. Detection thread.
+
+        A crash here costs one step, never the thread (the v1 pipeline's rule).
+        """
+        v2 = self._v2
+        assert v2 is not None
+        now = datetime.now(UTC)
+        try:
+            if flow is not None:
+                self._pop_tls_evidence(flow)  # v2 drops JA3/Heartbleed (PLAN_FINAL §4.8); free the cache
+                v2.observe_record(flow, now)
+            v2.drain_inbox(now)
+            v2.evaluate(now)
+        except Exception:
+            _logger.exception("v2 detection step crashed; continuing")
 
     def _sweep_loop(self) -> None:
         """Expire timed-out flows and TTL-elapsed rules on `flow.cleanup_interval_seconds`.

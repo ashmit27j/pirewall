@@ -40,7 +40,7 @@ are regression evidence and are labelled as such.
 | — | Known-issues pass: KNOWN_ISSUES #12, #18, #19, #21 | Complete | See "Known-issues pass (2026-10-28)" below. Not a planned phase. No nft, native or config change. Nothing ran on the Pi. |
 | 15 | Native hardening, pcap reader, replay capture backend | Complete | See "Phase 15 details" below. `panic = "unwind"` + `catch_unwind` everywhere; fuzzed 2 × 631 s with no crash (env=sandbox). Pcap replay and `pcap_to_flows.py` give rows equal to live features. Live-ring fallback is wired into core by phase 16. The Pi benchmark is written, not run. |
 | 16 | `pirewall-start` v2, deployment templates, systemd, data modes, lab victim | Complete: **v2.0 deployable** (Implemented/Tested/Mocked) | See "Phase 16 details" below. Suite 1631 passed / 38 skipped as `pw`, netns tier 33/33 as root, env=sandbox only. `--check` passes in mock mode on a dev machine. Nothing ran on the Pi: every kernel and systemd step there is Environment-dependent. |
-| 17 | D1 detectors, kernel offender poller, policy engine | Not started | Prompt: `phase-17-detection-policy.md`. Depends on 16. Marks **v2.1 (engine)**. |
+| 17 | D1 detectors, kernel offender poller, policy engine | Complete: **v2.1 (engine)** (Implemented/Tested/Mocked) | See "Phase 17 details" below. `pipeline.engine = "v2"` runs; default stays `"v1"` (human's call). Suite 1914 passed / 39 skipped as `pw`, netns tier 34/34 as root, env=sandbox/mock only. Thresholds ship as floors, `frozen = false`; fitting on `pi-live` data is Environment-dependent. Nothing ran on the Pi. |
 | 18 | Lab harness and data modes | Not started; **prompt not yet written** | Planned in PLAN_v3 §8. `docs/v2/prompts/phase-18-*.md` does not exist yet. |
 | 19 | ML on feature schema 3.0.0, from own pcaps | Not started; **prompt not yet written** | Planned in PLAN_v3 §8. |
 | 20 | Evaluation support, docs reconciliation, paper tables | Not started; **prompt not yet written** | Planned in PLAN_v3 §8. |
@@ -887,6 +887,90 @@ the panel, a real `--panic` and its restore, `--lab-victim up/down`, and the
 crash-loop alert (e.g. `systemctl kill -s SIGKILL pirewall-core` three times
 inside 300 s). `ether saddr` on brcmfmac `wlan0` remains Environment-dependent
 (phase 14).
+
+### Phase 17 details
+
+**Scope** (`docs/v2/prompts/phase-17-detection-policy.md`, ADDENDUM_4 D4,
+PLAN_FINAL §4.5–4.6). Under `pipeline.engine = "v2"`, the kernel tier (K) and
+the deterministic per-MAC detectors (D1) are the only evidence that can
+enforce; a reviewable policy table picks the action; scores are for display.
+Integrator for `pirewall/runtime/core.py`. v1 stays selectable and is still
+the default.
+
+**Gates (2026-10-29, env=sandbox: WSL2 Ubuntu 26.04, x86_64; synthetic
+fixtures are env=mock):**
+- `ruff check .` clean; `pyright` (strict) 0 errors.
+- `pytest` as `pw`: **1914 passed, 39 skipped** (34 netns tests need root,
+  3 need `node`, 2 need the `panic-injection` build).
+- `tests/netns` as root: **34/34 passed**, including the new
+  `test_17_the_kernel_poller_reads_real_offenders_and_counters` (a real
+  SYN flood, real `@offenders` and counter reads through
+  `NftablesSetBackend`).
+
+| Deliverable | Label | Evidence |
+|---|---|---|
+| 1. K poller (`pirewall/detection_v2/kernel.py`): 1 s reads of `@offenders`, per-guard verdict counters (per-poll deltas), set fill, static-table presence; `sustained_polls` per (code, MAC); `KernelGuardEvidence` with the guard's mode **at poll time**; WARNING once a watched set passes 80% (re-armed below it). Meter membership is never evidence. Table loss stays reported CRITICAL by core's existing 1 s watch loop, which now hosts the poller. Publishes `list_offenders`. | Tested (fake); Tested (netns, real nft, sandbox); **Environment-dependent** (Pi) | `tests/unit/test_kernel_poller.py` (8), `tests/netns/test_kernel_data_plane.py::test_17_*`. |
+| 2. D1 detectors (`pirewall/detection_v2/d1.py`): vertical scan, horizontal scan, failed-handshake ratio, brute force, slow-rate DoS (ported B2 clusters), fan-in per destination, new-MAC and new-lease rate, portal auth failures per account and LAN-wide. 10 s + 60 s windows (1 h opt-in). LRU-bounded per MAC/destination/account with eviction counters. | Tested (synthetic, env=mock) | `tests/unit/test_d1_detectors.py` (23): nmap-, masscan-, hydra-, slowloris-like fire; busy page load, phone waking up, OS update and P2P stay under the shipped floors. |
+| 3. Thresholds (`detection_v2/thresholds.py`, `scripts/train/fit_d1_thresholds.py`, `config/d1_thresholds.toml`): `clamp(P99.9 × margin, floor, ceiling)` from the benign training block of `pcap_to_flows` output, replayed through the same `D1State.measure_*` functions core runs; sha256 over the entries; provenance (manifest hashes, block bounds, env tag; mixed tags refused); `--freeze`; `--floors-only`. Core refuses `engine = "v2"` in ASSISTED/ACTIVE without a valid file; `pirewall-start` preflight refuses the same. SHADOW falls back to the floors with a warning. | Tested; fitting on real benign data **Environment-dependent** (RUNBOOK H20) | `tests/unit/test_d1_thresholds.py` (11), `tests/unit/test_startup_helper.py::test_engine_v2_*`, `tests/integration/test_core_daemon_v2.py::test_engine_v2_*`. The shipped file is the floors, `frozen = false` (non-goal: no fitting without real data). |
+| 4. Policy engine (`pirewall/policy/`): `table.toml` is data, and the loader refuses a table that breaks a D4 ceiling, writes in SHADOW, uses the approval queue in ACTIVE, or lacks a row. Escalation only on new independent evidence (only fresh evidence classifies a bundle); TTL × multiplier per accepted earlier D1 decision, capped at `max_ttl_seconds`; ASSISTED BLOCK → approval; observe-mode K → MONITOR only; enforce-mode K needs `sustained_polls ≥ 2`. Decisions go through validator v2 and `FirewallManager.submit_candidate`. | Tested | `tests/unit/test_policy_matrix.py` (221): the full {K 4} × {D1 4} × {D2} × {D3} × {3 modes} matrix (192 cells), plus the separate invariants. |
+| 5. Scores → UI only. `PolicyDecision.threat_level` (derived from the action) fills the dashboard/API decision fields; a candidate's `threat_score` is `DISPLAY_SCORE_BY_ACTION[action]`. | Tested | `test_policy_matrix.py::test_scores_never_move_an_action` (scores scaled 0.5× to 1000×, actions unchanged in every mode). |
+| 6. ML as optional input. D3: the loaded LightGBM's known-attack output becomes `ClassifierEvidence` (corroboration only). D2: accepted by the engine and covered by the matrix, **not wired live** under v2 (see deviation 4). | Tested (engine); Implemented (D3 live wiring) | Matrix rows `ml_only`/`ml_with_d1`. |
+| 7. Pipeline switch. `engine = "v1"` unchanged (the baseline, through the set backend). `engine = "v2"` routes new-flow signals (the fast path), completed records and slow clusters into `V2Pipeline` (`pirewall/runtime/pipeline_v2.py`). | Tested (Mocked) | `tests/integration/test_v2_engine_mock_end_to_end.py` (6): whole daemon, pcap replay, native and Python paths, ACTIVE/ASSISTED/SHADOW: the scanning MAC is blocked / held for approval with a RATE_LIMIT / shadowed, the browsing MAC gets nothing. Inline fixtures: phase 18's mock pcaps do not exist yet. |
+| 8. Events and metrics. `SecurityEventType.POLICY_DECISION`; event fields `mac`, `engine`, `policy_decision_id`, `evidence_ids`, `requires_approval` (in the Wazuh JSON); `deploy/wazuh/pirewall_decoder.xml`; Netdata `pirewall.v2.*` gauges (guard hits, offenders, set fill, evidence and decision counts, D1 tracking). | Tested (shaping); **Environment-dependent** (real Wazuh/Netdata) | `tests/unit/test_v2_pipeline.py` (9), `tests/unit/test_wazuh_decoder.py` (2). |
+
+**Definition-of-done items.** v1 #6 (classification only at flow completion):
+under v2, creation-time signals feed the cardinality detectors, and D1 runs on
+every detection-loop pass (≤ `_QUEUE_POLL_SECONDS`, per-MAC cooldown 1 s), not
+at completion. v1 #7 (blind to host-level attacks): every D1 detector is a
+per-MAC (or per-destination/LAN) aggregate. v1 #10 and audit #10's new risk
+(behaviour + anomaly reaching BLOCK): under v2 no score selects an action and
+ML can never exceed MONITOR alone. v1 #11 (absolute thresholds): thresholds are
+fitted from this network's benign data and clamped. **Under `engine = "v1"`
+all four stay as they were, by design: v1 is the evaluation baseline (D4).**
+
+**Deviations and decisions (each needs no human sign-off unless noted):**
+1. **Additive edits outside phase 17's paths**, needed because no existing
+   API offered the reads the poller needs: `SetBackend.read_counters` (+ nft
+   and fake implementations; the fake gains `@offenders`/meter sets and two
+   test hooks), the nft key parser accepting the integer `inet_service` half
+   of `@offenders` keys, three read-only `FirewallManager` views, a
+   `table` keyword on the serialized backend's `set_fill`
+   (phases 13/14's files); `PortalService(on_login_failure=…)` (phase 14);
+   the D1-thresholds preflight in `scripts/deployment/startup.py` and one
+   comment in `pirewall-start` (phase 16); `SecurityEvent`/`NetdataMetricsSnapshot`
+   fields and their Wazuh/Netdata shaping. All recorded in V2_CONTRACTS §13.
+2. **`V2Pipeline` is its own module** (`pirewall/runtime/pipeline_v2.py`)
+   rather than more code in `pipeline.py` (CLAUDE.md: one subsystem per file).
+3. **What D1 counts.** Connection starts from completed records
+   (`ConnectionStartTracker`, the same class `pcap_to_flows` uses), with the
+   handshake outcome derived from the canonical feature columns so live and
+   fitted values agree. Creation-time signals feed only the cardinality
+   detectors (vertical/horizontal scan, fan-in), where seeing a connection
+   twice cannot change a count (pinned by a test).
+4. **D2 is not wired live** under v2: the Isolation Forest is v1's
+   CICIDS-trained model, and phase 19 retrains D2/D3 on schema 3.0.0. D3 uses
+   the current LightGBM with `detection.known_attack_confidence_threshold` as
+   its operating point, until phase 19's benign-FPR operating point exists.
+5. **A `d1_standard` row** (failed handshakes, slow-rate DoS, one account's
+   portal failures → RATE_LIMIT in ASSISTED/ACTIVE) is added to the
+   PLAN_FINAL table, which names only "high-certainty" D1. Aggregate
+   evidence with no single device (fan-in, MAC churn, lease rate, LAN-wide
+   portal failures) is reported as `THREAT_DETECTED`, never acted on.
+6. **Horizontal-scan floors raised** 15→20 (10 s) and 30→40 (60 s) so a phone
+   waking up stays under them; ceilings 64/128.
+7. **ASSISTED ordering.** The held BLOCK is submitted before the RATE_LIMIT
+   (the validator's escalation stage would otherwise refuse a BLOCK whose
+   evidence the active RATE_LIMIT already carries), and only one BLOCK per
+   device waits in the approval queue at a time.
+8. **Escalation strikes count only accepted decisions**, so a BLOCK the
+   validator refuses as a duplicate does not lengthen the next TTL.
+9. **JA3/Heartbleed do not run under v2** (PLAN_FINAL §4.8: dropped).
+10. **Threshold hot-reload** exists as `D1State.replace_thresholds` but no
+    reload trigger calls it yet (Implemented, not wired).
+11. **Default engine stays `"v1"`.** D4 lets it change once phase 17 ships;
+    flipping it changes what a Pi runs on its next start, so it is left to the
+    human.
+12. `docs/v2/RUNBOOK_PI.md` (H20) does not exist yet; not written here.
 
 ### Known-issues pass (2026-10-28)
 

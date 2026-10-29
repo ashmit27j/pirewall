@@ -75,6 +75,7 @@ class FakeSetBackend:
         self._binding_size = binding_size
         self._tables: dict[_Location, dict[str, _FakeSet]] = {}
         self._guards: dict[GuardName, GuardMode] = {}
+        self._counters: dict[_Location, dict[str, int]] = {}
         self.ops: list[tuple[str, tuple[object, ...]]] = []
         self.fail_next = False
         self.calls = 0
@@ -97,6 +98,9 @@ class FakeSetBackend:
         static = self._tables.setdefault((inet, nft_names.STATIC_TABLE), {})
         for name in (nft_names.SET_BOUND4, nft_names.SET_MACBIND, nft_names.SET_ALLOW_BOUND):
             static.setdefault(name, _FakeSet(self._binding_size))
+        # Kernel-written: `@offenders` and the meters (filled only by the test hooks).
+        for name in (nft_names.SET_OFFENDERS, *sorted(nft_names.STATIC_METER_SETS)):
+            static.setdefault(name, _FakeSet(self._adaptive_size))
         arp = self._tables.setdefault((nft_names.ARP_FAMILY, nft_names.STATIC_ARP_TABLE), {})
         for name in (nft_names.SET_BOUND4, nft_names.SET_MACBIND):
             arp.setdefault(name, _FakeSet(self._binding_size))
@@ -196,6 +200,34 @@ class FakeSetBackend:
         fake = self._set(family, table, set_name)
         fake.elements = _live(fake.elements, self._now_fn())
         return SetFill(len(fake.elements), fake.size)
+
+    def read_counters(
+        self,
+        names: Iterable[str],
+        *,
+        table: str = nft_names.STATIC_TABLE,
+        family: str = nft_names.INET_FAMILY,
+    ) -> dict[str, int]:
+        if (family, table) not in self._tables:
+            return {}
+        counters = self._counters.get((family, table), {})
+        return {name: counters[name] for name in names if name in counters}
+
+    # ------------------------------------------------- kernel-side test hooks
+
+    def record_offender(self, mac: str, code: int, timeout_seconds: int = 60) -> None:
+        """Test hook: what a static guard's meter rule does (`update @offenders { ether saddr . N }`).
+
+        The kernel is `@offenders`' only writer (D1); core never calls this.
+        """
+        fake = self._set(nft_names.INET_FAMILY, nft_names.STATIC_TABLE, nft_names.SET_OFFENDERS)
+        fake.elements[(mac, str(code))] = self._now_fn() + timedelta(seconds=timeout_seconds)
+
+    def bump_counter(self, name: str, packets: int = 1) -> None:
+        """Test hook: a named `pirewall_static` counter counting `packets` more packets."""
+        location = (nft_names.INET_FAMILY, nft_names.STATIC_TABLE)
+        counters = self._counters.setdefault(location, {})
+        counters[name] = counters.get(name, 0) + packets
 
     def guard_mode(self, guard: GuardName) -> GuardMode | None:
         if (nft_names.INET_FAMILY, nft_names.STATIC_TABLE) not in self._tables:

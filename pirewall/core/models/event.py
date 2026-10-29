@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from pydantic import AwareDatetime, Field
 
-from pirewall.core.enums import EventSeverity, FirewallAction, Protocol, SecurityEventType
+from pirewall.core.enums import EventSeverity, FirewallAction, PipelineEngine, Protocol, SecurityEventType
 from pirewall.core.models.common import PirewallModel
 
 
@@ -34,3 +34,11 @@ class SecurityEvent(PirewallModel):
 
     reason: str | None = None
     model_version: str | None = None
+
+    # v2 policy fields (phase 17, ADDENDUM_4.md D4). `mac` is the device's
+    # normalised unicast MAC (D3), never a lease hostname or client-id.
+    mac: str | None = None
+    engine: PipelineEngine | None = None
+    policy_decision_id: str | None = None
+    evidence_ids: tuple[str, ...] = ()
+    requires_approval: bool | None = None

@@ -453,6 +453,29 @@ block_ttl_seconds = 300
 escalation_ttl_multiplier = 2     # only on NEW independent evidence
 max_ttl_seconds = 3600            # every adaptive element expires; 3600 is also the ceiling
 sustained_polls = 2               # an enforce-mode offender must persist this many 1 s polls; >= 2
+table_path = "pirewall/policy/table.toml"   # the reviewable policy table (data, not code)
+max_tracked_devices = 4096
+max_evidence_ids_per_device = 256
+
+[d1]
+# D4 / PLAN_FINAL 4.5 — deterministic MAC-keyed detectors and the kernel
+# poller. Read only when [pipeline] engine = "v2". Thresholds are learned
+# from benign traffic (scripts/train/fit_d1_thresholds.py) and live in
+# thresholds_path; core refuses ASSISTED/ACTIVE under v2 without that file.
+thresholds_path = "config/d1_thresholds.toml"
+windows_seconds = [10, 60]        # 3600 (1 h) is optional and cuttable
+max_tracked_macs = 4096
+max_tracked_destinations = 4096
+max_events_per_mac = 4096
+max_tracked_accounts = 1024
+evaluation_cooldown_seconds = 1.0
+brute_force_ports = [22, 80, 443, 8080]   # the portal port is added at runtime
+brute_force_max_duration_seconds = 5.0
+brute_force_size_tolerance = 0.25
+failed_handshake_min_starts = 10
+kernel_poll_interval_seconds = 1.0
+set_fill_warning_ratio = 0.8
+max_known_macs = 16384
 
 [lab]
 # D7 — provenance tag on every artifact: "pi-live", "pi-scripted", "sandbox"

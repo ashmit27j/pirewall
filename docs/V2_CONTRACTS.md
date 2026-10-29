@@ -115,6 +115,17 @@ timestamp.
 * `evidence_id(evidence)` gives the string used in
   `PolicyDecision.evidence_ids`: the `id` for the three v2 variants, and
   `anomaly:<flow_id>` for the reused `AnomalyEvidence`, which has no id.
+* **Producer ids (added by phase 17).** The producers set deterministic ids,
+  so re-observing the same thing is the *same* evidence and can never
+  escalate (D4): D1 uses
+  `d1:<detector>:<scope>:<window>:<subject>:<floor(t / window)>` (scope
+  `device | destination | account | global`); the kernel poller uses
+  `k:<code>:<mac>:<episode start>:<guard mode>:<stage>`, where an episode is
+  one unbroken run of polls and `stage` is `new`/`sustained` for an
+  enforce-mode guard (crossing `policy.sustained_polls` is new evidence) and
+  `observe` for an observe-mode one. Pinned by
+  `tests/unit/test_d1_detectors.py::test_evidence_ids_are_stable_within_a_window_bucket`
+  and `tests/unit/test_kernel_poller.py`.
 
 ## 5. Policy decision — `pirewall/core/models/policy.py`
 
@@ -261,6 +272,8 @@ loads unchanged, and no existing key was renamed or removed.
 | `[lab]` | `env_tag = "sandbox"`, `victim_netns = "labvictim"`, `victim_host_interface = "lab0"`, `victim_network = "10.250.0.0/30"` (must be a /30) |
 | `[capture]` additions | `backend` also accepts `"replay"`, which needs `replay_path`. `replay_speed = "max"` (also `"realtime"` or `"<N>x"`). Phase 15 implements the replay (`pirewall/capture/replay.py`); core selects it from these settings from phase 16. Phase 15 adds `native_max_panics_per_minute = 5` (D6 fallback threshold). |
 | `[flow]` addition (phase 15) | `connection_start_max_tracked = 100000`, the `ConnectionStartTracker` bound (§11). |
+| `[policy]` additions (phase 17) | `table_path = "pirewall/policy/table.toml"` (the reviewable table, D4), `max_tracked_devices = 4096`, `max_evidence_ids_per_device = 256` (escalation memory bounds). |
+| `[d1]` (phase 17) | `thresholds_path = "config/d1_thresholds.toml"`, `windows_seconds = [10, 60]` (must include both; 3600 optional), `max_tracked_macs = 4096`, `max_tracked_destinations = 4096`, `max_events_per_mac = 4096`, `max_tracked_accounts = 1024`, `evaluation_cooldown_seconds = 1.0`, `brute_force_ports = [22, 80, 443, 8080]` (+ the portal port), `brute_force_max_duration_seconds = 5.0`, `brute_force_size_tolerance = 0.25`, `failed_handshake_min_starts = 10`, `kernel_poll_interval_seconds = 1.0`, `set_fill_warning_ratio = 0.8`, `max_known_macs = 16384`. Thresholds themselves live in the thresholds file (§13). Older configs need no migration: the section is fully defaulted. |
 
 **`[guards]` → template variable** (for `render_templates.py`, phase 13).
 Each `{rate, burst}` pair renders into `<VAR>` and `<VAR>_BURST`. Rates are
@@ -441,3 +454,39 @@ Every other phase reaches them through their public API.
   order.
 * Phase 15 runs in parallel with 13 but must not edit `runtime/core.py`. Its
   `ReplayCapture` is wired into capture selection by phase 16.
+
+## 13. Phase-17 additions
+
+All additive (§0). Each is pinned by the test named.
+
+* **`SecurityEventType.POLICY_DECISION`** and optional `SecurityEvent`
+  fields `mac`, `engine: PipelineEngine`, `policy_decision_id`,
+  `evidence_ids` (default `()`), `requires_approval`. The Wazuh JSON carries
+  them when set (`pirewall/integration/wazuh.py`), and
+  `deploy/wazuh/pirewall_decoder.xml` matches them
+  (`tests/unit/test_enums.py`, `tests/unit/test_wazuh_decoder.py`).
+* **`SetBackend.read_counters(names, *, table, family) -> dict[str, int]`**:
+  packet counts of named counters, missing ones omitted; implemented by
+  `NftablesSetBackend` (one `list counter` each) and `FakeSetBackend`
+  (with `record_offender`/`bump_counter` test hooks standing in for the
+  kernel). `@offenders` keys list as `(mac, "<code>")`: nft prints the
+  `inet_service` half as an integer (`tests/netns/test_kernel_data_plane.py::test_17_*`).
+* **`FirewallManager` read-only kernel views**: `kernel_offenders()`,
+  `kernel_counters(names)`, `kernel_set_fill(table, set_name)`. They only
+  read; the kernel stays `@offenders`' only writer (`tests/unit/test_kernel_poller.py`).
+* **`NetdataMetricsSnapshot.v2: V2Gauges | None`**: guard meter hits per
+  poll (raw/input/forward), offenders, max set fill, kernel/D1 evidence and
+  policy decision counts, D1 tracked MACs and evictions; exported as
+  `pirewall.v2.<name>` (`tests/unit/test_v2_pipeline.py::test_the_netdata_snapshot_exports_v2_gauges`).
+* **`list_offenders` (§9) is now populated**: under `pipeline.engine = "v2"` the kernel poller publishes each poll (`first_seen` = the episode start); under v1 it stays empty with `offenders_polled = false`.
+* **`PortalService(on_login_failure=...)`**: told `(account, client_ip,
+  client_mac, at)` of each wrong-password attempt, never the password.
+* **The D1 thresholds file** (`pirewall/detection_v2/thresholds.py`):
+  `version = 1`, `frozen`, `sha256` over the entries, `[provenance]`, and
+  one `[[threshold]]` per `<detector>/<scope>/<window>` with `value`,
+  `floor`, `ceiling` and, when fitted, `benign_p999`, `margin`, `samples`
+  (`tests/unit/test_d1_thresholds.py`).
+* **The policy table file** (`pirewall/policy/table.toml`): `version = 1`,
+  `[d1] high/standard`, and one `[[row]]` per `EvidenceClass` with
+  `shadow`/`assisted`/`active` cells and optional `escalate`
+  (`tests/unit/test_policy_matrix.py`).

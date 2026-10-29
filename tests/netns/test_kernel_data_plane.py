@@ -513,3 +513,26 @@ def test_both_transports_write_the_same_kernel_state(plane: Plane) -> None:
 
 def test_3c_the_legit_mac_never_entered_an_accusatory_set() -> None:
     assert LEGIT_HITS == []
+
+
+# ------------------------------------------------------- phase 17: the tier-K poller on real nft
+
+
+def test_17_the_kernel_poller_reads_real_offenders_and_counters(plane: Plane) -> None:
+    """`@offenders` (ether_addr . inet_service, listed with an integer service) and named counters."""
+    from pirewall.detection_v2.kernel import KernelPoller
+    from pirewall.runtime.core import _ManagerKernelReader  # pyright: ignore[reportPrivateUsage]
+
+    poller = KernelPoller(_ManagerKernelReader(plane.manager), sustained_polls=2, set_fill_warning_ratio=0.8)
+    before = plane.manager.kernel_counters(["c_verdict_raw"]).get("c_verdict_raw", 0)
+    hping("pw_a", f"-S -p 8080 -c 30000 -i u100 -q {IP['r']}")
+
+    assert (MAC["a"], 1) in plane.manager.kernel_offenders()
+    assert plane.manager.kernel_counters(["c_verdict_raw"])["c_verdict_raw"] > before
+    first = poller.poll(datetime.now(UTC))
+    second = poller.poll(datetime.now(UTC))
+    mine = [item for item in second.evidence if item.mac == MAC["a"] and item.code.value == 1]
+    assert mine and mine[0].guard is GuardName.RAW and mine[0].guard_mode is GuardMode.ENFORCE
+    assert mine[0].sustained_polls == 2
+    assert first.guard_hits[GuardName.RAW] > 0
+    assert first.table_present and first.error is None

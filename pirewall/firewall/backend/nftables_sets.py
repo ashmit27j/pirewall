@@ -144,6 +144,25 @@ class NftablesSetBackend:
         size = listed.get("size")
         return SetFill(count=len(_as_list(listed.get("elem"))), size=size if isinstance(size, int) else None)
 
+    def read_counters(
+        self,
+        names: Iterable[str],
+        *,
+        table: str = nft_names.STATIC_TABLE,
+        family: str = nft_names.INET_FAMILY,
+    ) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for name in names:
+            try:
+                output = self._run([{"list": {"counter": {"family": family, "table": table, "name": name}}}])
+            except FirewallError:
+                continue  # not declared in this table (or the table is gone): omitted, not zero
+            for item in _objects(output, "counter"):
+                packets = item.get("packets")
+                if item.get("name") == name and isinstance(packets, int):
+                    counts[name] = packets
+        return counts
+
     def guard_mode(self, guard: GuardName) -> GuardMode | None:
         chain = nft_names.GUARD_VERDICT_CHAINS[guard]
         try:
@@ -268,7 +287,8 @@ def _key_from_json(value: object) -> ElementKey | None:
     if value_dict is None:
         return None
     parts = _as_list(value_dict.get("concat"))
-    if len(parts) == 2 and all(isinstance(part, str) for part in parts):
+    # `@offenders` is `ether_addr . inet_service`: nft lists the service half as an integer.
+    if len(parts) == 2 and all(isinstance(part, str | int) and not isinstance(part, bool) for part in parts):
         return (str(parts[0]), str(parts[1]))
     return None
 

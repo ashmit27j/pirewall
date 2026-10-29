@@ -38,7 +38,7 @@
 #   scripts/deployment/pirewall-start --dry-run               # print every command, run none
 #   sudo scripts/deployment/pirewall-start --no-portal        # core + api only
 #   sudo scripts/deployment/pirewall-start --skip-nft         # leave the ruleset alone
-#   sudo scripts/deployment/pirewall-start --engine v1        # pipeline (v2 arrives in phase 17)
+#   sudo scripts/deployment/pirewall-start --engine v1        # pipeline: v1 baseline, or v2 (policy engine)
 #   sudo scripts/deployment/pirewall-start --guards observe   # all three guards; or per guard:
 #        --guard-raw MODE --guard-input MODE --guard-forward MODE    (MODE: observe|enforce)
 #   sudo scripts/deployment/pirewall-start --data-mode live   # claim env pi-live (Pi only)

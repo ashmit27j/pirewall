@@ -18,6 +18,10 @@ dependencies = [
 # pirewall-core runs the pure-Python capture path. Building it needs a Rust
 # toolchain; see docs/ARCHITECTURE.md "Native capture engine".
 native = ["pirewall-native"]
+# Dev/lab only (CLAUDE.md v2 dependency additions): scapy builds the frames of
+# the phase-18 mock pcaps (lab/mock/gen_pcaps.py, the only importer). Never
+# imported under pirewall/, never installed on the Pi's runtime path.
+lab = ["scapy>=2.5"]
 
 [tool.uv.sources]
 pirewall-native = { path = "native" }
@@ -40,7 +44,7 @@ packages = ["pirewall"]
 [tool.ruff]
 line-length = 110
 target-version = "py312"
-src = ["pirewall", "tests", "scripts"]
+src = ["pirewall", "tests", "scripts", "lab"]
 # docs/v2/ is the frozen v2 design bundle: its scripts are sandbox evidence
 # (docs/v2/v2/RESULTS.md) and are kept byte-for-byte as tested, not linted.
 extend-exclude = ["docs/v2"]
@@ -51,11 +55,16 @@ select = [
 ]
 ignore = []
 
+[tool.ruff.lint.per-file-ignores]
+# lab/ entry points run as `python lab/<script>.py` (RUNBOOK_PI.md): they put
+# the repo root on sys.path before importing `lab.*`/`scripts.*`.
+"lab/**/*.py" = ["E402"]
+
 [tool.ruff.lint.isort]
-known-first-party = ["pirewall"]
+known-first-party = ["pirewall", "lab"]
 
 [tool.pyright]
-include = ["pirewall", "tests", "scripts"]
+include = ["pirewall", "tests", "scripts", "lab"]
 exclude = ["**/__pycache__", "pirewall/ml/artifacts"]
 venvPath = "."
 venv = ".venv"

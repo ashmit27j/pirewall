@@ -1,0 +1,207 @@
+# Campaign #1: dev runs (PLAN_FINAL §5). Tune here; never report these as eval numbers.
+#
+#   sudo uv run python lab/run_campaign.py lab/campaigns/dev.toml --attacker kali@<kali-ip> \
+#       --attacker-ip <kali LAN ip> --attacker-mac <kali LAN mac> \
+#       --param neighbour_ip=<a bound household IP> --param attacker_iface=<kali LAN iface> \
+#       --param wordlist=<path on kali>
+#
+# Placeholders: {pi_ip}, {victim_ip}, {victim_net}, {protected_net} come from the Pi's
+# config; everything else from --param. `target` is "pi", "victim" or an IP inside
+# network.protected_network. `side` says where lab/capture.sh records the victim view:
+# "input" for the Pi itself (Victim A), "forward" for the labvictim netns.
+# N = 5 for floods and scans, 3 otherwise. `victim_filter.src = "any"` for random-source
+# and spoofed floods (the attacker's own IP never appears at the victim).
+
+name = "dev"
+phase = "dev"
+seed = 20261029
+pre_attack_seconds = 10
+post_attack_seconds = 30
+cooldown_poll_seconds = 2
+cooldown_quiet_polls = 3
+cooldown_timeout_seconds = 900
+
+[[attack]]
+id = "syn_flood_fixed"
+script = "syn_flood.sh"
+runs = 5
+target = "victim"
+side = "forward"
+duration = 30
+offered_rate_pps = 1500
+args = ["--rate", "1500", "--port", "80"]
+victim_filter = { proto = "tcp", dport = 80 }
+
+[[attack]]
+id = "syn_flood_random"
+script = "syn_flood.sh"
+runs = 5
+target = "victim"
+side = "forward"
+duration = 30
+offered_rate_pps = 1500
+args = ["--rate", "1500", "--port", "80", "--rand-source"]
+victim_filter = { src = "any", proto = "tcp", dport = 80 }
+
+[[attack]]
+id = "udp_flood_fixed"
+script = "udp_flood.sh"
+runs = 5
+target = "pi"
+side = "input"
+duration = 30
+offered_rate_pps = 3000
+args = ["--rate", "3000", "--port", "5555"]
+victim_filter = { proto = "udp", dport = 5555 }
+
+[[attack]]
+id = "udp_flood_random"
+script = "udp_flood.sh"
+runs = 5
+target = "pi"
+side = "input"
+duration = 30
+offered_rate_pps = 3000
+args = ["--rate", "3000", "--port", "5555", "--rand-source"]
+victim_filter = { src = "any", proto = "udp", dport = 5555 }
+
+[[attack]]
+id = "icmp_flood_fixed"
+script = "icmp_flood.sh"
+runs = 5
+target = "pi"
+side = "input"
+duration = 30
+offered_rate_pps = 500
+args = ["--rate", "500"]
+victim_filter = { proto = "icmp" }
+
+[[attack]]
+id = "icmp_flood_random"
+script = "icmp_flood.sh"
+runs = 5
+target = "pi"
+side = "input"
+duration = 30
+offered_rate_pps = 500
+args = ["--rate", "500", "--rand-source"]
+victim_filter = { src = "any", proto = "icmp" }
+
+[[attack]]
+id = "ip_spoof_neighbour"
+script = "spoof_neighbour.sh"
+runs = 3
+target = "victim"
+side = "forward"
+duration = 20
+offered_rate_pps = 800
+args = ["--rate", "800", "--port", "80", "--spoof-ip", "{neighbour_ip}"]
+victim_filter = { src = "{neighbour_ip}", proto = "tcp", dport = 80 }
+
+[[attack]]
+id = "vertical_scan_t4"
+script = "nmap_vertical.sh"
+runs = 5
+target = "victim"
+side = "forward"
+duration = 60
+args = ["--timing", "T4", "--ports", "1-1024"]
+victim_filter = { proto = "tcp" }
+
+[[attack]]
+id = "vertical_scan_t3"
+script = "nmap_vertical.sh"
+runs = 5
+target = "victim"
+side = "forward"
+duration = 90
+args = ["--timing", "T3", "--ports", "1-1024"]
+victim_filter = { proto = "tcp" }
+
+[[attack]]
+id = "vertical_scan_t2"
+script = "nmap_vertical.sh"
+runs = 5
+target = "victim"
+side = "forward"
+duration = 120
+args = ["--timing", "T2", "--ports", "1-250"]
+victim_filter = { proto = "tcp" }
+
+[[attack]]
+id = "horizontal_scan"
+script = "nmap_horizontal.sh"
+runs = 5
+target = "victim"
+side = "forward"
+duration = 60
+args = ["--scan-net", "{victim_net}", "--port", "22"]
+victim_filter = { proto = "tcp", dport = 22 }
+
+[[attack]]
+id = "masscan"
+script = "masscan.sh"
+runs = 5
+target = "victim"
+side = "forward"
+duration = 30
+args = ["--rate", "1000", "--ports", "1-1024"]
+victim_filter = { proto = "tcp" }
+
+[[attack]]
+id = "ssh_bruteforce"
+script = "hydra_ssh.sh"
+runs = 3
+target = "victim"
+side = "forward"
+duration = 60
+args = ["--wordlist", "{wordlist}"]
+victim_filter = { proto = "tcp", dport = 22 }
+
+[[attack]]
+id = "http_bruteforce"
+script = "hydra_http.sh"
+runs = 3
+target = "victim"
+side = "forward"
+duration = 60
+args = ["--wordlist", "{wordlist}"]
+victim_filter = { proto = "tcp", dport = 80 }
+
+[[attack]]
+id = "portal_bruteforce"
+script = "portal_bruteforce.sh"
+runs = 3
+target = "pi"
+side = "input"
+duration = 30
+args = ["--rate", "5"]
+victim_filter = { proto = "tcp", dport = 8080 }
+
+[[attack]]
+id = "slowloris"
+script = "slowloris.sh"
+runs = 3
+target = "victim"
+side = "forward"
+duration = 60
+args = ["--connections", "150", "--interval", "10"]
+victim_filter = { proto = "tcp", dport = 80 }
+
+[[attack]]
+id = "arp_poisoning"
+script = "arp_poison.sh"
+runs = 3
+target = "pi"
+side = "input"
+duration = 30
+args = ["--spoof-ip", "{neighbour_ip}", "--iface", "{attacker_iface}"]
+
+[[attack]]
+id = "mac_churn"
+script = "mac_churn.sh"
+runs = 3
+target = "pi"
+side = "input"
+duration = 30
+args = ["--iface", "{attacker_iface}", "--interval", "0.5"]

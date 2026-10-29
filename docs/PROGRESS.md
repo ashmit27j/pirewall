@@ -42,9 +42,89 @@ are regression evidence and are labelled as such.
 | 16 | `pirewall-start` v2, deployment templates, systemd, data modes, lab victim | Complete: **v2.0 deployable** (Implemented/Tested/Mocked) | See "Phase 16 details" below. Suite 1631 passed / 38 skipped as `pw`, netns tier 33/33 as root, env=sandbox only. `--check` passes in mock mode on a dev machine. Nothing ran on the Pi: every kernel and systemd step there is Environment-dependent. |
 | 17 | D1 detectors, kernel offender poller, policy engine | Complete: **v2.1 (engine)** (Implemented/Tested/Mocked) | See "Phase 17 details" below. `pipeline.engine = "v2"` runs; default stays `"v1"` (human's call). Suite 1914 passed / 39 skipped as `pw`, netns tier 34/34 as root, env=sandbox/mock only. Thresholds ship as floors, `frozen = false`; fitting on `pi-live` data is Environment-dependent. Nothing ran on the Pi. |
 | — | Handoff pass: phase 18–20 prompts, `RUNBOOK_PI.md`, `HANDOFF.md`, v2 merged to `main` | Complete (documentation only) | See "Handoff pass (2026-10-29)" below. No code changed. |
-| 18 | Lab harness and data modes | Not started; prompt ready | `docs/v2/prompts/phase-18-lab-harness.md`. Can start now. |
+| 18 | Lab harness and data modes | Complete: **v2.1 (engine + harness)** (Implemented/Tested/Mocked) | See "Phase 18 details" below. Suite 2034 passed / 39 skipped as `pw`, netns tier 34/34 as root, env=mock/sandbox only. `pirewall-start --check --data-mode mock` passes without `--pcap`. Benign capture, campaigns #1/#2 and the real G5 run are Environment-dependent. Finding: fast mock replays over-count D1 on benign devices (hand-over to 16/17). Nothing ran on the Pi. |
 | 19 | ML on feature schema 3.0.0, from own pcaps | Not started; prompt ready | `docs/v2/prompts/phase-19-ml-schema3.md`. Needs 18; real numbers need `pi-live` data (RUNBOOK_PI H0, H28). |
 | 20 | Evaluation support, docs reconciliation, paper tables | Not started; prompt ready | `docs/v2/prompts/phase-20-eval-docs-paper.md`. Needs everything, plus the human's Pi campaigns. |
+
+### Phase 18 details
+
+**Scope.** `docs/v2/prompts/phase-18-lab-harness.md`: the lab harness under
+`lab/`, the three data modes, the offline G5 evaluator and aggregation.
+Written over two sessions (the first stopped at the usage limit with about
+half the files and no gates run). Env tags of everything run here:
+`mock` and `sandbox` only. **Nothing ran on the Pi**, and no attack tool
+ran against anything.
+
+**Gates (2026-10-29, WSL Ubuntu).** `ruff check .` clean; `pyright`
+(strict) 0 errors; `pytest` as `pw`: 2034 passed / 39 skipped; `tests/netns` as root:
+34/34 passed. `uv run python lab/mock/gen_pcaps.py --seed 1` then
+`scripts/deployment/pirewall-start --check --data-mode mock` (no `--pcap`):
+exit 0, with and without `--engine v2` (env=mock).
+
+| Deliverable | Label | Evidence / what a human must do |
+|---|---|---|
+| `lab/manifest.py` (one schema; `replay` kind added), `verify_manifest.py`, `seal.py`, `common.py` (env-tag guard reusing `SystemProbe.is_raspberry_pi`, output locations, provenance) | Tested | `test_lab_manifest.py`: changed byte, missing file, added file, re-seal refused, nested tag mismatch, eval without frozen thresholds, `pi-*` refused off a Pi, tracked-tree writes refused, capture sealed with its lab MACs |
+| `lab/stats.py` | Tested | `test_lab_stats.py`: rule of three, Garwood intervals against table values, median CI coverage |
+| `lab/mock/gen_pcaps.py` (18 attack classes + benign over 6 MACs; ground truth now also carries the attacker `ip`) | Tested (env=mock) | `test_lab_mock_dataset.py`: byte-identical per seed, different for another seed, every class in `ground_truth.jsonl`, refuses to overwrite without `--force`; `pcap_to_flows` labels every attack flow with its class and every benign-device flow `benign` (ARP poisoning has no IPv4 flow) |
+| `lab/mock/replay.py` | Tested (fakes) + run by hand (env=mock) | `test_lab_client_tools.py`. By hand on the full seed-1 set: drained in ~13 s and sealed; v2 acted on 8 attack classes, v1 on 5. See finding 1 before reading anything into benign devices there |
+| `pirewall-start --data-mode mock --check` without `--pcap` | Tested by hand (env=mock) | exit 0 once `gen_pcaps.py` has run |
+| `test_v2_engine_mock_end_to_end.py` additive test | Tested (env=mock) | `test_the_mock_data_sets_scanner_is_acted_on[ACTIVE/SHADOW]` replays the generated `vertical_scan_t4` pcap when `lab/mock/out` exists, the inline fixture otherwise; scanner acted on, no rule on a benign MAC |
+| `lab/meter_sim.py` | Tested | `test_lab_meter_sim.py`: rates/bursts from the rendered template, 3 s flood inside the burst does not trip (PLAN_FINAL §1.2), trip time when the bucket runs dry, set-timeout expiry, fail-open when the meter set is full, enforce vs observe, spoof is a static drop |
+| `lab/benign_fp.py` (offline G5) | Tested (env=mock) | `test_lab_mock_dataset.py`: attack MACs trip meters and draw decisions; every benign MAC at zero enforce actions in every scenario and mode (rule-of-three bound reported); verdict "no" for mock. Two bugs fixed this session (finding 2). **Environment-dependent:** the real G5 run on `pi-live` hours (RUNBOOK_PI step 24) |
+| `lab/aggregate.py`, `lab/score_run.py` | Tested | `test_lab_aggregate.py`: per-attack medians with the tag in every row and file name; refuses mixed env tags (naming both runs) and dev+eval; a tampered run stops it; a miss is not a number; TTM/effectiveness on a synthetic arrival series |
+| `lab/run_campaign.py` (+ `--param` placeholders), `lab/campaigns/{dev,eval}.toml`, `lab/poll_state.py` | Tested (fakes) | `test_lab_run_campaign.py`: order is a pure function of the seed; cooldown waits for N quiet polls and gives up without forcing anything; eval refuses the shipped unfrozen thresholds before any attack; a dev campaign seals 8 runs that verify; both shipped campaigns load and expand. **Environment-dependent:** campaigns #1 and #2 on the Pi (RUNBOOK_PI steps 21, 23) |
+| `lab/attacks/*.sh` (12 attacks + `_common.sh`) | Tested (`--dry-run` only) | `test_lab_attacks.py`: every script refuses three out-of-lab targets, free-form tool arguments, missing lab bounds, out-of-lab scan ranges and spoof addresses; Pi-only attacks refuse the victim. No tool was executed. **Environment-dependent:** real runs from Kali |
+| `lab/capture.sh` (victim side, incl. the input-path NFLOG tap) | Not yet validated (tap syntax checked) | The tap table parses and loads with nft 1.1.6 inside a throwaway netns (sandbox). tcpdump on `nflog:`/in `labvictim` never ran. **Environment-dependent** (Pi, root, labvictim up) |
+| `lab/capture/benign_capture.sh` | Not yet validated | Never run (needs root, a LAN interface, and consent). **Environment-dependent:** RUNBOOK_PI step 5 |
+| `lab/benign/background.py` (profiles + campaign probe) | Tested (fakes) | `test_lab_client_tools.py`: segment plan, one `benign:<profile>` window per segment, probe sample format matches `score_run.py`. Real traffic from client devices is **Environment-dependent** |
+| `lab/preflight.py` | Tested (fakes) | chrony offset parsing and every check against a fake runner/core. On the Pi: **Environment-dependent** |
+| Import graph | Tested | `test_lab_import_graph.py`: nothing under `pirewall/` imports `lab` or `scapy` (incl. lazy and `import_module`), only `gen_pcaps.py` imports scapy, the core-reading scripts never import `pirewall.firewall.backend`/`pirewall.capture`, client-side scripts are stdlib only |
+| `lab/README.md`, RUNBOOK_PI steps 5, 19, 21, 23, 24 and the undo table | Implemented | Checked against the real CLI: step 5 now uses `benign_capture.sh`; 21/23 gained the required `--attacker-ip/--attacker-mac/--param`, the scoring step and `aggregate.py --out`; 24 gained the actual `benign_fp.py` command |
+| V2_CONTRACTS §12 row 18 | Implemented | Confirmed, and extended (additively) with the pyproject tool paths, `.gitignore` lines and RUNBOOK commands this phase touched |
+
+**Findings.**
+
+1. **Mock replays over-count D1 on benign devices (env=mock; hand-over to
+   the owners of `pirewall-start`/core, phases 16/17).** `pirewall-start
+   --data-mode mock` replays at `replay_speed = "max"`, and core evaluates
+   D1 windows on the wall clock, so each 10 s window sees minutes of
+   capture. Replaying `00_benign.pcap` alone through `CoreDaemon` (v2,
+   ACTIVE): `max` → 3 BLOCKs (D1 `horizontal_scan` 25–34 > 20) on three
+   benign MACs; `20x` → 5 BLOCKs; **`realtime` → 0 decisions**. The full
+   seed-1 replay likewise put RATE_LIMIT (D1 `slow_rate_dos`) on two
+   benign devices. The offline evaluator, on capture time, gives zero.
+   So these are a mock-fidelity artifact, not detector FPs; but any mock
+   replay result about benign devices is meaningless until core evaluates
+   D1 on the replay's virtual clock in mock mode (or mock runs in real
+   time). Not fixed here: `runtime/core.py` and `pirewall-start` are not
+   phase 18's.
+2. **`benign_fp.py` bugs fixed.** (a) Clean-device totals and the verdict
+   subtracted only `--exclude-mac` MACs, so an attacker's decisions after
+   its ground-truth window (its `@offenders` entry outlives the window)
+   counted as benign enforce actions; MACs with an attack window are now
+   lab devices for the whole span (`attack_window_macs` in the report).
+   (b) Ground-truth windows labelled `benign:*` (from `background.py`)
+   excluded the very devices that are the clean data; they are now skipped.
+3. **`pirewall-start --data-mode mock --engine v2` does not reach core**: the
+   flag goes to the preflight and the manifest but not into the mock
+   config, so core runs the config's engine. `replay.py --engine` works
+   around it by passing a config copy. Its "no pcap" message still says the
+   phase-18 generator "does not exist yet". Both are phase 16's file; hand
+   over.
+
+**Deviations.** `lab` was added to ruff's isort `known-first-party` (the
+other `pyproject.toml` tool paths were added in the first session); both are
+recorded in V2_CONTRACTS §12. `replay.py` matches decisions by MAC, falling
+back to the ground truth's attacker IP for v1 events (they carry no MAC).
+`benign/background.py` takes `--env-tag` without the Pi check (it runs on
+client devices; the Pi-side capture is the checked artifact), as its
+docstring says. No detector, threshold, policy table or guard default was
+changed.
+
+**Environment-dependent (RUNBOOK_PI):** the benign capture on the Pi (step
+5); scripted profiles from client devices (step 21); campaigns #1 and #2
+(steps 21, 23), including `capture.sh` and `preflight.py` on real hardware;
+the offline G5 run on real `pi-live` data (step 24).
 
 ### Handoff pass (2026-10-29)
 

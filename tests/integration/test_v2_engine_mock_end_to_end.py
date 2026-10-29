@@ -7,6 +7,10 @@ fixture is inline, as the phase prompt allows. Mocked: nothing reaches the
 kernel; the "block" is an element in `FakeSetBackend`.
 
 Skipped where `AF_UNIX` is unavailable.
+
+Phase 18 addition: `test_the_mock_data_sets_scanner_is_acted_on` replays the
+generated mock data set (`lab/mock/gen_pcaps.py`) when it exists, and the
+inline fixture otherwise.
 """
 
 import socket
@@ -139,3 +143,83 @@ def test_the_scanner_is_acted_on_and_the_browser_is_not(
 
 def mac_of_str(address: str) -> str:
     return ":".join(f"{byte:02x}" for byte in mac_of(address))
+
+
+# Phase 18 (additive): the same check on the generated mock data set when it exists
+# (`uv run python lab/mock/gen_pcaps.py --seed 1`), else on the inline fixture above.
+_GENERATED: Final = _REPO / "lab" / "mock" / "out"
+_GENERATED_SCAN: Final = "vertical_scan_t4"
+
+
+def _mock_source(workdir: Path) -> tuple[Path, dict[str, str], str, frozenset[str]]:
+    """(pcap, network overrides, scanner MAC, benign MACs): generated if present, else inline."""
+    import ipaddress
+    import json
+
+    manifest_path = _GENERATED / "manifest.json"
+    pcaps = sorted(_GENERATED.glob(f"*_{_GENERATED_SCAN}.pcap")) if manifest_path.is_file() else []
+    if not pcaps:
+        capture_file = workdir / "mock.pcap"
+        _write_pcap(capture_file)
+        return capture_file, {}, mac_of_str(ATTACKER), frozenset({mac_of_str(BROWSER)})
+    extra = json.loads(manifest_path.read_text(encoding="utf-8"))["extra"]
+    windows = [json.loads(line) for line in (_GENERATED / "ground_truth.jsonl").read_text().splitlines()]
+    scanner = str(next(window["mac"] for window in windows if window["label"] == _GENERATED_SCAN))
+    protected = str(extra["network"]["protected"])
+    network = {
+        "protected_network": protected,
+        "pirewall_lan_ip": str(extra["network"]["pi"]),
+        "upstream_gateway": str(next(ipaddress.ip_network(protected).hosts())),
+    }
+    return pcaps[0], network, scanner, frozenset(str(mac) for mac in extra["benign_macs"])
+
+
+@pytest.mark.parametrize("mode", [EnforcementMode.ACTIVE, EnforcementMode.SHADOW])
+def test_the_mock_data_sets_scanner_is_acted_on(workdir: Path, mode: EnforcementMode) -> None:
+    capture_file, network, scanner, benign = _mock_source(workdir)
+    socket_path = str(workdir / "core.sock")
+    overrides: dict[str, dict[str, object]] = {}
+    if network:
+        overrides["network"] = {**network}
+        overrides["admin"] = {"admin_pc_ip": network["pirewall_lan_ip"].rsplit(".", 1)[0] + ".50"}
+    config = make_config(
+        api={"rpc_socket_path": socket_path, "history_size": 2000},
+        firewall={"allowlist_store_path": str(workdir / "allowlist.json"), "enforcement_mode": mode.value},
+        capture={"interface": "eth1", "backend": "replay", "replay_path": str(capture_file)},
+        antispoof={"lease_file": str(workdir / "leases")},
+        pipeline={"engine": "v2"},
+        d1={"thresholds_path": str(_REPO / "config" / "d1_thresholds.toml")},
+        lab={"env_tag": "mock"},
+        **overrides,
+    )
+    capture, aggregator = build_replay_capture(config, rebase_to=datetime.now(UTC))
+    daemon = CoreDaemon(
+        config,
+        capture=capture,
+        native_aggregator=aggregator,
+        notifier=SystemdNotifier(notify_socket=None),
+        mock_firewall=True,
+    )
+    daemon.start()
+    try:
+        client = UnixSocketRpcClient(socket_path)
+
+        def scanner_rules() -> list[object]:
+            return [
+                rule for rule in client.list_rules() if rule.target is not None and rule.target.mac == scanner
+            ]
+
+        _wait_for(lambda: bool(scanner_rules()), "a decision on the mock data set's scanner")
+        time.sleep(0.5)
+        rules = client.list_rules()
+    finally:
+        daemon.stop()
+    acted = {
+        (rule.action, rule.status)
+        for rule in rules
+        if rule.target is not None and rule.target.mac == scanner
+    }
+    assert acted
+    if mode is EnforcementMode.SHADOW:
+        assert {status for _, status in acted} == {RuleStatus.SHADOWED}
+    assert not [rule for rule in rules if rule.target is not None and rule.target.mac in benign]

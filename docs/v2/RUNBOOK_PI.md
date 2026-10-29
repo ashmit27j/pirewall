@@ -74,19 +74,24 @@ already established and conntrack keeps it alive.
 
    ```sh
    sudo apt install -y tcpdump
-   sudo install -d -m 700 /var/lib/pirewall-lab/benign
-   df -h /var/lib/pirewall-lab                       # note free space
-   sudo systemd-run --unit=pirewall-benign-capture \
-     tcpdump -Z root -ni "$LAN" -s 128 -G 3600 -w '/var/lib/pirewall-lab/benign/benign-%Y%m%d%H.pcap'
-   # disk watchdog: stops the capture at 85% full
-   sudo systemd-run --unit=pirewall-capture-watchdog /bin/sh -c \
-     'while sleep 60; do u=$(df --output=pcent /var/lib/pirewall-lab | tail -1 | tr -dc 0-9); if [ "$u" -ge 85 ]; then systemctl stop pirewall-benign-capture; logger -p user.crit "pirewall benign capture stopped at ${u}% disk"; exit 0; fi; done'
-   systemctl status pirewall-benign-capture --no-pager | head -5
+   df -h /var/lib                                    # note free space
+   sudo bash lab/capture/benign_capture.sh start     # consent banner: type yes
+   sudo bash lab/capture/benign_capture.sh status
    ```
 
-   These are transient units: they stop on reboot. After a reboot, rerun the
-   two `systemd-run` lines. Phase 18 replaces this with
-   `lab/capture/benign_capture.sh`.
+   It writes hourly `benign-%Y%m%d%H.pcap` files (`-s 128`) on
+   `network.lan_interface` into a new session directory
+   `/var/lib/pirewall-lab/benign/<UTC stamp>/`, and its disk watchdog stops
+   it at 85% full and logs why. `sudo bash lab/capture/benign_capture.sh stop`
+   ends it and seals the session (`manifest.json`, env tag `pi-live`, with the
+   lab-MAC list of step 6). To keep it running unattended, as a transient unit
+   (it stops on reboot; rerun it after one, then seal the old session with
+   `sudo bash lab/capture/benign_capture.sh seal <session dir>`):
+
+   ```sh
+   sudo systemd-run --unit=pirewall-benign-capture \
+     bash "$PWD/lab/capture/benign_capture.sh" start --foreground --i-have-consent
+   ```
 
 6. **Write down every lab device's MAC** (Kali, test laptops) with the time
    it joined, in `/var/lib/pirewall-lab/lab_macs.txt`. Their traffic is
@@ -244,7 +249,7 @@ already established and conntrack keeps it alive.
     Exclude every MAC in `lab_macs.txt`:
 
     ```sh
-    sudo cp -r /var/lib/pirewall-lab/benign ~/benign && sudo chown -R "$USER" ~/benign
+    sudo cp -r /var/lib/pirewall-lab/benign/<session> ~/benign && sudo chown -R "$USER" ~/benign
     uv run python -m scripts.dataset.pcap_to_flows ~/benign --out ~/flows-benign \
       --config config/local_config.toml --continuous --env-tag pi-live
     uv run python -m scripts.train.fit_d1_thresholds ~/flows-benign --config config/local_config.toml \
@@ -269,19 +274,25 @@ already established and conntrack keeps it alive.
 
 ## H24–H30 — campaign #1, dev runs (after phase 18)
 
-21. Phase 18 provides `lab/preflight.py`, `lab/run_campaign.py`,
-    `lab/attacks/*.sh` and `lab/score_run.py`. The exact flags are in
-    `lab/README.md` once it exists; the shape is:
+21. `lab/README.md` has every flag. Copy `lab/` to Kali first
+    (`scp -r lab kali@<kali-ip>:lab`; it needs hping3, nmap, masscan, hydra,
+    slowhttptest, dsniff, isc-dhcp-client). Then, on the Pi:
 
     ```sh
     sudo scripts/deployment/pirewall-start --lab-victim up
-    sudo uv run python lab/preflight.py
-    sudo uv run python lab/run_campaign.py lab/campaigns/dev.toml --attacker kali@<kali-ip>
-    uv run python lab/aggregate.py lab/runs/<campaign-id>
+    sudo uv run python lab/preflight.py --host kali@<kali-ip>
+    CAMPAIGN=(--attacker kali@<kali-ip> --attacker-ip <kali LAN ip> --attacker-mac <kali LAN mac>
+              --param neighbour_ip=<a bound household IP> --param attacker_iface=<kali LAN iface>
+              --param wordlist=<wordlist path on kali>)
+    sudo uv run python lab/run_campaign.py lab/campaigns/dev.toml "${CAMPAIGN[@]}" --dry-run   # read it
+    sudo uv run python lab/run_campaign.py lab/campaigns/dev.toml "${CAMPAIGN[@]}"
+    uv run python lab/score_run.py lab/runs/<stamp>-dev/*/
+    uv run python lab/aggregate.py lab/runs/<stamp>-dev --out lab/runs/<stamp>-dev-aggregate
     ```
 
-    Also start scripted benign traffic on your own client devices:
-    `python lab/benign/background.py --profile mixed` (pi-scripted).
+    Also start scripted benign traffic on your own client devices (copy
+    `lab/` there too):
+    `python3 lab/benign/background.py --profile mixed --env-tag pi-scripted`.
 
 ## H28–H30 — ML training on own data (after phase 19)
 
@@ -302,13 +313,24 @@ already established and conntrack keeps it alive.
     uv run python -m scripts.train.fit_d1_thresholds ~/flows-benign --config config/local_config.toml \
       --assume-benign --exclude-mac <kali-mac> --freeze --out config/d1_thresholds.toml
     sha256sum config/d1_thresholds.toml pirewall/policy/table.toml   # record both
-    sudo uv run python lab/run_campaign.py lab/campaigns/eval.toml --attacker kali@<kali-ip>
+    sudo uv run python lab/run_campaign.py lab/campaigns/eval.toml "${CAMPAIGN[@]}"   # refuses unfrozen thresholds
+    uv run python lab/score_run.py lab/runs/<stamp>-eval/*/
+    uv run python lab/aggregate.py lab/runs/<stamp>-eval --out lab/runs/<stamp>-eval-aggregate
     ```
 
 24. Offline G5 over every clean `pi-live` hour, including the held-out
-    window (phase 18's `lab/benign_fp.py`). It prints
-    "forward guard may enforce: yes/no". Only on "yes" may you run
-    `sudo scripts/deployment/pirewall-start --guard-forward enforce`.
+    window. Per sealed capture session (step 5):
+
+    ```sh
+    uv run python -m scripts.dataset.pcap_to_flows ~/benign --out ~/flows-g5 \
+      --config config/local_config.toml --continuous --env-tag pi-live
+    uv run python lab/benign_fp.py ~/flows-g5 --out lab/runs/g5-$(date +%Y%m%d) --pcaps ~/benign \
+      --config config/local_config.toml --capture-manifest ~/benign \
+      --ground-truth lab/runs/<stamp>-dev/*/ground_truth.jsonl --ground-truth lab/runs/<stamp>-eval/*/ground_truth.jsonl
+    ```
+
+    It prints "forward guard may enforce: yes/no — <reason>". Only on "yes"
+    may you run `sudo scripts/deployment/pirewall-start --guard-forward enforce`.
 
 ## H41–H42 — review
 
@@ -324,7 +346,7 @@ already established and conntrack keeps it alive.
 |---|---|
 | Locked out, or anything looks wrong | `sudo scripts/deployment/pirewall-start --panic` (deletes the v2 tables; base policy stays) |
 | Back to v1 behaviour on the v2 data plane | `sudo scripts/deployment/pirewall-start --engine v1 --data-mode live` |
-| Stop the benign capture | `sudo systemctl stop pirewall-benign-capture pirewall-capture-watchdog` |
+| Stop the benign capture | `sudo bash lab/capture/benign_capture.sh stop` (or `sudo systemctl stop pirewall-benign-capture` for the systemd-run form; both seal the session) |
 | Undo PMF | `sudo nmcli connection modify "$AP" 802-11-wireless-security.pmf optional && sudo nmcli connection up "$AP"` |
 | Remove the `.pth` link | `sudo scripts/deployment/install_nftables_pth.sh --uninstall` |
 | Remove the lab victim | `sudo scripts/deployment/pirewall-start --lab-victim down` |

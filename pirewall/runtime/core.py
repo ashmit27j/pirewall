@@ -61,11 +61,15 @@ Capture selection
 `capture.backend` picks the path: `replay` reads pcaps through the same
 engine (`pirewall.capture.replay`), `python` forces `AFPacketCapture`, and
 `auto`/`native` use the TPACKET_V3 ring when the extension is installed.
-A replay sweeps flows on **its own clock** (the capture time of the last
-frame fed), from the capture thread, every `flow.cleanup_interval_seconds`
-of capture time: at `max` speed an hour of traffic passes in seconds, and
-the wall clock would expire nothing until the replay had ended. When the
-replay runs out, every flow still open is flushed to detection once.
+A replay runs on **its own clock** (the capture time of the last frame
+fed): the capture thread sweeps flows on it every
+`flow.cleanup_interval_seconds` of capture time, and detection evaluates
+v2 windows against it too (a completed flow's own `last_seen`, else the
+last frame fed). At `max` speed an hour of traffic passes in seconds; on
+the wall clock the sweep would expire nothing until the replay had ended,
+and D1 would count every connection start in its window as though the
+whole capture had happened at once. When the replay runs out, every flow
+still open is flushed to detection once.
 
 On the native ring, a caught engine panic (ADDENDUM_4.md D6) costs the poll
 or drain in flight and is reported as a `CAPTURE_ERROR` WARNING.
@@ -474,6 +478,9 @@ class CoreDaemon:
         self._native_shed: tuple[int, int] = (0, 0)
         # Replay clock bookkeeping (capture thread only).
         self._replay_last_sweep_us: int | None = None
+        # The capture time of the last frame fed: detection reads it to
+        # evaluate v2 windows on the replay's clock, not the wall clock.
+        self._replay_now_us: int | None = None
         self._replay_flushed = False
         # Constructed here and handed straight to `FirewallManager`, which
         # is the only code path permitted to call into
@@ -715,12 +722,15 @@ class CoreDaemon:
         if wanted == "replay":
             # D7 mock/replay mode: pcaps through the same engine, no NIC, no root.
             self._replay = True
-            capture, aggregator = build_replay_capture(config)
+            # Rebase onto the wall clock at start, so a decision's timestamps
+            # (and rule expiry) sit in the present while every gap — and so
+            # every feature — keeps its captured length.
+            capture, aggregator = build_replay_capture(config, rebase_to=datetime.now(UTC))
             if aggregator is None or config.capture.replay_path is None:
                 return capture, aggregator
             # One poll can feed thousands of frames, minutes of capture time
             # at `max` speed, so the replay clock is checked between frames.
-            sink = _ReplayClockSink(aggregator, self._sweep_on_replay_clock)
+            sink = _ReplayClockSink(aggregator, self._note_replay_time)
             return (
                 ReplayCapture(config.capture.replay_path, sink, speed=config.capture.replay_speed),
                 aggregator,
@@ -1246,7 +1256,7 @@ class CoreDaemon:
                 completed = aggregator.process_packet(packet)
             self._enqueue(completed)
             if self._replay:
-                self._sweep_on_replay_clock(int(packet.timestamp.timestamp() * 1_000_000))
+                self._note_replay_time(int(packet.timestamp.timestamp() * 1_000_000))
         if self._replay and not self._stop.is_set():
             self._finish_replay()
 
@@ -1298,9 +1308,14 @@ class CoreDaemon:
         """
         now_us = capture.virtual_now_us
         if now_us is not None:
-            self._sweep_on_replay_clock(now_us)
+            self._note_replay_time(now_us)
         if capture.finished and not self._replay_flushed:
             self._finish_replay()
+
+    def _note_replay_time(self, now_us: int) -> None:
+        """Record the replay's clock, then sweep flows if it crossed an interval. Capture thread."""
+        self._replay_now_us = now_us
+        self._sweep_on_replay_clock(now_us)
 
     def _sweep_on_replay_clock(self, now_us: int) -> None:
         """Sweep flows at the replay's own time, every `cleanup_interval_seconds` of it. Capture thread."""
@@ -1668,7 +1683,7 @@ class CoreDaemon:
                 cluster = self._slow_cluster_queue.get_nowait()
             except queue.Empty:
                 return
-            now = datetime.now(UTC)
+            now = self._detection_now()
             if self._v2 is not None:
                 self._v2.observe_slow_cluster(cluster, now)  # D1 slow-rate DoS (ported B2)
                 continue
@@ -1886,6 +1901,23 @@ class CoreDaemon:
         self._drain_slow_clusters()
         _logger.info("detection loop exited")
 
+    def _detection_now(self, flow: Flow | None = None) -> datetime:
+        """The clock detection evaluates against: a replay's capture time, else the wall clock.
+
+        D1 connection starts are stamped with their capture time
+        (`flow.first_seen`), so windows must be evaluated on the same
+        clock: at `datetime.now` every start of an accelerated replay
+        would land in one wall-clock window. A completed record is
+        evaluated at its own `last_seen` (when that start became visible);
+        between records, at the last frame fed.
+        """
+        if self._replay:
+            if flow is not None:
+                return flow.last_seen
+            if self._replay_now_us is not None:
+                return from_microseconds(self._replay_now_us)
+        return datetime.now(UTC)
+
     def _process_v2(self, flow: Flow | None) -> None:
         """One v2 detection step: a completed record (if any), the inbox, then D1 + policy. Detection thread.
 
@@ -1893,7 +1925,7 @@ class CoreDaemon:
         """
         v2 = self._v2
         assert v2 is not None
-        now = datetime.now(UTC)
+        now = self._detection_now(flow)
         try:
             if flow is not None:
                 self._pop_tls_evidence(flow)  # v2 drops JA3/Heartbleed (PLAN_FINAL §4.8); free the cache

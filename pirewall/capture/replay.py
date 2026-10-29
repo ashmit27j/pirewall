@@ -22,12 +22,12 @@ the replay runs on a *virtual clock*, the capture's own (`virtual_now_us`).
 
 **Rebasing.** `rebase_to` shifts every timestamp by one constant (so the
 first frame lands at `rebase_to`), which keeps every gap, and so every
-feature, bit-identical. Core sweeps timeouts on the wall clock, so a replay
-fed to core is rebased to "now"; at `"max"` speed its virtual clock then
-runs ahead of the wall clock, and inactivity timeouts fire only once the
-wall clock catches up (completion and the active timeout are packet-driven
-and unaffected). Offline tools (`scripts/dataset/pcap_to_flows.py`) do not
-rebase and sweep on the virtual clock instead.
+feature, bit-identical. Core selects a config replay rebased to "now", so
+its timestamps — and the rule expiry derived from them — sit in the
+present; it then sweeps and evaluates on the virtual clock, which at
+`"max"` speed runs ahead of the wall clock. Offline tools
+(`scripts/dataset/pcap_to_flows.py`) do not rebase and sweep on the
+virtual clock instead.
 
 A directory is replayed as one continuous capture, its files in name order.
 """

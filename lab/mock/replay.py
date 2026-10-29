@@ -24,15 +24,18 @@ fakes, with no root and no nft. This script:
 4. stops pirewall-start (SIGINT, as Ctrl-C) and seals the run directory:
    `kind = "replay"`, env tag `mock`, always.
 
-**`--engine`**: `pirewall-start --data-mode mock` builds core's config from
-`--config` and does not apply its own `--engine` to it, so this script
-writes a copy of the config with `pipeline.engine` set and passes that.
+**`--engine`**: this script writes a copy of the config with
+`pipeline.engine` set and passes that, so the engine is pinned by the run's
+own input regardless of what the source config or `pirewall-start` would
+otherwise choose. (`pirewall-start --data-mode mock --engine` also reaches
+core now; the copy keeps the run self-describing.)
 
-**Not a benign-FP measurement.** At `max` speed core's wall-clock D1
-windows each see far more than their span of capture time, so benign
-devices can draw decisions that a real-time replay does not produce
-(lab/README.md). Use it as a pipeline regression check; use
-`lab/benign_fp.py` (capture time) for false positives.
+**Benign false positives.** D1 evaluates a replay on the capture clock
+(phase-18 hand-over fix), so `max` speed no longer stretches its windows;
+but this driver also exercises replay pacing and the production evaluation
+cooldown, so treat it as a pipeline regression check. Use
+`lab/benign_fp.py` (capture time, offline) for the false-positive
+measurement (lab/README.md).
 
 The replay rebases capture timestamps to "now", so decisions are matched to
 the ground truth by device: the event's MAC (v2), else its source IP

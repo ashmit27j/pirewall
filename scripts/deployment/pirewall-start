@@ -1058,9 +1058,12 @@ mock_main() {
   local pcap="${PCAP:-${REPO_ROOT}/lab/mock/out}"
   [[ -e "$pcap" ]] || refuse "no pcap at ${pcap}" \
     "Pass one:  --pcap PATH  (a .pcap/.pcapng file or a directory of them). lab/mock/out is written
-by the phase 18 mock generator, which does not exist yet."
+by lab/mock/gen_pcaps.py:  uv run python lab/mock/gen_pcaps.py --seed 1"
   local run_dir="${RUN_DIR:-${REPO_ROOT}/.pirewall-mock}"
   local api_port="${PIREWALL_MOCK_API_PORT:-18443}"
+
+  local -a mock=(mock-config --run-dir "$run_dir" --pcap "$pcap" --api-port "$api_port")
+  [[ -n "$ENGINE" ]] && mock+=(--engine "$ENGINE")
 
   local -a pre=(preflight --data-mode mock)
   [[ -n "$ENGINE" ]] && pre+=(--engine "$ENGINE")
@@ -1070,18 +1073,19 @@ by the phase 18 mock generator, which does not exist yet."
   (( CHECK_ONLY )) && { printf '\n%spreflight passed — nothing was changed (--check)%s\n' "$C_GREEN" "$C_RESET"; exit "$EXIT_OK"; }
 
   if (( DRY_RUN )); then
-    run "$VENV_PY" -m scripts.deployment.startup --config "$config_source" mock-config \
-      --run-dir "$run_dir" --pcap "$pcap" --api-port "$api_port"
+    run "$VENV_PY" -m scripts.deployment.startup --config "$config_source" "${mock[@]}"
     run "$VENV_PY" -m pirewall.main --config "${run_dir}/mock_config.toml" --data-mode mock
     run "$VENV_PY" -m pirewall.api --config "${run_dir}/mock_config.toml"
-    run "$VENV_PY" -m scripts.deployment.startup --config "${run_dir}/mock_config.toml" manifest \
-      --out "${run_dir}/manifest.json" --data-mode mock --no-kernel
+    local -a dry_manifest=(manifest --out "${run_dir}/manifest.json" --data-mode mock --no-kernel)
+    [[ -n "$MANIFEST_COPY" ]] && dry_manifest+=(--out "$MANIFEST_COPY")
+    [[ -n "$ENGINE" ]] && dry_manifest+=(--engine "$ENGINE")
+    run "$VENV_PY" -m scripts.deployment.startup --config "${run_dir}/mock_config.toml" "${dry_manifest[@]}"
     return 0
   fi
 
   local mock_env
-  mock_env="$("$VENV_PY" -m scripts.deployment.startup --config "$config_source" mock-config \
-    --run-dir "$run_dir" --pcap "$pcap" --api-port "$api_port")" || die "could not prepare ${run_dir}"
+  mock_env="$("$VENV_PY" -m scripts.deployment.startup --config "$config_source" "${mock[@]}")" \
+    || die "could not prepare ${run_dir}"
   eval "$mock_env"
   ok "run directory ${run_dir} (config, throwaway TLS, admin password)"
 

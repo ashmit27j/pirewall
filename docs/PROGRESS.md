@@ -96,8 +96,9 @@ exit 0, with and without `--engine v2` (env=mock).
    So these are a mock-fidelity artifact, not detector FPs; but any mock
    replay result about benign devices is meaningless until core evaluates
    D1 on the replay's virtual clock in mock mode (or mock runs in real
-   time). Not fixed here: `runtime/core.py` and `pirewall-start` are not
-   phase 18's.
+   time). **Fixed in the phase-18 hand-over pass** (below): core now
+   rebases a config replay to "now" and evaluates v2 windows on the
+   capture clock.
 2. **`benign_fp.py` bugs fixed.** (a) Clean-device totals and the verdict
    subtracted only `--exclude-mac` MACs, so an attacker's decisions after
    its ground-truth window (its `@offenders` entry outlives the window)
@@ -110,7 +111,9 @@ exit 0, with and without `--engine v2` (env=mock).
    config, so core runs the config's engine. `replay.py --engine` works
    around it by passing a config copy. Its "no pcap" message still says the
    phase-18 generator "does not exist yet". Both are phase 16's file; hand
-   over.
+   over. **Fixed in the phase-18 hand-over pass** (below): `mock-config
+   --engine` sets `pipeline.engine`, and the refusal names
+   `lab/mock/gen_pcaps.py`.
 
 **Deviations.** `lab` was added to ruff's isort `known-first-party` (the
 other `pyproject.toml` tool paths were added in the first session); both are
@@ -125,6 +128,39 @@ changed.
 5); scripted profiles from client devices (step 21); campaigns #1 and #2
 (steps 21, 23), including `capture.sh` and `preflight.py` on real hardware;
 the offline G5 run on real `pi-live` data (step 24).
+
+### Phase 18 hand-over fixes (2026-10-30)
+
+**Scope.** Phase 18 findings 1 and 3, fixed off-Pi while the Pi ran the
+SHADOW soak (no deploy, restart or Pi command). Ownership exception is
+recorded in V2_CONTRACTS §12; no detector threshold, policy table, guard
+default or contract changed.
+
+| Deliverable | Label |
+|---|---|
+| Replay detection clock (`pirewall/runtime/core.py`): a config-selected replay is rebased to "now"; v2 detection evaluates on the capture clock — a completed record at its `last_seen`, otherwise the last frame fed; the slow-cluster drain follows the same clock | Tested (env=mock) |
+| D1 window bounds (`pirewall/detection_v2/d1.py`): device, destination, global and per-account series count only `since <= at <= now`, so an accelerated replay's already-fed later events cannot inflate an earlier window | Tested (unit + env=mock) |
+| `pirewall-start --data-mode mock --engine` reaches core: `mock-config --engine` writes `pipeline.engine`; the dry run and the real path both pass it to the manifest; the no-pcap refusal names `lab/mock/gen_pcaps.py` | Tested (unit; the dry-run test needs a POSIX host with nft/systemd) |
+| Regression test `tests/integration/test_replay_detection_clock.py`: 25 benign sessions 12 s apart plus a trailing scan at `evaluation_cooldown_seconds = 0`; asserts no benign decision and waits for the scanner's (a positive "detection drained" signal) | Tested (python path); native variant skips where the extension is not built |
+| Docs honesty: `pirewall/capture/replay.py`, `lab/mock/replay.py`, `lab/README.md` describe the replay clock, not wall-clock D1 | Implemented |
+
+**Deviation (ownership).** The fixes edit `pirewall/runtime/core.py`
+(integrator owners 14/16/17/19), `scripts/deployment/pirewall-start` and
+`startup.py` (16) and `pirewall/detection_v2/d1.py` (17). The human
+authorized this cross-phase hand-over because the bugs block every mock
+replay result; the edits are confined to the replay clock, D1 window
+bounds and mock `--engine` propagation.
+
+**Gates (macOS host, no Pi access).** `ruff check` clean and `pyright`
+0 errors on the whole tree. Full `pytest`: 1953 passed, 80 skipped, 40
+failed — the same 40 environment failures as the clean `d3a9fec` baseline
+on this host (36 `test_lab_attacks.py` from bash 3.2's `set -u` array
+expansion, 1 portal-socket test needing a `root` group, 2 model-hash tests
+needing the absent model artifacts, 1 mock end-to-end test whose process
+exits before cleanup). Baseline: 1951 passed, 78 skipped, 40 failed. The
+new test's native variant and the dry-run test skip here
+(`pirewall_native` not built; no nft/systemd). Not run: WSL and the root
+netns tier (34/34 last recorded on Linux).
 
 ### Handoff pass (2026-10-29)
 

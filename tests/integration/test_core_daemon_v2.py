@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -188,8 +188,10 @@ def test_capture_backend_replay_is_selected_and_swept_on_the_replay_clock(
     """Phase 15 hand-off: core picks the replay from config, and sweeps at capture time.
 
     The pcap starts at `T0_US` (March 2026) and spans ~6 minutes, replayed
-    at max speed. A wall-clock sweep would land months later, at most once;
-    the replay-clock sweeps land at capture times, ~every 30 s of them.
+    at max speed. Core rebases it to "now", and a wall-clock sweep would
+    land months after the capture's start, at most once; the replay-clock
+    sweeps land at capture times, ~every 30 s of them, so they span the
+    pcap's whole ~6 minutes even though it drains in about a second.
     """
     if native and not native_engine_available():
         pytest.skip("pirewall_native not built")
@@ -214,6 +216,7 @@ def test_capture_backend_replay_is_selected_and_swept_on_the_replay_clock(
         original(now)
 
     monkeypatch.setattr(daemon, "_sweep_flows", record)
+    started = datetime.now(UTC)
     daemon.start()
     try:
         client = UnixSocketRpcClient(str(workdir / "core.sock"))
@@ -222,9 +225,14 @@ def test_capture_backend_replay_is_selected_and_swept_on_the_replay_clock(
         assert client.get_engine_stats().backend == "replay"
     finally:
         daemon.stop()
-    capture_start = datetime.fromtimestamp(T0_US / 1_000_000, UTC)
     assert sweeps, "the replay should have been swept on its own clock"
-    assert all(abs((sweep - capture_start).total_seconds()) < 400 for sweep in sweeps)
+    # Rebasing puts the capture in the present; the sweeps still land on
+    # its ~6 minutes of capture time, which no wall-clock sweep could do in
+    # a replay that drains in about a second. The sessions are 120 s apart,
+    # so a 30 s cleanup interval sweeps at 120, 240 and 360 s.
+    assert len(sweeps) >= 3
+    assert max(sweeps) - min(sweeps) >= timedelta(seconds=200)
+    assert all(abs((sweep - started).total_seconds()) < 400 for sweep in sweeps)
 
 
 class _PanickingCapture(FakeFlowCapture):

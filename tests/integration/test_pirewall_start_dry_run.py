@@ -176,6 +176,31 @@ def test_mock_mode_uses_no_root_no_nft_and_no_systemd(
     assert not any(command.startswith(("nft", "systemctl", "install ", "useradd")) for command in commands)
 
 
+def test_mock_mode_passes_an_explicit_engine_to_the_mock_config(
+    setup: tuple[Path, dict[str, str]], tmp_path: Path
+) -> None:
+    pcap = tmp_path / "mock.pcap"
+    pcap.write_bytes(b"")
+
+    commands = _commands(
+        _run(
+            *setup,
+            "--dry-run",
+            "--data-mode",
+            "mock",
+            "--pcap",
+            str(pcap),
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--engine",
+            "v2",
+        )
+    )
+
+    assert "--engine v2" in commands[_index(commands, " mock-config")]
+    assert "--engine v2" in commands[_index(commands, " manifest")]
+
+
 def test_mock_mode_refuses_without_a_pcap(setup: tuple[Path, dict[str, str]], tmp_path: Path) -> None:
     result = _run(*setup, "--dry-run", "--data-mode", "mock", "--pcap", str(tmp_path / "absent.pcap"))
 

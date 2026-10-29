@@ -419,6 +419,17 @@ def test_the_mock_config_lives_entirely_in_its_run_directory(tmp_path: Path) -> 
         assert Path(path).is_relative_to(run_dir), path
 
 
+def test_the_mock_config_applies_a_requested_engine(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    pcap = tmp_path / "x.pcap"
+
+    default = startup.mock_config(_config(tmp_path), run_dir, pcap, 18443, "hash")
+    overridden = startup.mock_config(_config(tmp_path), run_dir, pcap, 18443, "hash", "v2")
+
+    assert default.pipeline.engine is PipelineEngine.V1
+    assert overridden.pipeline.engine is PipelineEngine.V2
+
+
 # -------------------------------------------------------------------- lab
 
 

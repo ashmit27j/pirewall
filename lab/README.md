@@ -72,13 +72,12 @@ uv run python lab/mock/replay.py --engine v2          # sealed run under lab/run
 Same seed and scale give byte-identical files. `--scale 0.05` makes a
 small set for quick tests.
 
-**Do not read benign false positives off a mock replay.** `pirewall-start
---data-mode mock` replays at `max` speed, and core evaluates its D1 windows
-on the wall clock, so a fast replay squeezes minutes of capture into each
-10 s window. Replaying `00_benign.pcap` alone, core BLOCKs benign devices
-for `horizontal_scan` at `max` and `20x` speed and makes no decision at all
-in real time (env=mock, `docs/PROGRESS.md` phase 18 findings). Judge
-benign false positives with `benign_fp.py`, which runs on capture time.
+**Read benign false positives from `benign_fp.py`.** A mock replay now
+evaluates D1 on the capture clock (phase-18 hand-over fix), so `max` speed
+no longer squeezes minutes of capture into one 10 s window; the driver
+still exercises replay pacing and the production evaluation cooldown, so
+it is a pipeline regression check. `benign_fp.py` runs on capture time and
+is the false-positive measurement.
 
 ### pi-live: benign capture (RUNBOOK_PI.md step 5)
 

@@ -456,6 +456,13 @@ Every other phase reaches them through their public API.
   order.
 * Phase 15 runs in parallel with 13 but must not edit `runtime/core.py`. Its
   `ReplayCapture` is wired into capture selection by phase 16.
+* **Phase 18 hand-over exception (2026-10-30).** The human authorized
+  phase 18's owner to fix its two hand-over findings across
+  `pirewall/runtime/core.py` (14/16/17/19), `scripts/deployment/pirewall-start`
+  and `startup.py` (16) and `pirewall/detection_v2/d1.py` (17). The edits
+  are confined to the replay clock, D1 window bounds and mock `--engine`
+  propagation, with regression tests; no contract, threshold or policy
+  change. Recorded as a deviation in `docs/PROGRESS.md`.
 
 ## 13. Phase-17 additions
 

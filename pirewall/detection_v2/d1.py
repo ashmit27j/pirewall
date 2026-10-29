@@ -354,7 +354,7 @@ class D1State:
         measured: dict[ThresholdKey, float] = {}
         for window in self._windows:
             since = now - timedelta(seconds=window)
-            events = [event for event in device.events if event.at >= since]
+            events = [event for event in device.events if since <= event.at <= now]
             values: dict[D1Detector, float] = {
                 D1Detector.VERTICAL_SCAN: _max_distinct(
                     events, lambda e: e.destination_ip, lambda e: e.destination_port
@@ -364,7 +364,10 @@ class D1State:
                 ),
                 D1Detector.BRUTE_FORCE: self._brute_force(events),
                 D1Detector.SLOW_RATE_DOS: float(
-                    max((count for count, at in device.slow.values() if at >= since), default=0)
+                    max(
+                        (count for count, at in device.slow.values() if since <= at <= now),
+                        default=0,
+                    )
                 ),
             }
             ratio = self._failed_ratio(events)
@@ -394,7 +397,7 @@ class D1State:
         measured: dict[ThresholdKey, float] = {}
         for window in self._windows:
             since = now - timedelta(seconds=window)
-            macs = {mac for at, mac in arrivals if at >= since}
+            macs = {mac for at, mac in arrivals if since <= at <= now}
             measured[ThresholdKey(D1Detector.FAN_IN, "destination", window)] = float(len(macs))
         return measured
 
@@ -420,7 +423,7 @@ class D1State:
                 (D1Detector.PORTAL_AUTH_FAILURES, self._portal_failures),
             ):
                 measured[ThresholdKey(detector, "global", window)] = float(
-                    sum(1 for at in series if at >= since)
+                    sum(1 for at in series if since <= at <= now)
                 )
         return measured
 
@@ -434,7 +437,7 @@ class D1State:
         for window in self._windows:
             since = now - timedelta(seconds=window)
             for account, failures in self._accounts.items():
-                recent = [mac for at, mac in failures if at >= since]
+                recent = [mac for at, mac in failures if since <= at <= now]
                 macs = set(recent)
                 # One device behind every failure: the evidence can name it.
                 culprit = next(iter(macs)) if len(macs) == 1 else None

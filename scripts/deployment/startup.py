@@ -823,14 +823,20 @@ def mock_config(
     pcap: Path,
     api_port: int,
     password_hash: str,
+    engine: str | None = None,
 ) -> PirewallConfig:
     """`source` rewritten to run entirely inside `run_dir`: replay, loopback, no portal, no forwarding.
 
     Nothing in the result points at a system path: sockets, logs, state and
     TLS all live under `run_dir`, so a mock run needs no root and leaves the
     host untouched. The env tag is `mock` (D7), never a `pi-*` tag.
+
+    `engine` overrides `pipeline.engine` when `pirewall-start --engine` was
+    given; `None` keeps the source config's engine.
     """
     data = source.model_dump(mode="json")
+    if engine is not None:
+        data["pipeline"]["engine"] = engine
     data["capture"].update(backend="replay", replay_path=str(pcap), replay_speed="max")
     data["api"].update(
         host="127.0.0.1",
@@ -875,7 +881,9 @@ def make_throwaway_tls(directory: Path) -> None:
     (directory / "pirewall.key").chmod(0o600)
 
 
-def prepare_mock_run(source_path: Path, run_dir: Path, pcap: Path, api_port: int) -> dict[str, str]:
+def prepare_mock_run(
+    source_path: Path, run_dir: Path, pcap: Path, api_port: int, engine: str | None = None
+) -> dict[str, str]:
     """Write the mock config, password and TLS into `run_dir`. Returns shell variables for the script."""
     run_dir.mkdir(parents=True, exist_ok=True)
     run_dir.chmod(0o700)
@@ -885,7 +893,14 @@ def prepare_mock_run(source_path: Path, run_dir: Path, pcap: Path, api_port: int
     password_file.chmod(0o600)
     (run_dir / "dnsmasq.leases").touch()
     make_throwaway_tls(run_dir / "tls")
-    config = mock_config(load_config(source_path), run_dir, pcap.resolve(), api_port, hash_password(password))
+    config = mock_config(
+        load_config(source_path),
+        run_dir,
+        pcap.resolve(),
+        api_port,
+        hash_password(password),
+        engine=engine,
+    )
     config_path = run_dir / "mock_config.toml"
     config_path.write_text(
         "# Written by pirewall-start --data-mode mock. Throwaway; lives only in this run directory.\n"
@@ -991,6 +1006,12 @@ def build_parser() -> argparse.ArgumentParser:
     mock.add_argument("--run-dir", type=Path, required=True)
     mock.add_argument("--pcap", type=Path, required=True)
     mock.add_argument("--api-port", type=int, default=18443)
+    mock.add_argument(
+        "--engine",
+        choices=[engine.value for engine in PipelineEngine],
+        default=None,
+        help="override pipeline.engine",
+    )
 
     sub.add_parser("lab-env", help="shell variables for --lab-victim")
     lab = sub.add_parser("lab-ruleset", help="render the pirewall_lab table")
@@ -1008,7 +1029,10 @@ def _env_tag(config: PirewallConfig, data_mode: str | None) -> EnvTag:
 def _dispatch(args: argparse.Namespace, config_path: Path) -> int:
     command: str = args.command
     if command == "mock-config":
-        print(_shell(prepare_mock_run(config_path, args.run_dir, args.pcap, args.api_port)), end="")
+        print(
+            _shell(prepare_mock_run(config_path, args.run_dir, args.pcap, args.api_port, args.engine)),
+            end="",
+        )
         return EXIT_OK
     if command == "crashloop-alert":
         return crashloop_alert(config_path, args.unit)

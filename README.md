@@ -42,10 +42,27 @@ See `docs/SECURITY.md`.
 
 Full detail in `docs/ADDENDUM.md`.
 
+## v2 (in progress)
+
+v2 moves enforcement into the kernel: static nftables guards (anti-spoofing,
+flood and scan meters) that keep working when `pirewall-core` is down, plus
+per-device (MAC) adaptive sets driven by deterministic detectors and an
+explicit policy table. ML evidence can never cause more than MONITOR. The
+rules are in `docs/ADDENDUM_4.md` and `docs/V2_CONTRACTS.md`.
+
+Status: phases 11–17 are complete in code and tested in a sandbox and on
+mock data. **None of it has run on the Pi yet.** The default
+`pipeline.engine` is still `"v1"`. Phases 18–20 (lab harness, ML retraining,
+evaluation) are next. **New to the project? Start with `docs/HANDOFF.md`.**
+
 ## Documentation map
 
 | Doc | Covers |
 |---|---|
+| `docs/HANDOFF.md` | **Start here.** Current state, how to resume work, how to run the gates, the concepts to learn and a file-by-file map. |
+| `docs/ADDENDUM_4.md`, `docs/V2_CONTRACTS.md` | The v2 rulebook (D1–D9) and the frozen types, nft names, RPC signatures and file ownership. Newest; wins over everything below. |
+| `docs/v2/RUNBOOK_PI.md` | The operator's step-by-step v2 deployment and evaluation on the Pi. |
+| `docs/v2/PLAN_v3.md`, `docs/v2/prompts/` | The v2 design and the per-phase build prompts (11–20, plus `pi-session.md`). |
 | `docs/MASTER_SPEC.md` | The original, frozen specification. |
 | `docs/ADDENDUM.md` | Safety-oriented additions on top of the spec (wins on conflict). |
 | `docs/ADDENDUM_2.md` | Detection-timing additions: creation-time behaviour counters, slow-rate DoS, the evidence-maturity gate, Heartbleed, JA3. |

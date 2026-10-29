@@ -41,9 +41,32 @@ are regression evidence and are labelled as such.
 | 15 | Native hardening, pcap reader, replay capture backend | Complete | See "Phase 15 details" below. `panic = "unwind"` + `catch_unwind` everywhere; fuzzed 2 × 631 s with no crash (env=sandbox). Pcap replay and `pcap_to_flows.py` give rows equal to live features. Live-ring fallback is wired into core by phase 16. The Pi benchmark is written, not run. |
 | 16 | `pirewall-start` v2, deployment templates, systemd, data modes, lab victim | Complete: **v2.0 deployable** (Implemented/Tested/Mocked) | See "Phase 16 details" below. Suite 1631 passed / 38 skipped as `pw`, netns tier 33/33 as root, env=sandbox only. `--check` passes in mock mode on a dev machine. Nothing ran on the Pi: every kernel and systemd step there is Environment-dependent. |
 | 17 | D1 detectors, kernel offender poller, policy engine | Complete: **v2.1 (engine)** (Implemented/Tested/Mocked) | See "Phase 17 details" below. `pipeline.engine = "v2"` runs; default stays `"v1"` (human's call). Suite 1914 passed / 39 skipped as `pw`, netns tier 34/34 as root, env=sandbox/mock only. Thresholds ship as floors, `frozen = false`; fitting on `pi-live` data is Environment-dependent. Nothing ran on the Pi. |
-| 18 | Lab harness and data modes | Not started; **prompt not yet written** | Planned in PLAN_v3 §8. `docs/v2/prompts/phase-18-*.md` does not exist yet. |
-| 19 | ML on feature schema 3.0.0, from own pcaps | Not started; **prompt not yet written** | Planned in PLAN_v3 §8. |
-| 20 | Evaluation support, docs reconciliation, paper tables | Not started; **prompt not yet written** | Planned in PLAN_v3 §8. |
+| — | Handoff pass: phase 18–20 prompts, `RUNBOOK_PI.md`, `HANDOFF.md`, v2 merged to `main` | Complete (documentation only) | See "Handoff pass (2026-10-29)" below. No code changed. |
+| 18 | Lab harness and data modes | Not started; prompt ready | `docs/v2/prompts/phase-18-lab-harness.md`. Can start now. |
+| 19 | ML on feature schema 3.0.0, from own pcaps | Not started; prompt ready | `docs/v2/prompts/phase-19-ml-schema3.md`. Needs 18; real numbers need `pi-live` data (RUNBOOK_PI H0, H28). |
+| 20 | Evaluation support, docs reconciliation, paper tables | Not started; prompt ready | `docs/v2/prompts/phase-20-eval-docs-paper.md`. Needs everything, plus the human's Pi campaigns. |
+
+### Handoff pass (2026-10-29)
+
+**Scope.** Make the project resumable by any model or person, and give the
+human their Pi steps. Documentation only; no code, config or template
+changed, so no gate was rerun (the phase-17 gates above stand).
+
+| Deliverable | Label |
+|---|---|
+| `docs/v2/prompts/phase-18-lab-harness.md`, `phase-19-ml-schema3.md`, `phase-20-eval-docs-paper.md` (from PLAN_v3 §4/§8, PLAN_FINAL §5, critique_ml.md §10) | Implemented (documentation) |
+| `docs/v2/prompts/pi-session.md`: a prompt for a model assisting on the Pi | Implemented (documentation) |
+| `docs/v2/RUNBOOK_PI.md`: H0 → H42 Pi steps, commands checked against the current scripts and flags; harness steps marked "after phase 18" | Implemented (documentation); **not yet run on the Pi** |
+| `docs/HANDOFF.md`: state, resume procedure, gates, git workflow, concept guide and file map | Implemented (documentation) |
+| `docs/KNOWN_ISSUES.md` "v2 open items"; README doc map and v2 status; V2_CONTRACTS §12 rows 18–20 confirmed and `runtime/core.py` handed to 19 for ML wiring only | Implemented (documentation) |
+| `v2` fast-forwarded into `main` and pushed; work continues on `main` (human's instruction) | Done |
+
+**Choices.** The runbook gives a raw `tcpdump` + `systemd-run` benign
+capture for H0, because the capture must start hours before phase 18's
+`lab/capture/benign_capture.sh` can exist. Transient units only; nothing
+persistent is installed. Harness command lines in the runbook (H24+) are the
+planned shape and are marked to be checked against `lab/README.md` by
+phase 18.
 
 ### Phase 11 details
 

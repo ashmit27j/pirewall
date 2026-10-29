@@ -42,6 +42,10 @@ plaintext-HTTP limitation (C5), and loopback-only local console access to
 the control panel (C6).
 
 Current status of every phase is tracked in `docs/PROGRESS.md`.
+**`docs/HANDOFF.md` is the orientation file**: current state, how to resume,
+how to run the gates on this Windows + WSL setup, the git workflow (commit to
+`main` and push at the end of every phase; ask before any other branch), and
+a file map. Read it after this file.
 
 ## Session start checklist
 

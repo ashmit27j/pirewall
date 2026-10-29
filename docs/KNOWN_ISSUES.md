@@ -13,6 +13,7 @@ deliberate choice with a stated reason, not an oversight.
 Last reviewed: **2026-09-10**, after the first real client session and the
 move to a new uplink network. Items 1, 2 and 23 updated 2026-10-28 (v2
 phase 14b). Items 12, 18, 19 and 21 updated 2026-10-28 (final pass).
+"v2 open items" added 2026-10-29 (after phase 17).
 
 ---
 
@@ -43,6 +44,34 @@ phase 14b). Items 12, 18, 19 and 21 updated 2026-10-28 (final pass).
 | 21 | A flood evicts the bounded history buffers within seconds | Medium | Fixed for single-source floods (2026-10-28); spoofed-source floods still evict |
 | 22 | Restart button can't be built as `sudo` + sudoers under `NoNewPrivileges` | Low | Blocked |
 | 23 | Identity keyed on source IP; blocking weaponisable by spoofing (audit #12, #16) | High | Fixed in code (2026-10-28); kernel half live with phase 16; Pi `ether saddr` Environment-dependent |
+
+---
+
+## v2 open items (2026-10-29, after phase 17)
+
+Risks and gaps specific to v2 (phases 11–17). Phase 20 merges these into
+the numbered list above. "Where it's handled" names the RUNBOOK_PI step or
+phase that closes each one.
+
+| # | Item | Severity | Status | Where it's handled |
+|---|---|---|---|---|
+| V1 | No v2 code has run on the Pi. Every kernel, systemd, libnftables and native-ring claim is sandbox/mock evidence only. | High | Environment-dependent | RUNBOOK_PI H1–H22 |
+| V2 | `ether saddr` on brcmfmac `wlan0` is unverified. If it does not carry the station MAC, MAC identity, anti-spoof and per-MAC sets do not work on this hardware. | High | Environment-dependent | RUNBOOK_PI step 8 |
+| V3 | The templates have passed `nft -c` on nft 1.0.2 and 1.0.9 (sandbox) but not on the Pi's nft (expected 1.0.6). | High | Environment-dependent | RUNBOOK_PI step 7 |
+| V4 | Raw guard enforcing with an incomplete binding seed could drop a legitimate device, or the Admin PC if its MAC is wrong in config. Mitigated: raw stays in observe if seeding fails, and the admin rule pins interface + MAC + IP. Still unproven on hardware. | High | Reasoned; mitigated in code | RUNBOOK_PI steps 12–14 (second SSH session open) |
+| V5 | D1 thresholds are the shipped floors (`frozen = false`). `engine = "v2"` refuses ASSISTED/ACTIVE without a valid file; SHADOW warns. | Medium | By design until fitted | RUNBOOK_PI H20, H35 |
+| V6 | ML models are v1's CICIDS-trained schema-2.0.0 models (#1, #2). Under v2, D3 is corroboration only and D2 is not wired. | Medium | Capped at MONITOR | Phase 19 |
+| V7 | Forward guard stays in observe until the offline G5 check passes on `pi-live` data. Forward-path floods are only observed until then. | Medium | By design (D2) | Phase 18 `lab/benign_fp.py`, RUNBOOK_PI step 24 |
+| V8 | No lab harness: no benign-capture tooling, scripted profiles, mock pcaps, campaign runner or aggregation. `--data-mode mock` needs `--pcap`; scripted mode points at a script that doesn't exist yet. | Medium | Not started | Phase 18 |
+| V9 | Native Pi benchmark (`benchmarks/v2-native-pi/`) is written but has never run. The native ring's live fallback is tested only with a fake. | Medium | Environment-dependent | RUNBOOK_PI step 10 |
+| V10 | Wazuh decoder and `pirewall.v2.*` Netdata gauges were never seen in a real Wazuh/Netdata. | Medium | Environment-dependent | RUNBOOK_PI after H22 |
+| V11 | Crash-loop alert and `ReadOnlyPaths` lease access are systemd behaviour, tested only statically. | Medium | Environment-dependent | RUNBOOK_PI step 17 |
+| V12 | Default `pipeline.engine` is `"v1"`. Flipping it changes what the Pi runs on its next start. | Decision | Human's call | Phase 20 presents the evidence |
+| V13 | D1 threshold hot-reload exists (`D1State.replace_thresholds`) but nothing triggers it; a new thresholds file needs a core restart. | Low | Implemented, not wired | Unscheduled |
+| V14 | `pcap_to_flows` Parquet output has never run (no pyarrow anywhere). CSV is tested. | Low | Not yet validated | Phase 19 if needed |
+| V15 | Model sidecars predate `artifact_sha256`, so preflight only warns about them. | Low | Accepted until retrain | Phase 19 |
+| V16 | Client↔client traffic on the onboard radio is bridged in firmware and invisible to pirewall. | — | Out of scope (D8) | Paper limitation |
+| V17 | Benign capture records household traffic headers. Consent is needed, and pcaps must never be committed or leave your own machines. | Process | Operator's duty | RUNBOOK_PI step 5 |
 
 ---
 

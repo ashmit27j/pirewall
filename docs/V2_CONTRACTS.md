@@ -421,7 +421,7 @@ Every other phase reaches them through their public API.
 | File | Owner(s), in order | What each does there |
 |---|---|---|
 | `pirewall/firewall/manager.py` | **13**, then **14** | 13: set-backend path, `set_guard_mode`, kill switch, panic stub, reconcile. 14: `sync_bindings`, MAC targets, `blocking_rules_matching` by IP→MAC. |
-| `pirewall/runtime/core.py` | **14**, then **16**, then **17** | 14: lease-sync thread and `BindingTable` wiring. 16: RPC snapshot wiring and replay capture selection (`--data-mode mock`). 17: K poller and the `engine = "v2"` pipeline. |
+| `pirewall/runtime/core.py` | **14**, then **16**, then **17**, then **19** | 14: lease-sync thread and `BindingTable` wiring. 16: RPC snapshot wiring and replay capture selection (`--data-mode mock`). 17: K poller and the `engine = "v2"` pipeline. 19: schema-3.0.0 model loading and D2 wiring only. |
 | `pirewall/ipc/dispatcher.py` | **16** | The six v2 operations. `pirewall/ipc/protocol.py`'s `RpcOperation` additions go with them. |
 
 **Phase-owned paths.**
@@ -435,7 +435,9 @@ Every other phase reaches them through their public API.
 | 15 | `native/**` (hardening, fuzz; rebased on 14's MAC fields), `pirewall/capture/replay.py`, `pirewall/capture/pcapio.py`, `pirewall/flow/connection_start.py`, `scripts/dataset/**`, `benchmarks/v2-native-pi/` |
 | 16 | `scripts/deployment/pirewall-start`, `deploy/systemd/**`, `deploy/network/**`, `scripts/deployment/configure.py`, `scripts/deployment/install_nftables_pth.sh`, `docs/SETUP.md`, `setup-new-network.md`, the v2 API routes and control-panel panel (`pirewall/api/**` and `pirewall/web/**`, after 12) |
 | 17 | `pirewall/policy/**`, `pirewall/detection_v2/**`, `pirewall/runtime/pipeline.py`, `pirewall/engine/**`, `scripts/train/fit_d1_thresholds.py`, `config/d1_thresholds.toml`, `deploy/wazuh/pirewall_decoder.xml` |
-| 18–20 | **Prompts not yet written.** Tentatively, from PLAN_v3 §8: 18 `lab/**` (harness, data modes, aggregate); 19 ML datasets and training on schema 3.0.0; 20 docs reconciliation and paper tables. Their prompts confirm or replace this row. |
+| 18 | `lab/**`, `tests/{unit,integration}/test_lab_*.py`, the `lab` optional-dependency group (scapy) in `pyproject.toml`; one additive edit to phase 17's `tests/integration/test_v2_engine_mock_end_to_end.py` (use the generated mock pcaps) |
+| 19 | `pirewall/features/**` (schema 3.0.0), `pirewall/ml/**`, `scripts/train/**`, `scripts/dataset/**` (after 15), `docs/FEATURE_SCHEMA.md`, `docs/ML_PIPELINE.md`, the ML-evidence wiring in `pirewall/runtime/pipeline_v2.py` and `pirewall/detection/coordinator.py` |
+| 20 | `lab/paper/**`, every non-frozen doc under `docs/`, `README.md`, `setup-new-network.md`, campaign-driven fixes in `lab/**` |
 
 **Shared, additive only.**
 

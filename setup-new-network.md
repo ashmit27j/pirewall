@@ -301,6 +301,31 @@ allow_local_console = true        # lets you open the panel on the Pi's own desk
 
 ## 6. Bring the stack up
 
+### 6.0 v2 steps (once per Pi)
+
+`docs/SETUP.md` "v2 bring-up" has the reasoning. In order:
+
+```sh
+sudo apt install python3-nftables
+sudo scripts/deployment/install_nftables_pth.sh              # links it into the venv, verifies the import
+uv run python -m scripts.deployment.configure --set-admin-pc   # confirm the Admin PC's MAC + interface
+uv run python -m scripts.deployment.configure --static-bindings  # devices with a fixed address (optional)
+sudo systemctl disable --now nftables.service                # its `flush ruleset` would wipe pirewall
+echo "net.ipv6.conf.${PI_LAN_IF:-wlan0}.disable_ipv6 = 1" | sudo tee /etc/sysctl.d/60-pirewall-ipv6.conf
+sudo sysctl --system
+sudo scripts/deployment/pirewall-start --check                # every refusal prints its fix
+```
+
+`configure.py` already asks for the MAC on a fresh config; `--set-admin-pc`
+is for a config written before v2. Then bring it up as below.
+
+**Recovery:** `sudo scripts/deployment/pirewall-start --panic` deletes the
+three v2 tables and prints the restore command
+(`sudo scripts/deployment/pirewall-start`). The base table and the portal
+stay.
+
+### 6.1 Bring-up
+
 One idempotent script does the rest — accounts, directories, rulesets,
 services, in dependency order:
 

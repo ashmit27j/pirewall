@@ -37,10 +37,11 @@ from pathlib import Path
 
 from pirewall.config.loader import load_config
 from pirewall.config.models import PirewallConfig
+from pirewall.core.enums import EnvTag
 from pirewall.core.exceptions import ConfigurationError, PirewallError
 from pirewall.core.logging import configure_logging
 from pirewall.portal.demo_policy import refuse_demo_accounts_when_enforcing
-from pirewall.runtime.core import CoreDaemon
+from pirewall.runtime.core import CoreDaemon, check_engine_implemented
 
 _COMPONENT = "core"
 _DEFAULT_CONFIG_PATHS = (Path("config/local_config.toml"), Path("config/default_config.toml"))
@@ -74,7 +75,38 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="validate the configuration and exit without starting capture or binding sockets",
     )
+    parser.add_argument(
+        "--data-mode",
+        choices=("live", "scripted", "mock"),
+        default=None,
+        help="ADDENDUM_4.md D7. live/scripted claim the pi-live/pi-scripted env tag; mock runs "
+        "against in-memory firewall fakes and needs capture.backend = replay "
+        "(scripts/deployment/pirewall-start sets all of this up)",
+    )
     return parser
+
+
+_ENV_TAG_FOR_DATA_MODE = {"live": EnvTag.PI_LIVE, "scripted": EnvTag.PI_SCRIPTED, "mock": EnvTag.MOCK}
+
+
+def apply_data_mode(config: PirewallConfig, data_mode: str | None) -> PirewallConfig:
+    """Set `lab.env_tag` for an explicit `--data-mode` (D7); refuse an unsafe mock.
+
+    Without `--data-mode` the config's own tag stands (default `sandbox`), so
+    a Pi result is only ever claimed explicitly. Mock mode swaps the real
+    firewall for in-memory fakes, which is only meaningful against a pcap
+    replay: on a live interface it would capture real traffic and enforce
+    nothing while appearing to, so it is refused.
+    """
+    if data_mode is None:
+        return config
+    if data_mode == "mock" and config.capture.backend != "replay":
+        raise ConfigurationError(
+            '--data-mode mock needs capture.backend = "replay" (and capture.replay_path); '
+            "it never captures from a live interface"
+        )
+    lab = config.lab.model_copy(update={"env_tag": _ENV_TAG_FOR_DATA_MODE[data_mode]})
+    return config.model_copy(update={"lab": lab})
 
 
 def load(config_path: Path) -> PirewallConfig:
@@ -92,6 +124,8 @@ def main(argv: list[str] | None = None) -> int:
     config_path = args.config if args.config is not None else default_config_path()
     config = load(config_path)
     try:
+        config = apply_data_mode(config, args.data_mode)
+        check_engine_implemented(config)
         # Before anything privileged opens, like a bad config (PLAN_FINAL §4.9).
         refuse_demo_accounts_when_enforcing(config)
     except ConfigurationError as exc:
@@ -106,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
     logger = logging.getLogger(__name__)
     logger.info("pirewall-core starting with config %s (log: %s)", config_path, log_path or "stderr")
 
-    daemon = CoreDaemon(config)
+    daemon = CoreDaemon(config, mock_firewall=args.data_mode == "mock")
     daemon.install_signal_handlers()
     try:
         daemon.start()

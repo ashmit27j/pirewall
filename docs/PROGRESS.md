@@ -39,7 +39,7 @@ are regression evidence and are labelled as such.
 | 14b | Interim: four live risks on today's v1 Pi (fail-open guards, ML ceiling, lease-file path, portal migration) | Complete | See "Phase 14b details" below. Not a planned phase; approved by the human 2026-10-28. Edits two phase 16 files (deviation 1). Netns tier 31/31, env=sandbox only. Nothing ran on the Pi. |
 | — | Known-issues pass: KNOWN_ISSUES #12, #18, #19, #21 | Complete | See "Known-issues pass (2026-10-28)" below. Not a planned phase. No nft, native or config change. Nothing ran on the Pi. |
 | 15 | Native hardening, pcap reader, replay capture backend | Complete | See "Phase 15 details" below. `panic = "unwind"` + `catch_unwind` everywhere; fuzzed 2 × 631 s with no crash (env=sandbox). Pcap replay and `pcap_to_flows.py` give rows equal to live features. Live-ring fallback is wired into core by phase 16. The Pi benchmark is written, not run. |
-| 16 | `pirewall-start` v2, deployment templates, systemd, data modes, lab victim | Not started | Prompt: `phase-16-startup-deploy.md`. Depends on 13, 14, 15. Marks **v2.0 deployable**. |
+| 16 | `pirewall-start` v2, deployment templates, systemd, data modes, lab victim | Complete: **v2.0 deployable** (Implemented/Tested/Mocked) | See "Phase 16 details" below. Suite 1631 passed / 38 skipped as `pw`, netns tier 33/33 as root, env=sandbox only. `--check` passes in mock mode on a dev machine. Nothing ran on the Pi: every kernel and systemd step there is Environment-dependent. |
 | 17 | D1 detectors, kernel offender poller, policy engine | Not started | Prompt: `phase-17-detection-policy.md`. Depends on 16. Marks **v2.1 (engine)**. |
 | 18 | Lab harness and data modes | Not started; **prompt not yet written** | Planned in PLAN_v3 §8. `docs/v2/prompts/phase-18-*.md` does not exist yet. |
 | 19 | ML on feature schema 3.0.0, from own pcaps | Not started; **prompt not yet written** | Planned in PLAN_v3 §8. |
@@ -796,6 +796,97 @@ is phase 19.
 - `pirewall-start` and `--data-mode mock` (phase 16);
 - the mock pcap generator (phase 18). The writer it needs exists.
 - any Pi run, including the benchmark.
+
+### Phase 16 details
+
+**Scope** (`docs/v2/prompts/phase-16-startup-deploy.md`, PLAN_v3 §4 and §6).
+One script brings the v2 stack up in every mode, refuses unsafe states and
+records a manifest. Integrator for `pirewall/runtime/core.py` and
+`pirewall/ipc/dispatcher.py` (V2_CONTRACTS §12). With this phase **v2.0 is
+deployable**: kernel guards, anti-spoofing and adaptive sets, driven by the
+v1 pipeline. `--engine v2` is refused until phase 17.
+
+**Gates (2026-10-29, env=sandbox: WSL2 Ubuntu 26.04, x86_64):**
+- `ruff check .` clean, and `pyright` (strict) 0 errors.
+- `pytest` as `pw`: **1631 passed, 38 skipped** (33 netns tests need root,
+  3 need `node`, 2 need the `panic-injection` build).
+- `tests/netns` as root: **33/33 passed**, including the two new lab-victim
+  tests.
+- `pirewall-start --check --data-mode mock --pcap <generated pcap>` as `pw`:
+  exit 0. It warns that both model sidecars predate `artifact_sha256`, and
+  reports `pirewall_native` with `HAS_PACKET_RING`. Without `--pcap` it
+  refuses (exit 2) because `lab/mock/out/` is phase 18's output.
+- `scripts/deployment/install_nftables_pth.sh` run for real as root against
+  a throwaway uv 3.12 venv and Debian's `python3-nftables`: install, a second
+  install (idempotent), `--check`, `--uninstall`, a missing system
+  interpreter (exit 2) and a missing venv (exit 2). After install the venv
+  imports `nftables` and loads `libnftables`, and still cannot import
+  `numpy` from `dist-packages` (only the one package is exposed).
+
+| Deliverable | Label | Evidence |
+|---|---|---|
+| 1. `pirewall-start` v2 flags: `--engine`, `--guards`, `--guard-{raw,input,forward}`, `--data-mode live\|scripted\|mock`, `--pcap`, `--panic`, `--lab-victim up\|down`, `--manifest`; `--check`, `--dry-run`, `--no-portal`, `--skip-nft` kept. Bad flags refused. | Tested (dry run) | `test_pirewall_start_dry_run.py` (12 tests) asserts the command order for live, scripted, mock, panic, lab up and lab down, guard-flag propagation, `--skip-nft`, and refusals. |
+| 1. Preflight refusals, exit 2 with a fix: `nftables.service` enabled with `flush ruleset`; IPv6 on the LAN; config needs migration; admin MAC (or admin interface) missing; model hash ≠ sidecar (skipped for `--engine v2` with ML off). Also refused: a `pi-*` data mode off a Pi, and `--engine v2` before phase 17. | Tested | `test_startup_helper.py` (preflight cases through `PIREWALL_PREFLIGHT_*` overrides and a fake `/proc` and `nftables.conf`). |
+| 1. Preflight reports (warnings): libnftables transport, `pirewall_native` + `HAS_PACKET_RING`, lease file readable, chrony sync. The lease-file report was missing from the earlier draft of this phase and was added in this session. | Tested | `test_the_reports_say_which_transport_and_engine`, `test_an_unreadable_lease_file_is_a_warning_not_a_refusal`; seen live in the `--check` run above. |
+| 1. Load order base → static → adaptive → seed bindings + `allow_bound` → guard verdicts → core → api → portal → `portal.nft`. Tables load with raw in observe; raw is raised to enforce only if the seed succeeded (D2). | Tested (order, seeding logic); **Environment-dependent** (real load on the Pi) | `test_a_live_bring_up_follows_the_v2_load_order`, `test_the_tables_load_with_raw_in_observe_whatever_was_asked`, `test_an_unseeded_raw_guard_is_left_in_observe`, `test_a_seeded_raw_guard_enforces`. `pi_addrs` is not a set: the templates use `${PIREWALL_LAN_IP}` (phase 13's decision, V2_CONTRACTS §7). |
+| 1. Manifest at `/var/lib/pirewall/manifest.json` + `--manifest` copy: git SHA + dirty flag, config hash, model hashes, `nft --version`, `uname -r`, guard modes (read back from the kernel where possible), `enforcement_mode`, `pipeline.engine`, env tag, ruleset hash. | Tested | `test_the_manifest_records_what_a_result_needs`, `test_mock_never_writes_a_pi_tag`. |
+| 1. `--panic`: deletes the three v2 tables (through core's RPC when it answers, else directly), prints the restore command, logs CRITICAL to syslog/journald. | Tested (RPC + dry run); netns-tested in phase 13 for the deletion itself | `test_panic_goes_through_the_helper`, `test_v2_rpc.py::test_panic_deletes_only_the_v2_tables_and_audits_at_critical`. |
+| 1. `--data-mode mock`: no root, no nft; core on `capture.backend=replay` + Fake firewall; API on 127.0.0.1 with a throwaway cert; env tag always `mock`. | Tested (end to end) | `test_mock_mode_end_to_end.py`: runs the real script as a normal user, replays a pcap, reads the flow and guard modes over RPC, logs in over HTTPS and reads `/api/v1/guards`. |
+| 1. `--data-mode scripted`: as live, tag `pi-scripted`, reminder to start `lab/benign/background.py`. | Tested (dry run); the profiles themselves are phase 18 | `test_scripted_mode_on_a_pi_claims_the_tag_and_reminds_about_the_profiles`. |
+| 1. `--lab-victim up\|down`, idempotent: netns + veth + /30 from `[lab]`, sshd/nginx/iperf3/DNS inside (each skipped with a warning if not installed), `pirewall_lab` table that marks LAN → victim forwards for `pirewall_base` to accept; `down` removes all of it. | Tested (env=sandbox, real kernel) | `tests/netns/test_lab_victim.py` (2 tests, root): `up` twice gives one table, one rule, one address, and the victim answers ping from a LAN client through the router's forward path; `down` twice leaves no netns, table, link or pid file, and the victim is unreachable. |
+| 2. systemd: core `ReadOnlyPaths=-/var/lib/NetworkManager` (the `-` lets core start without it); `OnFailure=pirewall-crashloop-alert.service` in `[Unit]`; the alert unit (oneshot, no capabilities, no `[Install]`) runs `startup crashloop-alert`: CRITICAL to syslog first (no config needed), then Wazuh if enabled; exit 1 if Wazuh failed. Tmpfiles: `/run/pirewall-lab` (root 0750) and a note on the manifest. | Tested (static + unit); **Environment-dependent** (systemd itself) | `test_systemd_hardening.py::TestCrashloopAlert` (4 tests); `test_startup_helper.py` crash-loop tests (4: Wazuh forward, syslog only, failed send exits 1, unloadable config still alerts). |
+| 3. `configure.py`: Admin PC MAC + interface offered from `ip -j neigh show` (all interfaces), never defaulted, unicast only; manual entry always available. LAN interface MAC shown (in `--detect` and as a config comment) for confirmation. `[guards]` (D2 default modes) and `[lab]` (victim, never `env_tag`) written. `--set-admin-pc` asks for the MAC and interface too, or takes `--admin-pc-mac`/`--admin-interface` when scripted, inserting the keys into a 1.x config. | Tested | `test_configure_v2.py` (14 tests), and the existing 58 configure/discovery tests unchanged. |
+| 4. `scripts/deployment/install_nftables_pth.sh` | Tested by hand (env=sandbox, see gates) | No automated test: it needs root and the Debian package. |
+| 5. RPC: `get_guard_modes`, `set_guard_mode`, `panic`, `list_offenders`, `list_bindings`, `get_engine_stats`, served from snapshots outside the core RPC lock. API routes (`pirewall/api/routes/guards.py`) and a control-panel panel (`pirewall/web/v2_panel.py`): guard toggles (admin only, password again for enforce), offenders, bindings, panic with a typed confirmation. | Tested | `test_v2_rpc.py` (12), `test_api_v2_routes.py` (13, including session and Admin-PC refusal on every route, 422/403 on enforce without/with a wrong password), `test_core_daemon_v2.py` (8, including `test_the_v2_reads_never_wait_for_the_rpc_lock`), `test_portal_privilege_boundary.py` (the portal has none of them). |
+| 5. Core integration (owned file): v2 tables checked every pass, a missing table is CRITICAL and never re-created; reconcile with elements left by a previous run; `capture.backend=replay` selected inside core; live-ring native panics fall back to `AFPacketCapture` with a CRITICAL (the phase 15 hand-over). | Tested; live ring **Environment-dependent** | `test_core_daemon_v2.py`. The fallback test monkeypatches `AFPacketCapture` with a fake; the real ring needs `CAP_NET_RAW` on the Pi. |
+| 6. Docs: `docs/SETUP.md` "v2 bring-up" section, the Admin PC MAC in "Changing the Admin PC", five troubleshooting rows (panic recovery, preflight refusals, raw left in observe, crash-loop alert, MAC lockout); `setup-new-network.md` §6.0 delta. `docs/V2_CONTRACTS.md` records the three contract additions below. | Implemented | Reviewed against the code: commands, flags and refusals match what the script does. |
+
+**Contract additions** (V2_CONTRACTS §0: additions only, each with its doc
+and pinning test): `nft_names.LAB_TABLE` and `LAB_FORWARD_MARK`;
+`ModelMetadata.artifact_sha256` (optional); the six v2 names in
+`RpcOperation`. Nothing was changed or removed.
+
+**Deviations and choices:**
+
+1. **`docs/v2/RUNBOOK_PI.md` does not exist.** The prompt reads it and names
+   its H1–H3 and H10 steps as the Environment-dependent part. Not invented
+   here (CLAUDE.md v2 rule 4). What a human must do on the Pi is listed
+   below instead.
+2. **No config field for the LAN interface MAC or "Pi addresses".** The
+   prompt asks `configure.py` to collect them, but no contract field exists
+   and adding one is not needed: the Pi's LAN address is the existing
+   `network.pirewall_lan_ip`, and `pi_addrs` is rendered from it (phase 13).
+   The detected LAN MAC is shown for confirmation and written as a comment.
+3. **Model sidecars without `artifact_sha256` warn, not refuse.** Every
+   artifact trained so far predates the field; refusing would block the Pi
+   until phase 19 retrains. A sidecar that has the field and mismatches is
+   refused.
+4. **Two refusals beyond the prompt's list:** a `pi-*` data mode on a
+   machine that is not a Raspberry Pi (D7: only Pi runs may carry the tag),
+   and `--engine v2` before phase 17 implements it.
+5. **Mock mode's default input `lab/mock/out/` is phase 18's.** Until then
+   `--data-mode mock` (and its `--check`) need `--pcap`.
+6. **A pre-existing date bomb fixed in `tests/unit/test_lease_sync.py`**
+   (phase 14's test, test-only change). `test_run_polls_until_stopped`
+   pinned `NOW = 2026-10-28` for the lease's expiry but let `LeaseSync.run`
+   use the real clock, so from 2026-10-29 the lease read as expired. The
+   test now passes `now_fn=lambda: NOW`.
+7. **The lab-victim netns test enters the router namespace with `nsenter
+   --net`, not `ip netns exec`.** The latter also gives the script a
+   private mount namespace, so the `/run/netns/<victim>` bind mount vanished
+   between runs. That is a harness artifact (on the Pi the script runs in
+   the host's mount namespace), documented in the test.
+
+**What a human needs to do on the Pi** (all Environment-dependent until
+then): `sudo apt install python3-nftables` and run the `.pth` installer;
+re-run `configure.py --set-admin-pc` to record the Admin PC MAC and
+interface; disable `nftables.service` and IPv6 on the LAN; run
+`pirewall-start --check`, then `pirewall-start`. Confirm the manifest, the
+guard modes on the control panel, that the Admin PC still reaches SSH and
+the panel, a real `--panic` and its restore, `--lab-victim up/down`, and the
+crash-loop alert (e.g. `systemctl kill -s SIGKILL pirewall-core` three times
+inside 300 s). `ether saddr` on brcmfmac `wlan0` remains Environment-dependent
+(phase 14).
 
 ### Known-issues pass (2026-10-28)
 

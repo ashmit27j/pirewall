@@ -50,6 +50,13 @@ _PRIVILEGED_OPERATIONS = frozenset(
         RpcOperation.PORTAL_SET_PASSWORD,
         RpcOperation.PORTAL_LIST_SESSIONS,
         RpcOperation.PORTAL_FORCE_LOGOUT,
+        # v2 (docs/V2_CONTRACTS.md §9): never on the portal socket.
+        RpcOperation.GET_GUARD_MODES,
+        RpcOperation.SET_GUARD_MODE,
+        RpcOperation.PANIC,
+        RpcOperation.LIST_OFFENDERS,
+        RpcOperation.LIST_BINDINGS,
+        RpcOperation.GET_ENGINE_STATS,
     }
 )
 

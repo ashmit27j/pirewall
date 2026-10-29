@@ -102,6 +102,19 @@ class DiscoveredNetwork:
     # (address, link-layer address) for the same reachable LAN neighbours, for
     # offering `[[antispoof.static]]` candidates. Also candidates, never answers.
     neighbour_macs: tuple[tuple[ipaddress.IPv4Address, str], ...] = ()
+    # v2 (ADDENDUM_4.md D3): every up, addressed interface, and its MAC where
+    # `ip -j addr` reported one. The LAN interface MAC is shown for the
+    # operator to confirm; the names are the admin-interface candidates.
+    interface_macs: tuple[tuple[str, str], ...] = ()
+    # (address, link-layer address, interface) for reachable neighbours on
+    # *every* interface, so the Admin PC's MAC can be offered whichever
+    # segment it sits on. Candidates, never answers.
+    all_neighbours: tuple[tuple[ipaddress.IPv4Address, str, str], ...] = ()
+
+    @property
+    def lan_mac(self) -> str | None:
+        """The LAN interface's own MAC, if `ip -j addr` reported one."""
+        return dict(self.interface_macs).get(self.lan_interface)
 
 
 def _run_ip(*arguments: str) -> Any:
@@ -284,6 +297,46 @@ def parse_neighbour_macs(payload: Any) -> list[tuple[ipaddress.IPv4Address, str]
     return sorted(found)
 
 
+def parse_interface_macs(payload: Any) -> list[tuple[str, str]]:
+    """(interface, MAC) for every up, non-loopback interface in `ip -j addr show` output.
+
+    Lowercased, not validated: a tunnel's all-zero or absent address is
+    simply skipped later by whoever needs a unicast MAC.
+    """
+    found: list[tuple[str, str]] = []
+    for entry in _as_array(payload) or []:
+        link = _as_object(entry)
+        if link is None:
+            continue
+        name = link.get("ifname")
+        address = link.get("address")
+        flags = _string_set(link.get("flags"))
+        if not isinstance(name, str) or name == "lo" or "LOOPBACK" in flags or "UP" not in flags:
+            continue
+        if isinstance(address, str) and address:
+            found.append((name, address.lower()))
+    return sorted(found)
+
+
+def parse_all_neighbours(payload: Any) -> list[tuple[ipaddress.IPv4Address, str, str]]:
+    """(address, link-layer address, interface) from `ip -j neigh show` across every interface.
+
+    The same filtering as `parse_neighbour_macs`, keeping `dev`. Entries
+    without a `dev` (never seen in practice) are skipped.
+    """
+    found: set[tuple[ipaddress.IPv4Address, str, str]] = set()
+    for entry in _as_array(payload) or []:
+        neighbour = _as_object(entry)
+        if neighbour is None:
+            continue
+        device = neighbour.get("dev")
+        if not isinstance(device, str) or not device:
+            continue
+        for address, mac in parse_neighbour_macs([neighbour]):
+            found.add((address, mac, device))
+    return sorted(found)
+
+
 def choose_lan_interface(
     addresses: list[InterfaceAddress], wan_interface: str
 ) -> tuple[InterfaceAddress, tuple[str, ...]]:
@@ -317,7 +370,8 @@ def choose_lan_interface(
 def discover() -> DiscoveredNetwork:
     """Read the live network layout. Raises `DiscoveryError` with an actionable message on failure."""
     wan_interface, upstream_gateway = parse_default_route(_run_ip("route", "show", "default"))
-    addresses = parse_addresses(_run_ip("addr", "show"))
+    address_payload = _run_ip("addr", "show")
+    addresses = parse_addresses(address_payload)
     lan, warnings = choose_lan_interface(addresses, wan_interface)
 
     neighbour_payload = _run_ip("neigh", "show", "dev", lan.interface)
@@ -340,4 +394,6 @@ def discover() -> DiscoveredNetwork:
         admin_pc_candidates=tuple(candidates),
         warnings=warnings,
         neighbour_macs=tuple(neighbour_macs),
+        interface_macs=tuple(parse_interface_macs(address_payload)),
+        all_neighbours=tuple(parse_all_neighbours(_run_ip("neigh", "show"))),
     )

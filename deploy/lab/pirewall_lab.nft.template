@@ -1,0 +1,27 @@
+#!/usr/sbin/nft -f
+# pirewall_lab — the forward-path lab victim's allowance (phase 16, PLAN_v3 §0.4).
+#
+# Rendered and loaded only by `pirewall-start --lab-victim up`, deleted by
+# `--lab-victim down`. Not a deployment template: `render_templates.py` never
+# renders this directory, and core never reads or writes this table.
+#
+# LAN -> labvictim crosses the forward hook exactly as Internet-bound traffic
+# does, so every static guard and adaptive set applies to it. This chain only
+# marks the new LAN -> victim packets; `pirewall_base`'s forward chain accepts
+# the mark (an accept here would end only this chain, and base's policy drop
+# would still drop the packet). Replies are `ct state established` there.
+#
+# Declare, then flush, then fill: reloading never deletes the table.
+
+table inet pirewall_lab {
+	chain forward { type filter hook forward priority 0; policy accept; }
+}
+
+flush chain inet pirewall_lab forward
+
+table inet pirewall_lab {
+	chain forward {
+		type filter hook forward priority 0; policy accept;
+		iifname "${LAN_INTERFACE}" oifname "${LAB_INTERFACE}" ip saddr ${PROTECTED_NETWORK} ip daddr ${LAB_VICTIM_IP} meta mark set ${LAB_FORWARD_MARK}
+	}
+}

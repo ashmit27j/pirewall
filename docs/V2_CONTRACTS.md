@@ -194,6 +194,16 @@ ports into `deploy/firewall/`, once they exist.
 static, arp. `BASE_TABLE` (`pirewall_base`) and `PORTAL_TABLE`
 (`pirewall_portal`) are named only so code can assert it never touches them.
 
+**Lab table (added by phase 16).** `LAB_TABLE` (`inet pirewall_lab`) is
+loaded only by `pirewall-start --lab-victim up` and deleted by `--lab-victim
+down`. Core never reads or writes it, and it is not in `PANIC_TABLES`: it is
+lab tooling, not enforcement. Its one rule sets `LAB_FORWARD_MARK`
+(`0x00007077`) on LAN → victim forwards, and `pirewall_base`'s forward chain
+accepts exactly that mark (an accept in a separate table cannot override
+base's `policy drop`). Pinned by
+`tests/unit/test_startup_helper.py::test_the_lab_ruleset_marks_only_lan_to_victim_traffic`
+and `::test_the_base_template_accepts_exactly_the_lab_mark`.
+
 **Chains.**
 
 * **`pirewall_static`:** `prerouting_frag`, `prerouting_raw`,
@@ -287,11 +297,22 @@ The defaults are the template's starting values (`docs/v2/v2/render.py`),
 not calibrated values. A rate and its burst are one threshold, and are
 fitted together.
 
+**Model sidecar (added by phase 16).** `ModelMetadata.artifact_sha256`
+(`pirewall/core/models/model_metadata.py`): optional lowercase-hex SHA-256 of
+the artifact the sidecar describes. `pirewall-start` refuses when it is set
+and does not match the file, and warns (recording the computed hash in the
+manifest) when it is absent, as in every artifact trained before phase 16.
+Pinned by `tests/unit/test_startup_helper.py::test_a_model_that_does_not_match_its_sidecar_hash_is_refused`
+and `::test_a_matching_hash_passes_and_a_missing_one_only_warns`.
+
 ## 9. RPC — `pirewall/ipc/protocol_v2.py`
 
-Six admin operations on `core.sock`, given as signatures only. Phase 16 adds
-them to `RpcOperation`, with handlers in `CoreRpcDispatcher`. **None of them
-is ever added to `PortalRpcDispatcher`** (C1).
+Six admin operations on `core.sock`, given as signatures only. Phase 16 added
+them to `RpcOperation` (same string values), with handlers in
+`CoreRpcDispatcher`; `tests/unit/test_v2_rpc.py::test_the_operation_names_are_the_frozen_contract`
+pins the two lists to each other. **None of them is ever added to
+`PortalRpcDispatcher`** (C1), pinned by
+`::test_the_portal_dispatcher_has_none_of_the_v2_operations`.
 
 ```python
 class CoreRpcV2(Protocol):

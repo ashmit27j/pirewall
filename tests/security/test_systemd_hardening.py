@@ -296,3 +296,31 @@ def test_tmpfiles_keeps_the_two_socket_directories_in_different_groups() -> None
     assert groups["/run/pirewall"] == "pirewall-ipc"
     assert groups["/run/pirewall-portal"] == "pirewall-portal-ipc"
     assert groups["/run/pirewall"] != groups["/run/pirewall-portal"]
+
+
+class TestCrashloopAlert:
+    """Phase 16: core's `OnFailure=` raises a CRITICAL; the alert unit itself holds no privilege."""
+
+    def test_core_triggers_the_alert_from_the_unit_section(self) -> None:
+        """`OnFailure=` is a [Unit] directive; under [Service] systemd ignores it."""
+        sections = _parse_sections("pirewall-core.service")
+        assert sections["Unit"].get("OnFailure") == ["pirewall-crashloop-alert.service"]
+        assert "OnFailure" not in sections.get("Service", {})
+
+    def test_core_can_read_the_lease_file_and_still_starts_without_it(self) -> None:
+        """D3 lease sync. The `-` prefix: a missing directory must not stop core from starting."""
+        read_only = " ".join(_parse_service("pirewall-core.service")["ReadOnlyPaths"]).split()
+        assert "-/var/lib/NetworkManager" in read_only
+
+    def test_the_alert_is_a_oneshot_with_no_capabilities(self) -> None:
+        directives = _parse_service("pirewall-crashloop-alert.service")
+        assert _first(directives, "Type") == "oneshot"
+        assert _first(directives, "CapabilityBoundingSet") == ""
+        assert _first(directives, "NoNewPrivileges") == "true"
+        assert _first(directives, "ProtectSystem") == "strict"
+        assert "AF_NETLINK" not in (_first(directives, "RestrictAddressFamilies") or "")
+        assert "crashloop-alert" in (_first(directives, "ExecStart") or "")
+
+    def test_the_alert_is_never_enabled_on_its_own(self) -> None:
+        """It runs only when core fails; an [Install] section would start it at boot."""
+        assert "Install" not in _parse_sections("pirewall-crashloop-alert.service")

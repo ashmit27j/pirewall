@@ -5,9 +5,12 @@ from fastapi.responses import HTMLResponse
 
 from pirewall.api.app import RpcClientDep
 from pirewall.core.exceptions import RpcError
+from pirewall.core.models.identity import Binding
 from pirewall.core.models.portal import PortalSession, PortalUser
 from pirewall.ipc.client import BaseRpcClient
+from pirewall.ipc.protocol_v2 import EngineStats, GuardModes, OffenderEntry
 from pirewall.web.render import render_dashboard, render_login_page
+from pirewall.web.v2_panel import V2PanelState
 
 public_router = APIRouter(prefix="/control-panel", tags=["web"])
 protected_router = APIRouter(prefix="/control-panel", tags=["web"])
@@ -41,7 +44,45 @@ def dashboard(rpc_client: RpcClientDep) -> HTMLResponse:
             detections,
             portal_users,
             portal_sessions,
+            v2=_v2_state(rpc_client),
         )
+    )
+
+
+def _v2_state(rpc_client: BaseRpcClient) -> V2PanelState:
+    """The v2 section's data, each part fetched on its own so one failure cannot hide the rest.
+
+    pirewall-core reports an error, rather than an empty value, for a v2
+    view it cannot serve (no set backend, tables deleted by panic, counters
+    not published yet). That is shown in the panel, not turned into a 503:
+    the rest of the dashboard is still accurate.
+    """
+    guards: GuardModes | None = None
+    guards_error: str | None = None
+    try:
+        guards = rpc_client.get_guard_modes()
+    except RpcError as exc:
+        guards_error = str(exc)
+    errors: list[str] = []
+    offenders: tuple[OffenderEntry, ...] = ()
+    bindings: tuple[Binding, ...] = ()
+    engine: EngineStats | None = None
+    try:
+        offenders = rpc_client.list_offenders()
+        bindings = rpc_client.list_bindings()
+    except RpcError as exc:
+        errors.append(f"v2 status unavailable: {exc}")
+    try:
+        engine = rpc_client.get_engine_stats()
+    except RpcError as exc:
+        errors.append(f"engine counters unavailable: {exc}")
+    return V2PanelState(
+        guards=guards,
+        guards_error=guards_error,
+        offenders=offenders,
+        bindings=bindings,
+        engine=engine,
+        errors=tuple(errors),
     )
 
 

@@ -32,3 +32,10 @@ class ModelMetadata(PirewallModel):
 
     is_placeholder: bool = False
     notes: str | None = None
+
+    # SHA-256 (lowercase hex) of the artifact file this sidecar describes.
+    # `pirewall-start` refuses to start when it does not match the file on
+    # disk (phase 16 preflight), and records it in the run manifest. Optional
+    # because artifacts trained before phase 16 carry none; for those the
+    # preflight warns and records the computed hash instead.
+    artifact_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")

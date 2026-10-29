@@ -17,10 +17,12 @@ from starlette.testclient import TestClient
 from pirewall.api.app import create_app
 from pirewall.config.models import PirewallConfig
 from pirewall.firewall.backend.fake import FakeFirewallBackend
+from pirewall.firewall.backend.fake_sets import FakeSetBackend
 from pirewall.firewall.manager import FirewallManager
 from pirewall.ipc.client import BaseRpcClient
 from pirewall.ipc.dispatcher import CoreRpcDispatcher
 from pirewall.ipc.loopback import LoopbackRpcClient
+from pirewall.ipc.snapshots import V2Snapshots
 from pirewall.ipc.state import CoreStateStore
 from tests.helpers.config import TEST_ADMIN_PASSWORD, TEST_ADMIN_USERNAME, make_config
 
@@ -66,6 +68,10 @@ class TestHarness:
     # as a typed field so tests that drive the RPC layer directly (or stub
     # a down core) don't have to reach through the untyped `app.state`.
     rpc_client: BaseRpcClient
+    # Set only by `make_harness(..., v2=True)`: the fake kernel sets and
+    # the snapshots the v2 read operations serve.
+    sets: FakeSetBackend | None = None
+    snapshots: V2Snapshots | None = None
 
     def get(self, url: str, **kwargs: Any) -> Response:
         return Response(self.client.get(url, **kwargs))  # pyright: ignore[reportUnknownMemberType]
@@ -84,6 +90,7 @@ def make_harness(
     now: datetime,
     *,
     client_address: tuple[str, int] = (ADMIN_PC_IP, 12345),
+    v2: bool = False,
     **config_overrides: dict[str, object],
 ) -> TestHarness:
     """Build a full app: FirewallManager + FakeFirewallBackend + CoreStateStore, wired via LoopbackRpcClient.
@@ -91,12 +98,18 @@ def make_harness(
     `client_address` simulates the connecting IP FastAPI sees
     (`request.client.host`) — defaults to the configured Admin PC so tests
     opt in to simulating a *different* source when testing the restriction.
+    `v2=True` adds a `FakeSetBackend` and `V2Snapshots`, as core wires them
+    from phase 16, with the guard modes published once.
     """
     config = make_config(**config_overrides)
     backend = FakeFirewallBackend()
-    manager = FirewallManager(config, backend)
+    sets = FakeSetBackend(lambda: now) if v2 else None
+    manager = FirewallManager(config, backend, set_backend=sets)
     state = CoreStateStore(max_history=50, started_at=now)
-    dispatcher = CoreRpcDispatcher(state, manager, config, now_fn=lambda: now)
+    snapshots = V2Snapshots() if v2 else None
+    if snapshots is not None:
+        snapshots.publish_guard_modes(manager.guard_modes(now))
+    dispatcher = CoreRpcDispatcher(state, manager, config, now_fn=lambda: now, snapshots=snapshots)
     rpc_client = LoopbackRpcClient(dispatcher)
     app = create_app(config, rpc_client)
     test_client = TestClient(app, client=client_address)
@@ -107,6 +120,8 @@ def make_harness(
         state=state,
         config=config,
         rpc_client=rpc_client,
+        sets=sets,
+        snapshots=snapshots,
     )
 
 

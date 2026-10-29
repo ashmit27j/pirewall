@@ -1,0 +1,5 @@
+# Shell scripts run under bash on Linux (the Pi, and the WSL test tier). A
+# CRLF checkout on Windows (core.autocrlf=true) breaks them, so they are
+# always LF in the working tree.
+*.sh text eol=lf
+scripts/deployment/pirewall-start text eol=lf

@@ -57,6 +57,17 @@ class RpcOperation(StrEnum):
     PORTAL_LIST_SESSIONS = "portal_list_sessions"
     PORTAL_FORCE_LOGOUT = "portal_force_logout"
 
+    # v2 admin operations (docs/V2_CONTRACTS.md §9, `pirewall.ipc.protocol_v2`).
+    # `CoreRpcDispatcher` only, never `PortalRpcDispatcher` (C1): guard
+    # flips and panic are as dangerous as the kill switch. The four reads are
+    # served from published snapshots, outside core's RPC lock.
+    GET_GUARD_MODES = "get_guard_modes"
+    SET_GUARD_MODE = "set_guard_mode"
+    PANIC = "panic"
+    LIST_OFFENDERS = "list_offenders"
+    LIST_BINDINGS = "list_bindings"
+    GET_ENGINE_STATS = "get_engine_stats"
+
 
 class RpcRequest(BaseModel):
     """One RPC call: a closed-set operation name plus its (operation-specific) parameters."""

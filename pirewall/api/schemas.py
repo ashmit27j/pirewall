@@ -7,10 +7,11 @@ need for a parallel, duplicate schema for read-only passthrough data.
 
 from datetime import datetime
 from ipaddress import IPv4Network
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
-from pirewall.core.enums import Protocol
+from pirewall.core.enums import GuardMode, Protocol
 from pirewall.core.models.common import UnicastMacAddress
 from pirewall.core.models.portal import PortalUser
 
@@ -117,3 +118,30 @@ class PortalUserResponse(BaseModel):
 
     user: PortalUser
     generated_password: str | None = None
+
+
+class GuardModeRequest(BaseModel):
+    """Flip one static guard (ADDENDUM_4.md D2). `password` is required to switch to ENFORCE.
+
+    Switching to observe needs no password: it only ever drops less. An
+    enforce flip needs the admin password again, like an allowlist addition,
+    because it starts dropping traffic on the LAN.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: GuardMode
+    password: SecretStr | None = Field(default=None, min_length=1)
+
+
+class PanicRequest(BaseModel):
+    """Delete the v2 tables (ADDENDUM_4.md D5). The literal `"panic"` is the confirmation.
+
+    A typed confirmation rather than a bare POST, so nothing reaches panic by
+    accident: a stray form submission or a replayed request without the
+    word does nothing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirm: Literal["panic"]

@@ -128,7 +128,16 @@ def create_app(
     """
     # Import routers lazily to keep any accidental heavy/forbidden import
     # (ADDENDUM.md A4) local to this one function, easy to spot in review.
-    from pirewall.api.routes import allowlist, events_stream, firewall, health, portal, read, rules
+    from pirewall.api.routes import (
+        allowlist,
+        events_stream,
+        firewall,
+        guards,
+        health,
+        portal,
+        read,
+        rules,
+    )
     from pirewall.api.routes import auth as auth_routes
     from pirewall.api.routes import config as config_routes
     from pirewall.web import routes as web_routes
@@ -169,6 +178,7 @@ def create_app(
     app.include_router(rules.router, dependencies=protected)
     app.include_router(allowlist.router, dependencies=protected)
     app.include_router(firewall.router, dependencies=protected)
+    app.include_router(guards.router, dependencies=protected)
     app.include_router(portal.router, dependencies=protected)
     app.include_router(web_routes.public_router, dependencies=admin_pc_only)
     app.include_router(web_routes.protected_router, dependencies=protected)

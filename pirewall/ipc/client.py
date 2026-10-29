@@ -14,6 +14,7 @@ from typing import Any, cast
 
 from pydantic import ValidationError
 
+from pirewall.core.enums import GuardMode, GuardName
 from pirewall.core.exceptions import RpcError
 from pirewall.core.models.allowlist import AllowlistEntry
 from pirewall.core.models.capture_stats import CaptureStatistics
@@ -21,6 +22,7 @@ from pirewall.core.models.decision import FirewallDecision
 from pirewall.core.models.detection_record import DetectionRecord
 from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.flow import Flow
+from pirewall.core.models.identity import Binding
 from pirewall.core.models.model_metadata import ModelMetadata
 from pirewall.core.models.portal import PortalClientState, PortalSession, PortalUser
 from pirewall.core.models.rule import FirewallRule
@@ -28,6 +30,7 @@ from pirewall.core.models.status import StatusResult
 from pirewall.core.models.threat import ThreatAssessment
 from pirewall.ipc._framing import read_all
 from pirewall.ipc.protocol import RpcOperation, RpcRequest, RpcResponse
+from pirewall.ipc.protocol_v2 import EngineStats, GuardModes, OffenderEntry, PanicResult
 
 
 class BaseRpcClient(ABC):
@@ -124,6 +127,32 @@ class BaseRpcClient(ABC):
     def record_event(self, event: SecurityEvent) -> SecurityEvent:
         data = self._require_data(RpcOperation.RECORD_EVENT, event.model_dump(mode="json"))
         return SecurityEvent.model_validate(data)
+
+    # --- v2 admin operations (docs/V2_CONTRACTS.md §9, `CoreRpcV2`) -------
+
+    def get_guard_modes(self) -> GuardModes:
+        return GuardModes.model_validate(self._require_data(RpcOperation.GET_GUARD_MODES))
+
+    def set_guard_mode(self, guard: GuardName, mode: GuardMode, actor: str) -> GuardModes:
+        """Flip one guard. The caller has already re-authenticated an ENFORCE flip."""
+        data = self._require_data(
+            RpcOperation.SET_GUARD_MODE, {"guard": guard.value, "mode": mode.value, "actor": actor}
+        )
+        return GuardModes.model_validate(data)
+
+    def panic(self, actor: str) -> PanicResult:
+        return PanicResult.model_validate(self._require_data(RpcOperation.PANIC, {"actor": actor}))
+
+    def list_offenders(self) -> tuple[OffenderEntry, ...]:
+        items = self._require_list(RpcOperation.LIST_OFFENDERS)
+        return tuple(OffenderEntry.model_validate(item) for item in items)
+
+    def list_bindings(self) -> tuple[Binding, ...]:
+        items = self._require_list(RpcOperation.LIST_BINDINGS)
+        return tuple(Binding.model_validate(item) for item in items)
+
+    def get_engine_stats(self) -> EngineStats:
+        return EngineStats.model_validate(self._require_data(RpcOperation.GET_ENGINE_STATS))
 
     # --- captive portal, client-facing (ADDENDUM_3.md C1) ------------------
     # Available on both sockets' clients as typed methods, but only the

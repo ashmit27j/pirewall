@@ -251,6 +251,14 @@ def test_registered_route_surface_matches_spec() -> None:
         ("/api/v1/portal/users/{username}", "DELETE"),
         ("/api/v1/portal/sessions", "GET"),
         ("/api/v1/portal/sessions/{client_ip}/logout", "POST"),
+        # v2 (docs/V2_CONTRACTS.md §9, phase 16): guard modes, panic and the
+        # snapshot reads. Same session + Admin-PC dependencies as the rest.
+        ("/api/v1/guards", "GET"),
+        ("/api/v1/guards/{guard}", "POST"),
+        ("/api/v1/firewall/panic", "POST"),
+        ("/api/v1/offenders", "GET"),
+        ("/api/v1/bindings", "GET"),
+        ("/api/v1/engine", "GET"),
         ("/control-panel/login", "GET"),
         ("/control-panel", "GET"),
     }

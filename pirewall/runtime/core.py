@@ -33,9 +33,45 @@ Threads, and why there is more than one
                      IP<->MAC `LeaseBindingTable` and writes changes to the
                      kernel binding sets (`pirewall.runtime.lease_sync`,
                      ADDENDUM_4.md D3). Never takes the RPC lock.
+`v2-watch`           Once a second: checks that the v2 tables still exist
+                     (CRITICAL on loss; core never recreates them, D5),
+                     reads the guard modes back from the kernel, and
+                     publishes them and the engine counters to
+                     `V2Snapshots`, which the four v2 read RPCs serve
+                     without the RPC lock. Never takes the RPC lock.
 main thread          `sd_notify` watchdog heartbeats, capture-statistics
                      refresh, and Netdata export.
 ===================  =========================================================
+
+Enforcement backend (phase 16)
+------------------------------
+
+With nothing injected, adaptive enforcement runs on the v2 set path:
+`NftablesSetBackend` into `inet pirewall_adaptive`, plus the binding and
+allowlist sets in `pirewall_static`. `pirewall-start` loads those tables
+before core starts; core reconciles with their live contents at start and
+never creates or deletes a table. The v1 `NftablesBackend` is still built,
+because the captive portal's `authed` set lives on it (C2).
+`mock_firewall=True` (`pirewall.main --data-mode mock`) swaps both for the
+in-memory fakes: no root, no nft, nothing on the host changes.
+
+Capture selection
+-----------------
+
+`capture.backend` picks the path: `replay` reads pcaps through the same
+engine (`pirewall.capture.replay`), `python` forces `AFPacketCapture`, and
+`auto`/`native` use the TPACKET_V3 ring when the extension is installed.
+A replay sweeps flows on **its own clock** (the capture time of the last
+frame fed), from the capture thread, every `flow.cleanup_interval_seconds`
+of capture time: at `max` speed an hour of traffic passes in seconds, and
+the wall clock would expire nothing until the replay had ended. When the
+replay runs out, every flow still open is flushed to detection once.
+
+On the native ring, a caught engine panic (ADDENDUM_4.md D6) costs the poll
+or drain in flight and is reported as a `CAPTURE_ERROR` WARNING.
+`capture.native_max_panics_per_minute` of them within 60 s abandons the
+ring for the Python `AFPacketCapture` path, salvaging the engine's open
+flows, with a CRITICAL event. A replay has no live fallback: it stops.
 
 Capture and detection are separated because they run at wildly different
 speeds. Single-flow Isolation Forest scoring was measured at ~30.7 ms/call on
@@ -83,17 +119,33 @@ from datetime import UTC, datetime
 from ipaddress import IPv4Address
 from pathlib import Path
 from types import FrameType
+from typing import Literal
 
 from pirewall.capture.af_packet import AFPacketCapture
 from pirewall.capture.interfaces import FlowCapture, PacketCapture, TcpPayload
 from pirewall.capture.native import NativePacketCapture, native_capture_available
 from pirewall.capture.parser import extract_tcp_payload
 from pirewall.capture.pipeline import capture_packets
+from pirewall.capture.replay import ReplayCapture, ReplayPacketCapture, build_replay_capture
 from pirewall.config.models import PirewallConfig
 from pirewall.core.binding_table import BindingTable
 from pirewall.core.bindings import LeaseBindingTable, static_bindings
-from pirewall.core.enums import EventSeverity, FailureMode, Protocol, SecurityEventType
-from pirewall.core.exceptions import CaptureError, ModelInferenceError, PirewallError
+from pirewall.core.enums import (
+    EventSeverity,
+    FailureMode,
+    GuardName,
+    PipelineEngine,
+    Protocol,
+    SecurityEventType,
+)
+from pirewall.core.exceptions import (
+    CaptureError,
+    ConfigurationError,
+    FirewallError,
+    ModelInferenceError,
+    NativeEngineError,
+    PirewallError,
+)
 from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.evidence import ProtocolSignatureEvidence
 from pirewall.core.models.flow import Flow
@@ -108,20 +160,26 @@ from pirewall.detection.tls_fingerprint import (
 )
 from pirewall.detection.tls_heartbeat import check_heartbleed
 from pirewall.firewall.allowlist_store import AllowlistStore
+from pirewall.firewall.backend.fake import FakeFirewallBackend
+from pirewall.firewall.backend.fake_sets import FakeSetBackend
 from pirewall.firewall.backend.nftables import NftablesBackend
+from pirewall.firewall.backend.nftables_sets import NftablesSetBackend
 from pirewall.firewall.interface import FirewallBackend
 from pirewall.firewall.manager import FirewallManager
 from pirewall.firewall.sets import SetBackend
 from pirewall.flow.aggregator import FlowAggregator, NewFlowSignal, SlowConnectionCluster
+from pirewall.flow.fallback import NativePanicBudget
 from pirewall.flow.key import FlowKey, compute_flow_key
-from pirewall.flow.native import NativeFlowAggregator, native_engine_available
+from pirewall.flow.native import NativeFlowAggregator, from_microseconds, native_engine_available
 from pirewall.integration.netdata import NetdataExporter, StatsdNetdataTransport
 from pirewall.integration.wazuh import SyslogWazuhTransport, WazuhForwarder
 from pirewall.ipc.dispatcher import CoreRpcDispatcher
 from pirewall.ipc.portal_dispatcher import PortalRpcDispatcher
 from pirewall.ipc.portal_service import PortalService
 from pirewall.ipc.protocol import RpcRequest, RpcResponse
+from pirewall.ipc.protocol_v2 import EngineStats
 from pirewall.ipc.server import UnixSocketRpcServer
+from pirewall.ipc.snapshots import V2Snapshots
 from pirewall.ipc.state import CoreStateStore
 from pirewall.portal.store import PortalUserStore
 from pirewall.runtime.forwarder import EventForwarder
@@ -174,6 +232,48 @@ _THREAD_JOIN_TIMEOUT_SECONDS = 5.0
 # Report dropped-flow backpressure at most this often, so a sustained
 # overload produces a steady signal instead of a log flood.
 _BACKPRESSURE_REPORT_INTERVAL = 1000
+# ADDENDUM_4.md D5: "core checks every second that both tables exist".
+_V2_WATCH_INTERVAL_SECONDS = 1.0
+
+# The pipelines this core can run. `pipeline.engine = "v2"` is phase 17's
+# policy engine; until it ships, a config asking for it is refused at
+# startup rather than silently run as v1 (`check_engine_implemented`).
+IMPLEMENTED_ENGINES: frozenset[PipelineEngine] = frozenset({PipelineEngine.V1})
+
+
+def check_engine_implemented(config: PirewallConfig) -> None:
+    """Raise `ConfigurationError` if `pipeline.engine` names a pipeline this core does not have."""
+    engine = config.pipeline.engine
+    if engine not in IMPLEMENTED_ENGINES:
+        available = ", ".join(sorted(item.value for item in IMPLEMENTED_ENGINES))
+        raise ConfigurationError(
+            f'pipeline.engine = "{engine.value}" is not implemented in this pirewall-core '
+            f"(available: {available}). The v2 policy engine ships in phase 17."
+        )
+
+
+def _describe_tables(tables: Iterable[tuple[str, str]]) -> str:
+    return ", ".join(f"{family} {table}" for family, table in tables)
+
+
+class _ReplayClockSink:
+    """A `FrameSink` that runs `on_time(ts_us)` before feeding each frame to the native engine.
+
+    `ReplayCapture.poll` feeds frames in a loop, so this is where the
+    capture thread can see the replay clock cross a sweep boundary between
+    two frames rather than only at the end of a poll.
+    """
+
+    def __init__(self, aggregator: NativeFlowAggregator, on_time: Callable[[int], None]) -> None:
+        self._aggregator = aggregator
+        self._on_time = on_time
+
+    def feed_us(self, raw: bytes, ts_us: int) -> None:
+        self._on_time(ts_us)
+        self._aggregator.feed_us(raw, ts_us)
+
+    def counters(self) -> tuple[int, int]:
+        return self._aggregator.counters()
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,11 +314,17 @@ class _SynchronizedDispatcher(CoreRpcDispatcher):
         manager: FirewallManager,
         config: PirewallConfig,
         portal: PortalService | None = None,
+        snapshots: V2Snapshots | None = None,
+        on_event: Callable[[SecurityEvent], None] | None = None,
     ) -> None:
-        super().__init__(state, manager, config, portal=portal)
+        super().__init__(state, manager, config, portal=portal, snapshots=snapshots, on_event=on_event)
         self._lock = lock
 
     def handle(self, request: RpcRequest) -> RpcResponse:
+        # The v2 reads touch only published immutable snapshots
+        # (V2_CONTRACTS §9), so they never queue behind the pipeline.
+        if request.operation in self.LOCK_FREE_OPERATIONS:
+            return super().handle(request)
         with self._lock:
             return super().handle(request)
 
@@ -256,14 +362,23 @@ class CoreDaemon:
         anomaly_queue_max: int = _ANOMALY_QUEUE_MAX,
         native_aggregator: NativeFlowAggregator | None = None,
         set_backend: SetBackend | None = None,
+        *,
+        mock_firewall: bool = False,
     ) -> None:
         """Build every subsystem. `capture`/`backend`/`notifier` are injectable for testing.
 
-        `set_backend` puts adaptive enforcement and the binding sets on the
-        v2 set path (`FirewallManager`'s docstring). It is a test seam until
-        phase 16 constructs `NftablesSetBackend` here by default; without
-        it, lease sync still keeps the binding table current (the portal, the
-        rule targets and the C4 checks read it) but writes no kernel sets.
+        Enforcement backends, in order of precedence:
+
+        * `mock_firewall=True`: `FakeFirewallBackend` + a `FakeSetBackend`
+          loaded with the configured guard modes, unless either is injected.
+          Used by `--data-mode mock`; nothing reaches the kernel.
+        * Nothing injected (production): the real `NftablesBackend` for the
+          portal and `NftablesSetBackend` for adaptive enforcement, the
+          bindings and the allowlist copy (ADDENDUM_4.md D1).
+        * `backend` injected without `set_backend`: the v1 rule path, kept
+          as a test seam. Lease sync still keeps the binding table current
+          (the portal, rule targets and the C4 checks read it) but writes no
+          kernel sets.
 
         Injecting `FakePacketCapture` and `FakeFirewallBackend` is what lets
         the whole daemon run without root, without a NIC, and without
@@ -271,10 +386,16 @@ class CoreDaemon:
         An injected `FlowCapture` (e.g. `FakeFlowCapture`) runs the native
         path and must come with the `native_aggregator` whose engine it
         feeds. With nothing injected, `capture.backend` picks the path.
+
+        Raises `ConfigurationError` when `pipeline.engine` names a pipeline
+        this core does not implement (`check_engine_implemented`).
         """
+        check_engine_implemented(config)
         self._config = config
         self._started_at = datetime.now(UTC)
         self._stop = threading.Event()
+        # The signal that asked for shutdown, logged by `run()` (never by the handler).
+        self._stop_signal: int | None = None
         # One lock for `CoreStateStore` + `FirewallManager`, shared with the
         # pipeline and the RPC dispatcher. Reentrant because the forwarder
         # can be called from inside a pipeline section that already holds it.
@@ -287,9 +408,22 @@ class CoreDaemon:
         # Set when `capture.backend = "native"` was asked for but could not
         # be honoured; reported as a SYSTEM_WARNING at start().
         self._capture_fallback_reason: str | None = None
+        # True when capture reads pcaps (`capture.backend = "replay"`, or an
+        # injected replay): flows are then swept on the replay's own clock.
+        self._replay = False
         self._capture: PacketCapture | FlowCapture
         self._native_aggregator: NativeFlowAggregator | None
         self._capture, self._native_aggregator = self._select_capture(config, capture, native_aggregator)
+        self._replay = self._replay or isinstance(self._capture, ReplayCapture | ReplayPacketCapture)
+        # D6: caught native panics, counted toward the live-ring fallback.
+        self._panic_budget = NativePanicBudget(config.capture.native_max_panics_per_minute)
+        self._panics_caught = 0
+        # Cumulative (completed flows, new-flow signals) the native engine
+        # shed at its per-drain caps; kept across a fallback to Python.
+        self._native_shed: tuple[int, int] = (0, 0)
+        # Replay clock bookkeeping (capture thread only).
+        self._replay_last_sweep_us: int | None = None
+        self._replay_flushed = False
         # Constructed here and handed straight to `FirewallManager`, which
         # is the only code path permitted to call into
         # `pirewall.firewall.backend` (CLAUDE.md). Deliberately not retained
@@ -297,9 +431,24 @@ class CoreDaemon:
         # daemon could deploy or remove a rule outside the manager's
         # validated lifecycle. `tests/security/test_backend_isolation.py`
         # asserts this file only ever *constructs* a backend.
-        firewall_backend: FirewallBackend = backend or NftablesBackend(
-            config.firewall.rate_limit_per_second
-        )
+        firewall_backend: FirewallBackend
+        if mock_firewall:
+            firewall_backend = backend or FakeFirewallBackend()
+            if set_backend is None:
+                set_backend = FakeSetBackend(
+                    lambda: datetime.now(UTC),
+                    adaptive_size=config.guards.adaptive_set_size,
+                    binding_size=config.guards.binding_set_size,
+                    guard_modes={
+                        GuardName.RAW: config.guards.raw_mode,
+                        GuardName.INPUT: config.guards.input_mode,
+                        GuardName.FORWARD: config.guards.forward_mode,
+                    },
+                )
+        else:
+            if backend is None and set_backend is None:
+                set_backend = NftablesSetBackend()
+            firewall_backend = backend or NftablesBackend(config.firewall.rate_limit_per_second)
 
         self._state = CoreStateStore(
             max_history=config.api.history_size, started_at=self._started_at
@@ -421,9 +570,25 @@ class CoreDaemon:
                 socket_group=config.portal.rpc_socket_group,
             )
 
+        # The v2 read views (V2_CONTRACTS §9). Bindings are served straight
+        # from the table's own immutable snapshot; the rest is published by
+        # the v2 watch thread.
+        self._snapshots = V2Snapshots(self._bindings.snapshot)
+        self._missing_tables: tuple[tuple[str, str], ...] = ()
         self._rpc_server = UnixSocketRpcServer(
             config.api.rpc_socket_path,
-            _SynchronizedDispatcher(self._lock, self._state, self._manager, config, self._portal),
+            _SynchronizedDispatcher(
+                self._lock,
+                self._state,
+                self._manager,
+                config,
+                self._portal,
+                snapshots=self._snapshots,
+                # The forwarder records *and* sends to Wazuh, so events the
+                # API reports (failed logins, allowlist additions) and every
+                # guard flip or panic reach the collector too.
+                on_event=self._forwarder.emit,
+            ),
         )
         self._lease_sync = LeaseSync(config, self._bindings, self._manager, on_event=self._forwarder.emit)
         self._notifier = notifier or SystemdNotifier()
@@ -439,6 +604,11 @@ class CoreDaemon:
     def bindings(self) -> BindingTable:
         """The live IP<->MAC binding table (read-only use: `snapshot`, `resolve_*`)."""
         return self._bindings
+
+    @property
+    def snapshots(self) -> V2Snapshots:
+        """The published v2 read views the four lock-free RPCs serve."""
+        return self._snapshots
 
     # ------------------------------------------------------------------ setup
 
@@ -457,6 +627,19 @@ class CoreDaemon:
             return capture, None
 
         wanted = config.capture.backend
+        if wanted == "replay":
+            # D7 mock/replay mode: pcaps through the same engine, no NIC, no root.
+            self._replay = True
+            capture, aggregator = build_replay_capture(config)
+            if aggregator is None or config.capture.replay_path is None:
+                return capture, aggregator
+            # One poll can feed thousands of frames, minutes of capture time
+            # at `max` speed, so the replay clock is checked between frames.
+            sink = _ReplayClockSink(aggregator, self._sweep_on_replay_clock)
+            return (
+                ReplayCapture(config.capture.replay_path, sink, speed=config.capture.replay_speed),
+                aggregator,
+            )
         native_ready = native_engine_available() and native_capture_available()
         if wanted != "python" and native_ready:
             aggregator = NativeFlowAggregator(
@@ -526,7 +709,11 @@ class CoreDaemon:
             signal.signal(signal_number, self._handle_signal)
 
     def _handle_signal(self, signal_number: int, _frame: FrameType | None) -> None:
-        _logger.info("received %s, shutting down", signal.Signals(signal_number).name)
+        # No logging in here: the handler runs on the main thread between
+        # bytecodes, possibly in the middle of that thread's own write to the
+        # log stream, and re-entering it raises (or deadlocks on a handler
+        # lock). `run()` logs the signal once the wait has returned.
+        self._stop_signal = signal_number
         self._stop.set()
 
     def start(self) -> None:
@@ -575,9 +762,10 @@ class CoreDaemon:
             self._capture.start()
             self._capture_started = True
             _logger.info(
-                "capture started on %s (%s path)",
-                self._config.capture.interface,
+                "capture started on %s (%s path%s)",
+                self._config.capture.replay_path if self._replay else self._config.capture.interface,
                 "native" if self._native_aggregator is not None else "python",
+                ", replay" if self._replay else "",
             )
         except CaptureError as exc:
             _logger.error("packet capture failed to start: %s", exc)
@@ -605,6 +793,10 @@ class CoreDaemon:
         # Bindings before anything serves a request: the portal refuses a
         # login without one, and the raw guard must not trust an unseeded set.
         self._seed_bindings()
+        # Then adopt whatever enforcement a previous run left in the kernel
+        # (D5 "restart"), and publish the first v2 views before RPC serves.
+        self._reconcile_sets()
+        self._refresh_v2_snapshots()
         self._spawn("pirewall-rpc", lambda: self._rpc_server.serve_until_stopped(self._stop))
         if self._portal_rpc_server is not None:
             portal_server = self._portal_rpc_server
@@ -614,6 +806,7 @@ class CoreDaemon:
         self._spawn("pirewall-detection", self._detection_loop)
         self._spawn("pirewall-sweep", self._sweep_loop)
         self._spawn("pirewall-lease-sync", lambda: self._lease_sync.run(self._stop))
+        self._spawn("pirewall-v2-watch", self._v2_watch_loop)
         if self._coordinator.models.isolation_forest is not None:
             self._spawn("pirewall-anomaly-inference", self._anomaly_inference_loop)
         if self._capture_started:
@@ -666,6 +859,115 @@ class CoreDaemon:
                 )
             )
 
+    def _reconcile_sets(self) -> None:
+        """Rebuild rule state from the live adaptive sets (D5 "restart"). Set path only.
+
+        Never creates or deletes a table: a missing one is reported CRITICAL
+        and left for `pirewall-start` to reload (D1).
+        """
+        if not self._manager.uses_set_backend:
+            return
+        now = datetime.now(UTC)
+        try:
+            with self._lock:
+                report = self._manager.reconcile(now)
+        except FirewallError as exc:
+            self._emit_system(
+                EventSeverity.ERROR, f"reconciling with the kernel's adaptive sets failed: {exc}"
+            )
+            return
+        if report.missing_tables:
+            # The v2 watch thread raises the CRITICAL table-loss event on its
+            # first pass; reporting it here too would say it twice.
+            _logger.error("v2 tables missing at startup: %s", _describe_tables(report.missing_tables))
+        if report.adopted or report.retired or report.unattributed:
+            self._emit_system(
+                EventSeverity.WARNING if report.unattributed else EventSeverity.INFO,
+                f"reconciled with the kernel at startup: adopted {len(report.adopted)} element(s) left by "
+                f"a previous run, retired {len(report.retired)}, left {len(report.unattributed)} "
+                "unattributed MAC-keyed element(s) to expire on their own (<= 1 h)",
+            )
+
+    def _v2_watch_loop(self) -> None:
+        """Once a second: table presence, guard modes and engine counters (D5, V2_CONTRACTS §9)."""
+        while not self._stop.wait(_V2_WATCH_INTERVAL_SECONDS):
+            try:
+                self._refresh_v2_snapshots()
+            except Exception:
+                _logger.exception("v2 watch pass crashed; continuing")
+        _logger.info("v2 watch loop exited")
+
+    def _refresh_v2_snapshots(self) -> None:
+        """Publish the engine counters, and on the set path check the tables and read the guards.
+
+        Runs without the RPC lock: everything it calls on the manager only
+        reads the set backend, which `FirewallManager` serialises itself.
+        """
+        now = datetime.now(UTC)
+        stats = self._engine_stats(now)
+        if stats is not None:
+            self._snapshots.publish_engine_stats(stats)
+        if not self._manager.uses_set_backend:
+            self._snapshots.publish_guard_modes(None, "this pirewall-core runs without the v2 set backend")
+            return
+        try:
+            missing = tuple(self._manager.missing_tables())
+        except FirewallError as exc:
+            _logger.warning("could not check the v2 tables: %s", exc)
+            missing = self._missing_tables
+        if missing != self._missing_tables:
+            self._report_table_change(missing)
+            self._missing_tables = missing
+        try:
+            self._snapshots.publish_guard_modes(self._manager.guard_modes(now))
+        except FirewallError as exc:
+            self._snapshots.publish_guard_modes(None, str(exc))
+
+    def _report_table_change(self, missing: tuple[tuple[str, str], ...]) -> None:
+        """CRITICAL when a v2 table disappears (D5 "table loss"); INFO when they are all back."""
+        if missing:
+            self._emit_system(
+                EventSeverity.CRITICAL,
+                f"v2 table(s) missing: {_describe_tables(missing)}. The static guards and adaptive sets "
+                "they hold are not enforcing. pirewall-core never recreates a table; reload them with "
+                "`sudo scripts/deployment/pirewall-start` (expected after a panic).",
+            )
+        else:
+            self._emit_system(EventSeverity.INFO, "every v2 table is loaded again")
+
+    def _engine_stats(self, now: datetime) -> EngineStats | None:
+        """The capture/flow engine counters `get_engine_stats` serves, or None if unreadable."""
+        try:
+            stats = self._capture.statistics()
+        except PirewallError as exc:
+            _logger.debug("capture statistics unavailable: %s", exc)
+            return None
+        backend: Literal["native", "python", "replay"] = (
+            "replay" if self._replay else "native" if self._native_aggregator is not None else "python"
+        )
+        flows_shed, signals_shed = self._native_shed
+        return EngineStats(
+            backend=backend,
+            has_packet_ring=native_capture_available(),
+            frames_seen=stats.packets_seen,
+            kernel_drops=stats.packets_dropped,
+            flows_shed=flows_shed,
+            new_flow_signals_shed=signals_shed,
+            panics_caught=self._panics_caught,
+            read_at=now,
+        )
+
+    def _emit_system(self, severity: EventSeverity, reason: str) -> None:
+        self._forwarder.emit(
+            SecurityEvent(
+                timestamp=datetime.now(UTC),
+                severity=severity,
+                event_type=SecurityEventType.SYSTEM_WARNING,
+                subsystem=_SUBSYSTEM,
+                reason=reason,
+            )
+        )
+
     def _spawn(self, name: str, target: Callable[[], None]) -> None:
         thread = threading.Thread(target=target, name=name, daemon=True)
         thread.start()
@@ -684,6 +986,8 @@ class CoreDaemon:
         try:
             while not self._stop.wait(interval):
                 self._tick()
+            if self._stop_signal is not None:
+                _logger.info("received %s, shutting down", signal.Signals(self._stop_signal).name)
         finally:
             self.stop()
         return 0
@@ -781,22 +1085,21 @@ class CoreDaemon:
     # ------------------------------------------------------------------ loops
 
     def _capture_loop(self) -> None:
-        """Capture -> parse -> aggregate. Completed flows go onto the detection queue."""
+        """Capture -> parse -> aggregate. Completed flows go onto the detection queue.
+
+        The native loop returns True when it has swapped to the Python path
+        (D6 fallback); the Python loop then carries on with the new capture.
+        """
         try:
             capture = self._capture
             native = self._native_aggregator
-            if isinstance(capture, PacketCapture) and isinstance(self._aggregator, FlowAggregator):
-                python_aggregator = self._aggregator
-                for packet in capture_packets(
-                    capture, self._forwarder, on_tcp_payload=self._handle_tcp_payload
-                ):
-                    if self._stop.is_set():
-                        return
-                    with self._flow_lock:
-                        completed = python_aggregator.process_packet(packet)
-                    self._enqueue(completed)
-            elif native is not None and isinstance(capture, FlowCapture):
-                self._native_capture_loop(capture, native)
+            if (
+                native is not None
+                and isinstance(capture, FlowCapture)
+                and not self._native_capture_loop(capture, native)
+            ):
+                return
+            self._python_capture_loop()
         except CaptureError as exc:
             if self._stop.is_set():
                 return
@@ -817,27 +1120,187 @@ class CoreDaemon:
         finally:
             _logger.info("capture loop exited")
 
-    def _native_capture_loop(self, capture: FlowCapture, aggregator: NativeFlowAggregator) -> None:
+    def _python_capture_loop(self) -> None:
+        """Python path: `AFPacketCapture` (or a pcap replay) -> parse -> `FlowAggregator`."""
+        capture = self._capture
+        aggregator = self._aggregator
+        if not isinstance(capture, PacketCapture) or not isinstance(aggregator, FlowAggregator):
+            return
+        for packet in capture_packets(capture, self._forwarder, on_tcp_payload=self._handle_tcp_payload):
+            if self._stop.is_set():
+                return
+            with self._flow_lock:
+                completed = aggregator.process_packet(packet)
+            self._enqueue(completed)
+            if self._replay:
+                self._sweep_on_replay_clock(int(packet.timestamp.timestamp() * 1_000_000))
+        if self._replay and not self._stop.is_set():
+            self._finish_replay()
+
+    def _native_capture_loop(self, capture: FlowCapture, aggregator: NativeFlowAggregator) -> bool:
         """Native path: poll the ring (GIL released), then drain the engine.
 
         Drained output is handled in the order `NativeBatch` documents — TLS
         payloads, then new-flow signals, then completed flows — so detection
         sees evidence and behavioral signals before the completion they
         precede, exactly as the Python loop's program order guarantees.
+
+        A caught engine panic (D6) costs the poll or drain in flight. Returns
+        True only after swapping to the Python path, once too many panics
+        fell within a minute; False when it stopped for any other reason.
         """
-        shed_flows = shed_signals = 0
+        shed_flows, shed_signals = self._native_shed
         while not self._stop.is_set():
-            capture.poll(_NATIVE_POLL_TIMEOUT_MS)
-            batch = aggregator.drain()
+            try:
+                capture.poll(_NATIVE_POLL_TIMEOUT_MS)
+                batch = aggregator.drain()
+            except NativeEngineError as exc:
+                if self._note_native_panic(exc):
+                    return self._fall_back_to_python(capture, aggregator)
+                continue
             for payload in batch.tls_payloads:
                 self._inspect_tcp_payload(payload)
             for new_flow in batch.new_flows:
                 self._handle_new_flow(new_flow)
             self._enqueue(batch.completed)
-            total_flows, total_signals = aggregator.shed()
+            try:
+                total_flows, total_signals = aggregator.shed()
+            except NativeEngineError as exc:
+                if self._note_native_panic(exc):
+                    return self._fall_back_to_python(capture, aggregator)
+                continue
             if total_flows > shed_flows or total_signals > shed_signals:
                 self._note_native_shedding(total_flows - shed_flows, total_signals - shed_signals)
                 shed_flows, shed_signals = total_flows, total_signals
+                self._native_shed = (shed_flows, shed_signals)
+            if isinstance(capture, ReplayCapture):
+                self._native_replay_tick(capture)
+        return False
+
+    def _native_replay_tick(self, capture: ReplayCapture) -> None:
+        """Flush once the last frame has been fed.
+
+        The sweeps themselves run between frames (`_ReplayClockSink`); an
+        injected replay without that sink is swept here, once per poll.
+        """
+        now_us = capture.virtual_now_us
+        if now_us is not None:
+            self._sweep_on_replay_clock(now_us)
+        if capture.finished and not self._replay_flushed:
+            self._finish_replay()
+
+    def _sweep_on_replay_clock(self, now_us: int) -> None:
+        """Sweep flows at the replay's own time, every `cleanup_interval_seconds` of it. Capture thread."""
+        interval_us = self._config.flow.cleanup_interval_seconds * 1_000_000
+        last = self._replay_last_sweep_us
+        if last is None:
+            self._replay_last_sweep_us = now_us
+            return
+        if now_us - last < interval_us:
+            return
+        self._replay_last_sweep_us = now_us
+        try:
+            self._sweep_flows(from_microseconds(now_us))
+        except NativeEngineError as exc:
+            self._note_native_panic(exc)
+
+    def _finish_replay(self) -> None:
+        """Every frame has been fed: close the flows still open, as the end of a capture does."""
+        self._replay_flushed = True
+        try:
+            with self._flow_lock:
+                remaining = self._aggregator.flush()
+        except NativeEngineError as exc:
+            self._note_native_panic(exc)
+            remaining = []
+        self._counters.add(flows_expired=len(remaining))
+        self._enqueue(remaining)
+        self._emit_system(
+            EventSeverity.INFO,
+            f"replay finished: every frame of {self._config.capture.replay_path} has been fed; "
+            f"{len(remaining)} open flow(s) flushed to detection",
+        )
+
+    def _note_native_panic(self, exc: NativeEngineError) -> bool:
+        """Count one caught engine panic (D6). True once the budget for a minute is spent."""
+        self._panics_caught += 1
+        exhausted = self._panic_budget.record()
+        _logger.warning("native engine panic caught (%d so far): %s", self._panics_caught, exc)
+        self._forwarder.emit(
+            SecurityEvent(
+                timestamp=datetime.now(UTC),
+                severity=EventSeverity.WARNING,
+                event_type=SecurityEventType.CAPTURE_ERROR,
+                subsystem=_SUBSYSTEM,
+                reason=(
+                    f"native engine panic caught and recovered ({self._panics_caught} so far); "
+                    f"the frames or batch in flight were dropped: {exc}"
+                ),
+            )
+        )
+        return exhausted
+
+    def _fall_back_to_python(self, capture: FlowCapture, aggregator: NativeFlowAggregator) -> bool:
+        """Abandon the native ring for `AFPacketCapture` + `FlowAggregator` (D6). True if it swapped.
+
+        The engine's open flows are salvaged (closed early) on the way out.
+        A replay has no live interface to fall back to, so it stops instead.
+        """
+        limit = self._panic_budget.max_per_minute
+        capture.stop()
+        try:
+            salvaged = aggregator.flush()
+        except NativeEngineError:
+            salvaged = []
+        self._enqueue(salvaged)
+        if self._replay:
+            self._emit_capture_critical(
+                f"the native engine panicked {limit} times within a minute during a replay; the replay "
+                f"was stopped ({len(salvaged)} open flow(s) salvaged). A replay has no live fallback."
+            )
+            return False
+        python_capture = AFPacketCapture(
+            interface=self._config.capture.interface,
+            snap_len=self._config.capture.snap_len,
+            promiscuous=self._config.capture.promiscuous,
+            buffer_size_bytes=self._config.capture.buffer_size_bytes,
+        )
+        try:
+            python_capture.start()
+        except CaptureError as exc:
+            self._emit_capture_critical(
+                f"the native engine panicked {limit} times within a minute and the Python capture "
+                f"path could not start ({exc}); capture is down. Enforcement and the static guards "
+                "keep running."
+            )
+            return False
+        python_aggregator = FlowAggregator(
+            self._config.flow,
+            on_new_flow=self._handle_new_flow,
+            protected_network=self._config.network.protected_network,
+        )
+        with self._flow_lock:
+            self._capture = python_capture
+            self._aggregator = python_aggregator
+            self._native_aggregator = None
+        self._emit_capture_critical(
+            f"the native engine panicked {limit} times within a minute; switched to the Python capture "
+            f"path, which drops packets under load ({len(salvaged)} open flow(s) salvaged). "
+            "Restart pirewall-core to return to the native engine."
+        )
+        return True
+
+    def _emit_capture_critical(self, reason: str) -> None:
+        _logger.critical("%s", reason)
+        self._forwarder.emit(
+            SecurityEvent(
+                timestamp=datetime.now(UTC),
+                severity=EventSeverity.CRITICAL,
+                event_type=SecurityEventType.CAPTURE_ERROR,
+                subsystem=_SUBSYSTEM,
+                reason=reason,
+            )
+        )
 
     def _note_native_shedding(self, flows: int, signals: int) -> None:
         """Account for work the engine shed at its per-drain caps — counted, never silent.
@@ -1305,23 +1768,17 @@ class CoreDaemon:
         same cadence — cheap (a duration/byte-count check per open flow, no
         feature extraction or ML), so it costs nothing extra to piggyback on
         this loop rather than run its own.
+
+        A replay's flows are swept from the capture thread on the replay's
+        own clock instead (`_sweep_on_replay_clock`); rule and portal expiry
+        stay here, on the wall clock, in every mode.
         """
         interval = float(self._config.flow.cleanup_interval_seconds)
-        detection = self._config.detection
         while not self._stop.wait(interval):
             now = datetime.now(UTC)
             try:
-                with self._flow_lock:
-                    completed = self._aggregator.sweep_timeouts(now)
-                    clusters = self._aggregator.snapshot_slow_connection_clusters(
-                        now,
-                        detection.slow_connection_min_duration_seconds,
-                        detection.slow_connection_max_bytes_per_second,
-                        detection.concurrent_slow_connections_threshold,
-                    )
-                self._counters.add(flows_expired=len(completed))
-                self._enqueue(completed)
-                self._enqueue_slow_clusters(clusters)
+                if not self._replay:
+                    self._sweep_flows(now)
                 self._expire_rules(now)
                 self._expire_portal_sessions()
             except PirewallError as exc:
@@ -1329,6 +1786,21 @@ class CoreDaemon:
             except Exception:
                 _logger.exception("sweep pass crashed")
         _logger.info("sweep loop exited")
+
+    def _sweep_flows(self, now: datetime) -> None:
+        """Expire timed-out flows and snapshot slow-connection clusters as of `now`."""
+        detection = self._config.detection
+        with self._flow_lock:
+            completed = self._aggregator.sweep_timeouts(now)
+            clusters = self._aggregator.snapshot_slow_connection_clusters(
+                now,
+                detection.slow_connection_min_duration_seconds,
+                detection.slow_connection_max_bytes_per_second,
+                detection.concurrent_slow_connections_threshold,
+            )
+        self._counters.add(flows_expired=len(completed))
+        self._enqueue(completed)
+        self._enqueue_slow_clusters(clusters)
 
     def _enqueue_slow_clusters(self, clusters: list[SlowConnectionCluster]) -> None:
         """Hand slow-connection clusters to the detection thread, dropping rather than blocking."""

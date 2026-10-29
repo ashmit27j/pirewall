@@ -1,50 +1,72 @@
 #!/usr/bin/env bash
-# pirewall-start — bring the whole pirewall stack up on the Pi, in order.
+# pirewall-start — bring the whole pirewall stack up on the Pi, in order (v2).
 #
-# Encodes the sequence in docs/SETUP.md §5–§10 as one idempotent, re-runnable
-# script. Safe to run repeatedly: every step checks whether it has already
-# been done and says so rather than redoing it.
+# Encodes docs/SETUP.md as one idempotent, re-runnable script, extended for v2
+# (docs/ADDENDUM_4.md, docs/v2/PLAN_v3.md §6). Safe to run repeatedly: every
+# step checks whether it has already been done and says so rather than
+# redoing it. The config-dependent steps live in scripts/deployment/startup.py
+# (`startup.py --help`); this script owns the order.
+#
+# ORDER (live / scripted, as root):
+#   preflight -> snapshot -> accounts -> directories -> render ->
+#   base -> static -> adaptive -> seed bindings + allow_bound ->
+#   guard verdicts -> core -> api -> portal -> portal.nft -> manifest
 #
 # WHAT IT DOES NOT DO, on purpose:
 #
-#   * It never generates configuration. `configure.py` asks for the Admin PC
-#     address and the admin password and deliberately refuses to guess
-#     either; a script that ran it unattended would have to. If the config
-#     is missing or still holds a CHANGE_ME placeholder, this stops and says
-#     which command to run.
-#   * It never generates TLS material. Same reason — `make_certs.sh` needs
-#     to know which address the certificate is for.
+#   * It never generates configuration or TLS material for a real run.
+#     `configure.py` asks for the Admin PC, its MAC and the password, and
+#     deliberately refuses to guess them. (Mock mode makes a throwaway
+#     loopback certificate inside its own run directory, nothing more.)
 #   * It never loads deploy/rendered/nat-masquerade.nft when NetworkManager's
-#     `shared` mode is already masquerading the LAN. Loading both leaves two
-#     masquerade rules where one is wanted.
+#     `shared` mode is already masquerading the LAN.
+#   * It never deletes a v2 table, except under --panic. Reloads declare
+#     everything and flush chains, so bindings and offender state survive.
 #
-# ORDERING IS THE POINT. Two steps are sequenced for reasons that are not
-# obvious and that cost real debugging to find:
+# ORDERING IS THE POINT:
 #
-#   1. The captive-portal nft table is loaded only *after* pirewall-portal is
-#      confirmed serving. That table rejects forwarding for unauthenticated
-#      LAN clients; loading it while the sign-in page is down gates the whole
-#      protected network with nowhere to sign in.
-#   2. pirewall-core is started and confirmed *before* pirewall-portal,
-#      because core is what creates the portal's RPC socket.
+#   1. The raw guard loads in observe and is raised to enforce only once the
+#      bindings are seeded (ADDENDUM_4.md D2). Enforcing anti-spoof with an
+#      empty binding set would meter every client as unbound.
+#   2. The captive-portal nft table is loaded only after pirewall-portal is
+#      confirmed serving: it rejects forwarding for unauthenticated clients.
+#   3. pirewall-core starts before pirewall-portal: core creates its socket.
 #
 # Usage:
-#   sudo scripts/deployment/pirewall-start              # bring everything up
-#   sudo scripts/deployment/pirewall-start --check      # preflight only, change nothing
-#   scripts/deployment/pirewall-start --dry-run         # print every command, run none
-#   sudo scripts/deployment/pirewall-start --no-portal  # core + api only
-#   sudo scripts/deployment/pirewall-start --skip-nft   # leave the ruleset alone
+#   sudo scripts/deployment/pirewall-start                    # bring everything up
+#   sudo scripts/deployment/pirewall-start --check            # preflight only, change nothing
+#   scripts/deployment/pirewall-start --dry-run               # print every command, run none
+#   sudo scripts/deployment/pirewall-start --no-portal        # core + api only
+#   sudo scripts/deployment/pirewall-start --skip-nft         # leave the ruleset alone
+#   sudo scripts/deployment/pirewall-start --engine v1        # pipeline (v2 arrives in phase 17)
+#   sudo scripts/deployment/pirewall-start --guards observe   # all three guards; or per guard:
+#        --guard-raw MODE --guard-input MODE --guard-forward MODE    (MODE: observe|enforce)
+#   sudo scripts/deployment/pirewall-start --data-mode live   # claim env pi-live (Pi only)
+#   sudo scripts/deployment/pirewall-start --data-mode scripted   # claim env pi-scripted (Pi only)
+#   scripts/deployment/pirewall-start --data-mode mock [--pcap PATH] [--run-dir DIR]
+#        # no root, no nft: core replays pcaps against in-memory firewall fakes,
+#        # the API serves https://127.0.0.1 (env tag mock). Ctrl-C stops both.
+#   sudo scripts/deployment/pirewall-start --panic            # delete the v2 tables, print the restore
+#   sudo scripts/deployment/pirewall-start --lab-victim up|down   # the forward-path victim netns
+#   ... --manifest PATH                                       # also copy the run manifest here
+#   ... --config PATH                                         # default config/local_config.toml
+#
+# Without --data-mode the env tag comes from the config (default sandbox), so a
+# Pi result is only ever claimed explicitly (ADDENDUM_4.md D7).
 #
 # Exit codes: 0 all good, 1 a step failed, 2 preflight refused to start.
 
 set -euo pipefail
 
 readonly REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-readonly VENV_PY="${REPO_ROOT}/.venv/bin/python"
+readonly VENV_PY="${PIREWALL_PYTHON:-${REPO_ROOT}/.venv/bin/python}"
 readonly TMPFILES_SRC="${REPO_ROOT}/deploy/systemd/pirewall-tmpfiles.conf"
 readonly ROLLBACK_DIR="${REPO_ROOT}/deploy/rollback"
+readonly RENDERED="${REPO_ROOT}/deploy/rendered"
 readonly UNIT_DIR="/etc/systemd/system"
 readonly DNSMASQ_DROPIN="/etc/NetworkManager/dnsmasq-shared.d/pirewall-portal.conf"
+readonly STATE_MANIFEST="/var/lib/pirewall/manifest.json"
+readonly LAB_RUN_DIR="/run/pirewall-lab"
 
 # How long to wait for a service to actually become useful (socket bound,
 # port listening) rather than merely "active". systemd reports a Type=simple
@@ -55,6 +77,19 @@ DRY_RUN=0
 CHECK_ONLY=0
 WANT_PORTAL=1
 SKIP_NFT=0
+ENGINE=""
+GUARDS=""
+GUARD_RAW=""
+GUARD_INPUT=""
+GUARD_FORWARD=""
+DATA_MODE=""
+PANIC=0
+LAB_VICTIM=""
+MANIFEST_COPY=""
+PCAP=""
+RUN_DIR=""
+CONFIG_FILE="${REPO_ROOT}/config/local_config.toml"
+SEEDED=""
 
 EXIT_OK=0
 EXIT_FAILED=1
@@ -95,21 +130,68 @@ run() {
   "$@"
 }
 
+# The Python helper (scripts/deployment/startup.py), with the config this run
+# uses. HELPER is the same command as an array, for `run` to print verbatim.
+helper() { "$VENV_PY" -m scripts.deployment.startup --config "$CONFIG_FILE" "$@"; }
+
+# Guard flags for the helper: config modes, then --guards, then per guard.
+guard_args() {
+  local -a args=()
+  [[ -n "$GUARDS" ]] && args+=(--guards "$GUARDS")
+  [[ -n "$GUARD_RAW" ]] && args+=(--guard-raw "$GUARD_RAW")
+  [[ -n "$GUARD_INPUT" ]] && args+=(--guard-input "$GUARD_INPUT")
+  [[ -n "$GUARD_FORWARD" ]] && args+=(--guard-forward "$GUARD_FORWARD")
+  # Nothing at all when no flag was given: an empty line would become an
+  # empty argument, which argparse rejects.
+  [[ ${#args[@]} -eq 0 ]] || printf '%s\n' "${args[@]}"
+}
+
 # ------------------------------------------------------------- arguments
 
 usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; $d'; }
 
+need_value() {
+  [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { fail "$1 needs a value"; echo; usage >&2; exit "$EXIT_REFUSED"; }
+}
+
+need_mode() {
+  case "$2" in observe|enforce) ;; *) fail "$1 takes observe or enforce, not '$2'"; exit "$EXIT_REFUSED" ;; esac
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dry-run)    DRY_RUN=1 ;;
-    --check)      CHECK_ONLY=1 ;;
-    --no-portal)  WANT_PORTAL=0 ;;
-    --skip-nft)   SKIP_NFT=1 ;;
-    -h|--help)    usage; exit "$EXIT_OK" ;;
-    *)            fail "unknown option: $1"; echo; usage >&2; exit "$EXIT_REFUSED" ;;
+    --dry-run)       DRY_RUN=1 ;;
+    --check)         CHECK_ONLY=1 ;;
+    --no-portal)     WANT_PORTAL=0 ;;
+    --skip-nft)      SKIP_NFT=1 ;;
+    --panic)         PANIC=1 ;;
+    --engine)        need_value "$@"; ENGINE="$2"; shift
+                     case "$ENGINE" in v1|v2) ;; *) refuse "--engine takes v1 or v2, not '$ENGINE'" ;; esac ;;
+    --guards)        need_value "$@"; need_mode "$1" "$2"; GUARDS="$2"; shift ;;
+    --guard-raw)     need_value "$@"; need_mode "$1" "$2"; GUARD_RAW="$2"; shift ;;
+    --guard-input)   need_value "$@"; need_mode "$1" "$2"; GUARD_INPUT="$2"; shift ;;
+    --guard-forward) need_value "$@"; need_mode "$1" "$2"; GUARD_FORWARD="$2"; shift ;;
+    --data-mode)     need_value "$@"; DATA_MODE="$2"; shift
+                     case "$DATA_MODE" in live|scripted|mock) ;; *) refuse "--data-mode takes live, scripted or mock" ;; esac ;;
+    --lab-victim)    need_value "$@"; LAB_VICTIM="$2"; shift
+                     case "$LAB_VICTIM" in up|down) ;; *) refuse "--lab-victim takes up or down" ;; esac ;;
+    --manifest)      need_value "$@"; MANIFEST_COPY="$2"; shift ;;
+    --pcap)          need_value "$@"; PCAP="$2"; shift ;;
+    --run-dir)       need_value "$@"; RUN_DIR="$2"; shift ;;
+    --config)        need_value "$@"; CONFIG_FILE="$2"; shift ;;
+    -h|--help)       usage; exit "$EXIT_OK" ;;
+    *)               fail "unknown option: $1"; echo; usage >&2; exit "$EXIT_REFUSED" ;;
   esac
   shift
 done
+
+if (( PANIC )) && [[ -n "$LAB_VICTIM" || -n "$DATA_MODE" ]]; then
+  refuse "--panic cannot be combined with --lab-victim or --data-mode"
+fi
+if [[ -n "$PCAP$RUN_DIR" && "$DATA_MODE" != "mock" ]]; then
+  refuse "--pcap and --run-dir only apply to --data-mode mock"
+fi
+readonly HELPER=("$VENV_PY" -m scripts.deployment.startup --config "$CONFIG_FILE")
 
 # ------------------------------------------------------------- preflight
 
@@ -123,50 +205,39 @@ require_binary() {
   command -v "$1" >/dev/null 2>&1 || refuse "required command not found: $1" "$2"
 }
 
-preflight() {
-  step "Preflight"
-
-  cd "$REPO_ROOT"
-  ok "repository root: $REPO_ROOT"
-
+require_venv() {
   [[ -x "$VENV_PY" ]] || refuse "no virtualenv at ${VENV_PY}" \
     "Create it first:  cd ${REPO_ROOT} && uv sync"
   ok "virtualenv: $("$VENV_PY" --version)"
+}
 
-  require_binary nft        "Install it:  sudo apt install nftables"
-  require_binary systemctl  "This script targets a systemd host."
-  require_binary systemd-tmpfiles "This script targets a systemd host."
-  ok "nft, systemctl, systemd-tmpfiles present"
-
-  local config_file="${REPO_ROOT}/config/local_config.toml"
-  [[ -f "$config_file" ]] || refuse "no config/local_config.toml" \
-    "Generate it first — it asks for the Admin PC address and the admin
-password, and deliberately refuses to guess either:
+# Load the config through the real Pydantic models, so anything this script
+# reads has already been validated the same way the daemons validate it.
+# Values are shell-quoted by python, never interpolated raw.
+load_config_env() {
+  [[ -f "$CONFIG_FILE" ]] || refuse "no config at ${CONFIG_FILE}" \
+    "Generate it first — it asks for the Admin PC, its MAC and the admin password,
+and deliberately refuses to guess any of them:
 
     cd ${REPO_ROOT} && uv run python -m scripts.deployment.configure"
-  ok "config: config/local_config.toml"
+  ok "config: ${CONFIG_FILE}"
 
-  if grep -q 'CHANGE_ME' "$config_file"; then
-    refuse "config/local_config.toml still contains CHANGE_ME placeholders" \
-      "Fix them, or re-run:  uv run python -m scripts.deployment.configure"
-  fi
-
-  # Load the config through the real Pydantic models, so anything this
-  # script reads has already been validated the same way the daemons
-  # validate it. Values are shell-quoted by python, never interpolated raw.
   local config_env
-  if ! config_env="$("$VENV_PY" - <<'PY'
+  if ! config_env="$(PIREWALL_CONFIG_FILE="$CONFIG_FILE" "$VENV_PY" - <<'PY'
+import os
 import shlex
 import sys
+from pathlib import Path
 
 from pirewall.config.loader import load_config
 
 try:
-    c = load_config("config/local_config.toml")
+    c = load_config(os.environ["PIREWALL_CONFIG_FILE"])
 except Exception as exc:  # any validation failure, reported not raised
     print(f"CONFIG_ERROR={shlex.quote(str(exc))}")
     sys.exit(0)
 
+cert = Path(c.api.tls_cert_path)
 pairs = {
     "WAN_IF": c.network.wan_interface,
     "LAN_IF": c.network.lan_interface,
@@ -176,6 +247,7 @@ pairs = {
     "ADMIN_PC": str(c.admin.admin_pc_ip),
     "API_PORT": str(c.api.port),
     "CORE_SOCK": c.api.rpc_socket_path,
+    "TLS_CERT": str(cert),
     "PORTAL_ENABLED": "1" if c.portal.enabled else "0",
     "PORTAL_HOST": str(c.portal.listen_host),
     "PORTAL_PORT": str(c.portal.listen_port),
@@ -183,20 +255,41 @@ pairs = {
     "PORTAL_GROUP": c.portal.rpc_socket_group,
     "USER_STORE": c.portal.user_store_path,
     "ENFORCEMENT": c.firewall.enforcement_mode.value,
+    "CONFIG_ENGINE": c.pipeline.engine.value,
+    "CONFIG_ENV": c.lab.env_tag.value,
 }
 for key, value in pairs.items():
     print(f"{key}={shlex.quote(value)}")
 PY
   )"; then
-    refuse "could not load config/local_config.toml" "Run: uv run python -m pirewall.main --check-config"
+    refuse "could not load ${CONFIG_FILE}" "Run: uv run python -m pirewall.main --config ${CONFIG_FILE} --check-config"
   fi
   eval "$config_env"
 
   if [[ -n "${CONFIG_ERROR:-}" ]]; then
-    refuse "config/local_config.toml is invalid: ${CONFIG_ERROR}" \
-      "Run: uv run python -m pirewall.main --check-config"
+    refuse "${CONFIG_FILE} is invalid: ${CONFIG_ERROR}" \
+      "Run: uv run python -m pirewall.main --config ${CONFIG_FILE} --check-config"
   fi
-  ok "config valid — enforcement=${ENFORCEMENT}, LAN ${PROTECTED} on ${LAN_IF}, WAN ${WAN_IF}"
+  ok "config valid — enforcement=${ENFORCEMENT}, engine=${ENGINE:-$CONFIG_ENGINE}, LAN ${PROTECTED} on ${LAN_IF}, WAN ${WAN_IF}"
+}
+
+preflight() {
+  step "Preflight"
+
+  cd "$REPO_ROOT"
+  ok "repository root: $REPO_ROOT"
+  require_venv
+
+  require_binary nft        "Install it:  sudo apt install nftables"
+  require_binary systemctl  "This script targets a systemd host."
+  require_binary systemd-tmpfiles "This script targets a systemd host."
+  ok "nft, systemctl, systemd-tmpfiles present"
+
+  if grep -q 'CHANGE_ME' "$CONFIG_FILE" 2>/dev/null; then
+    refuse "${CONFIG_FILE} still contains CHANGE_ME placeholders" \
+      "Fix them, or re-run:  uv run python -m scripts.deployment.configure"
+  fi
+  load_config_env
 
   # Interfaces have to exist before rules referencing them are loaded, or nft
   # accepts the ruleset and it silently matches nothing.
@@ -224,20 +317,41 @@ PY
     ok "upstream gateway matches the live default route: ${GATEWAY}"
   fi
 
-  if [[ -f "${REPO_ROOT}/deploy/certificates/pirewall.crt" ]]; then
+  local cert="$TLS_CERT"
+  [[ "$cert" == /* ]] || cert="${REPO_ROOT}/${cert}"
+  if [[ -f "$cert" ]]; then
     ok "TLS certificate present"
   else
-    refuse "no TLS certificate at deploy/certificates/pirewall.crt" \
+    refuse "no TLS certificate at ${TLS_CERT}" \
       "Generate it first:  scripts/deployment/make_certs.sh ${LAN_IP}"
   fi
 
   if (( WANT_PORTAL )) && [[ "$PORTAL_ENABLED" != "1" ]]; then
     warn "portal.enabled is false in the config — skipping every portal step"
-    warn "  set it to true in config/local_config.toml to enable the captive portal"
+    warn "  set it to true in the config to enable the captive portal"
     WANT_PORTAL=0
   fi
 
   check_lease_file
+  v2_preflight
+}
+
+# The v2 refusals (ADDENDUM_4.md, PLAN_v3 §6): nftables.service flush hazard,
+# IPv6 on the LAN, an unmigrated config, a missing admin MAC/interface, model
+# artifacts that do not match their sidecars, an engine not yet implemented,
+# a pi-* claim off a Pi. Reports: nft transport, native ring, chrony.
+v2_preflight() {
+  step "v2 preflight"
+  local -a args=(preflight)
+  [[ -n "$ENGINE" ]] && args+=(--engine "$ENGINE")
+  [[ -n "$DATA_MODE" ]] && args+=(--data-mode "$DATA_MODE")
+  local status=0
+  helper "${args[@]}" || status=$?
+  case "$status" in
+    0) ;;
+    2) refuse "v2 preflight refused to start (see above for what to fix)" ;;
+    *) die "the v2 preflight could not run (exit ${status})" ;;
+  esac
 }
 
 # Portal sign-in is refused for a client with no IP<->MAC binding, and the
@@ -245,18 +359,18 @@ PY
 # silently: the file never changes and nobody can sign in. So with the
 # portal on, anything but a file a running dnsmasq is writing, and that
 # pirewall-core can read, is a refusal. With the portal off it only costs
-# anti-spoof bindings, so it is a warning.
+# anti-spoof bindings, so it is a warning (and the raw guard stays observe).
 check_lease_file() {
   local lease_env
-  if ! lease_env="$("$VENV_PY" -m scripts.deployment.lease_check --config config/local_config.toml --shell)"; then
+  if ! lease_env="$("$VENV_PY" -m scripts.deployment.lease_check --config "$CONFIG_FILE" --shell)"; then
     refuse "the lease-file check could not run" "Run: uv run python -m scripts.deployment.lease_check"
   fi
   eval "$lease_env"
 
   local fix="antispoof.lease_file is derived from network.lan_interface (${LAN_IF}) when unset.
 Check that the NetworkManager shared connection on ${LAN_IF} is up, and remove
-any explicit antispoof.lease_file from config/local_config.toml unless your
-DHCP server really writes somewhere else. Diagnose with:
+any explicit antispoof.lease_file from the config unless your DHCP server
+really writes somewhere else. Diagnose with:
     uv run python -m scripts.deployment.lease_check"
 
   case "$LEASE_STATE" in
@@ -328,6 +442,16 @@ start_unit() {
     journalctl -u "$unit" -n 20 --no-pager >&2 || true
     exit "$EXIT_FAILED"
   fi
+}
+
+# Load one rendered ruleset: syntax-checked first, always. A bad ruleset
+# applied to a live box is how you lose the network you are connected over.
+load_ruleset() {
+  local file="$1" label="$2"
+  [[ -f "$file" ]] || (( DRY_RUN )) || die "missing ${file} — did rendering fail?"
+  run nft -c -f "$file" || die "${label} failed its syntax check — nothing was loaded"
+  run nft -f "$file"
+  ok "loaded ${label}"
 }
 
 # ----------------------------------------------------------------- steps
@@ -442,16 +566,19 @@ ensure_directories() {
 
 render_templates() {
   step "Render deployment templates"
-  run "$VENV_PY" -m scripts.deployment.render_templates --config config/local_config.toml
-  ok "rendered into deploy/rendered/"
+  # The raw guard renders as observe whatever was asked: it is raised to
+  # enforce by set_guard_verdicts, and only once the bindings are seeded.
+  local -a modes; mapfile -t modes < <(guard_args)
+  run "${HELPER[@]}" render "${modes[@]}"
+  ok "rendered into deploy/rendered/ (raw guard loads in observe until seeded)"
 }
 
 load_base_ruleset() {
   step "Load the base nftables ruleset"
   if (( SKIP_NFT )); then skip "--skip-nft given"; return 0; fi
 
-  local base="${REPO_ROOT}/deploy/rendered/base.nft"
-  [[ -f "$base" ]] || die "missing ${base} — did render_templates fail?"
+  local base="${RENDERED}/base.nft"
+  [[ -f "$base" ]] || (( DRY_RUN )) || die "missing ${base} — did rendering fail?"
 
   # Check before load, always. A syntactically bad ruleset applied to a live
   # box is how you lose a network you are connected over.
@@ -463,7 +590,7 @@ load_base_ruleset() {
 
   # NetworkManager's shared mode already masquerades the LAN. Loading ours on
   # top leaves two masquerade rules where one is wanted.
-  local nat="${REPO_ROOT}/deploy/rendered/nat-masquerade.nft"
+  local nat="${RENDERED}/nat-masquerade.nft"
   case "$(nm_shared_nat_state)" in
     present)
       skip "NetworkManager already masquerades ${PROTECTED} (nm-shared-${LAN_IF}) — not loading nat-masquerade.nft"
@@ -502,9 +629,71 @@ nm_shared_nat_state() {
   fi
 }
 
+# ADDENDUM_4.md D1: the two v2 tables (plus the ARP companion, in the static
+# file). Each file declares everything and then flushes chains; it never
+# deletes a table, so live bindings and offender state survive a reload.
+load_v2_tables() {
+  step "Load the v2 kernel tables (static guards, adaptive sets)"
+  if (( SKIP_NFT )); then skip "--skip-nft given"; return 0; fi
+  retire_v1_adaptive_table
+  load_ruleset "${RENDERED}/pirewall_static.nft" "table inet pirewall_static + arp pirewall_static_arp"
+  load_ruleset "${RENDERED}/pirewall_adaptive.nft" "table inet pirewall_adaptive"
+}
+
+# v1 enforced adaptive rules in `table inet pirewall` (forward hook). v2
+# never writes it, so whatever a v1 run left there would keep dropping with
+# nothing left to expire it. It is replaced by pirewall_adaptive; removing it
+# is one checked transaction, and it is never recreated.
+retire_v1_adaptive_table() {
+  local tables
+  if ! tables="$(nft list tables 2>/dev/null)"; then
+    (( DRY_RUN )) && warn "cannot read the ruleset without root — a real run retires any v1 'inet pirewall' table"
+    return 0
+  fi
+  grep -qx 'table inet pirewall' <<<"$tables" || return 0
+  warn "found the v1 adaptive table inet pirewall; v2 enforces through pirewall_adaptive instead"
+  local retire="${RENDERED}/retire-v1-adaptive.nft"
+  printf '%s\n' '#!/usr/sbin/nft -f' \
+    '# Written by pirewall-start: remove the v1 adaptive table, idempotently.' \
+    'add table inet pirewall' 'delete table inet pirewall' > "$retire"
+  run nft -c -f "$retire" || die "retiring inet pirewall failed its syntax check"
+  run nft -f "$retire"
+  ok "removed the v1 table inet pirewall"
+}
+
+# Bindings (lease file + [[antispoof.static]]) and the allowlist MAC+IP pairs,
+# through FirewallManager, the single writer of those sets (D1, D3).
+seed_kernel_sets() {
+  step "Seed bindings and allow_bound"
+  if (( SKIP_NFT )); then skip "--skip-nft given"; SEEDED=0; return 0; fi
+  if (( DRY_RUN )); then
+    run "${HELPER[@]}" seed
+    SEEDED="<seed result>"
+    return 0
+  fi
+  local out
+  out="$(helper seed)" || die "seeding the binding sets could not run"
+  SEEDED="${out##*SEEDED=}"
+  if [[ "$SEEDED" == "1" ]]; then
+    ok "bindings seeded"
+  else
+    warn "the binding seed failed — the raw guard stays in observe (ADDENDUM_4.md D2)"
+  fi
+}
+
+# Every verdict chain set in its own atomic batch, through
+# FirewallManager.set_guard_mode (D1's single permitted static write).
+set_guard_verdicts() {
+  step "Set the guard verdicts"
+  if (( SKIP_NFT )); then skip "--skip-nft given"; return 0; fi
+  local -a modes; mapfile -t modes < <(guard_args)
+  run "${HELPER[@]}" guards --seeded "$SEEDED" "${modes[@]}"
+  ok "guards set (defaults: input enforce, raw enforce if seeded, forward observe)"
+}
+
 install_units() {
   step "Install systemd units"
-  local -a units=(pirewall-core.service pirewall-api.service)
+  local -a units=(pirewall-core.service pirewall-api.service pirewall-crashloop-alert.service)
   (( WANT_PORTAL )) && units+=(pirewall-portal.service)
 
   for unit in "${units[@]}"; do
@@ -557,8 +746,8 @@ load_portal_gate() {
   # Deliberately last. This table rejects forwarding for unauthenticated LAN
   # clients; loading it while the sign-in page is down gates the protected
   # network with nowhere to sign in.
-  local portal="${REPO_ROOT}/deploy/rendered/portal.nft"
-  [[ -f "$portal" ]] || die "missing ${portal}"
+  local portal="${RENDERED}/portal.nft"
+  [[ -f "$portal" ]] || (( DRY_RUN )) || die "missing ${portal}"
 
   # v1 -> v2: `authed` became `ipv4_addr . ether_addr` (ADDENDUM_4.md D3).
   # nft cannot change an existing set's type, so loading the new file over
@@ -568,7 +757,7 @@ load_portal_gate() {
     outdated)
       warn "inet pirewall_portal has a v1 IP-only authed set; nft cannot change a set's type"
       warn "  replacing the table in one transaction: every LAN client is signed out once"
-      local migration="${REPO_ROOT}/deploy/rendered/portal-migrate.nft"
+      local migration="${RENDERED}/portal-migrate.nft"
       if (( DRY_RUN )); then
         skip "would write ${migration#"$REPO_ROOT"/}"
       else
@@ -627,7 +816,7 @@ install_dnsmasq_dropin() {
     return 0
   fi
 
-  local src="${REPO_ROOT}/deploy/rendered/dnsmasq-portal.conf"
+  local src="${RENDERED}/dnsmasq-portal.conf"
   [[ -f "$src" ]] || die "missing ${src}"
 
   if [[ -f "$DNSMASQ_DROPIN" ]] && cmp -s "$src" "$DNSMASQ_DROPIN"; then
@@ -639,6 +828,23 @@ install_dnsmasq_dropin() {
   ok "installed ${DNSMASQ_DROPIN}"
   warn "restart the AP for clients to pick it up:"
   warn "  sudo nmcli connection down <ap-connection> && sudo nmcli connection up <ap-connection>"
+}
+
+# PLAN_v3 §6 step 7 / G7: versions, hashes, modes, the env tag and a ruleset
+# hash, at /var/lib/pirewall/manifest.json plus the --manifest copy.
+write_manifest() {
+  step "Run manifest"
+  local -a args=(manifest --out "$STATE_MANIFEST")
+  [[ -n "$MANIFEST_COPY" ]] && args+=(--out "$MANIFEST_COPY")
+  [[ -n "$DATA_MODE" ]] && args+=(--data-mode "$DATA_MODE")
+  [[ -n "$ENGINE" ]] && args+=(--engine "$ENGINE")
+  (( SKIP_NFT )) && args+=(--no-kernel)
+  local -a modes; mapfile -t modes < <(guard_args)
+  run "${HELPER[@]}" "${args[@]}" "${modes[@]}"
+  if [[ "$DATA_MODE" == "scripted" ]]; then
+    warn "scripted mode: start the benign profiles on your client devices now:"
+    warn "  python lab/benign/background.py --profile mixed   (lab/ arrives in phase 18)"
+  fi
 }
 
 verify() {
@@ -684,8 +890,11 @@ summary() {
     printf '  Sign-in page    http://%s:%s/portal\n' "$PORTAL_HOST" "$PORTAL_PORT"
     printf '  Signed-in now   sudo nft list set inet pirewall_portal authed\n'
   fi
-  printf '  Enforcement     %s\n' "$ENFORCEMENT"
+  printf '  Enforcement     %s (adaptive)\n' "$ENFORCEMENT"
+  printf '  Guards          sudo nft list chain inet pirewall_static guard_verdict_input  (etc.)\n'
+  printf '  Manifest        %s\n' "$STATE_MANIFEST"
   printf '\n%sRollback%s\n' "$C_BOLD" "$C_RESET"
+  printf '  Drop every v2 table (panic)  sudo scripts/deployment/pirewall-start --panic\n'
   if (( WANT_PORTAL )); then
     printf '  Ungate the LAN immediately   sudo nft delete table inet pirewall_portal\n'
   fi
@@ -694,9 +903,229 @@ summary() {
   printf '  Stop everything              sudo systemctl stop pirewall-portal pirewall-api pirewall-core\n'
 }
 
+# ----------------------------------------------------------------- panic
+
+# ADDENDUM_4.md D5. Deletes inet pirewall_adaptive, inet pirewall_static and
+# arp pirewall_static_arp — nothing else. Through pirewall-core when it
+# answers (so its rules go REMOVED and its mode SHADOW), directly otherwise.
+# The helper logs it to the journal at CRITICAL and prints the restore line.
+panic_main() {
+  need_root
+  step "PANIC: remove pirewall's v2 tables"
+  cd "$REPO_ROOT"
+  require_venv
+  run "${HELPER[@]}" panic --actor "pirewall-start (uid ${EUID})"
+  printf '\n%s\n' "Restore: re-run  sudo ${BASH_SOURCE[0]}"
+}
+
+# ------------------------------------------------------------- lab victim
+
+# The forward-path victim (PLAN_v3 §0.4): a `labvictim` netns behind the veth
+# `lab0`, a routed /30 from [lab], running sshd, nginx, iperf3 and a DNS
+# responder. LAN -> lab0 crosses the forward hook like Internet traffic. The
+# `pirewall_lab` table permits it only while the victim is up. Idempotent.
+lab_main() {
+  need_root
+  cd "$REPO_ROOT"
+  require_venv
+  require_binary ip "Install it:  sudo apt install iproute2"
+  require_binary nft "Install it:  sudo apt install nftables"
+  [[ -f "$CONFIG_FILE" ]] || refuse "no config at ${CONFIG_FILE}"
+  local lab_env
+  lab_env="$(helper lab-env)" || refuse "could not read [lab] from ${CONFIG_FILE}"
+  eval "$lab_env"
+  if [[ "$LAB_VICTIM" == "up" ]]; then lab_up; else lab_down; fi
+}
+
+lab_netns_exists() { ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "$LAB_NETNS"; }
+
+lab_up() {
+  step "Lab victim up: netns ${LAB_NETNS}, ${LAB_HOST_IF} ${LAB_HOST_IP}/${LAB_PREFIX} -> ${LAB_VICTIM_IP}"
+  if lab_netns_exists; then skip "netns ${LAB_NETNS} exists"; else run ip netns add "$LAB_NETNS"; ok "created netns ${LAB_NETNS}"; fi
+
+  if ip link show "$LAB_HOST_IF" >/dev/null 2>&1; then
+    skip "veth ${LAB_HOST_IF} exists"
+  else
+    run ip link add "$LAB_HOST_IF" type veth peer name "$LAB_PEER_IF"
+    run ip link set "$LAB_PEER_IF" netns "$LAB_NETNS"
+    ok "created veth ${LAB_HOST_IF} <-> ${LAB_NETNS}:${LAB_PEER_IF}"
+  fi
+  if ip -4 addr show dev "$LAB_HOST_IF" 2>/dev/null | grep -q "inet ${LAB_HOST_IP}/"; then
+    skip "${LAB_HOST_IF} has ${LAB_HOST_IP}"
+  else
+    run ip addr add "${LAB_HOST_IP}/${LAB_PREFIX}" dev "$LAB_HOST_IF"
+  fi
+  run ip link set "$LAB_HOST_IF" up
+  if ip -n "$LAB_NETNS" -4 addr show dev "$LAB_PEER_IF" 2>/dev/null | grep -q "inet ${LAB_VICTIM_IP}/"; then
+    skip "victim has ${LAB_VICTIM_IP}"
+  else
+    run ip -n "$LAB_NETNS" addr add "${LAB_VICTIM_IP}/${LAB_PREFIX}" dev "$LAB_PEER_IF"
+  fi
+  run ip -n "$LAB_NETNS" link set lo up
+  run ip -n "$LAB_NETNS" link set "$LAB_PEER_IF" up
+  run ip -n "$LAB_NETNS" route replace default via "$LAB_HOST_IP"
+  ok "addresses and routes in place"
+
+  run install -d -m 0750 "$LAB_RUN_DIR"
+  lab_start_services
+
+  local ruleset="${RENDERED}/pirewall_lab.nft"
+  run "${HELPER[@]}" lab-ruleset --out "$ruleset"
+  run nft -c -f "$ruleset" || die "pirewall_lab failed its syntax check — nothing was loaded"
+  run nft -f "$ruleset"
+  ok "loaded table inet ${LAB_TABLE}: ${LAN_IF} -> ${LAB_HOST_IF} ${LAB_VICTIM_IP} is forwarded while the victim is up"
+}
+
+# Start one service inside the victim netns unless its pidfile names a live
+# process. A missing binary is a warning, not a failure: the victim is still
+# useful for the services that are installed.
+lab_service() {
+  local name="$1" binary="$2"; shift 2
+  local pidfile="${LAB_RUN_DIR}/${name}.pid"
+  if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    skip "${name} already running (pid $(cat "$pidfile"))"
+    return 0
+  fi
+  if ! command -v "$binary" >/dev/null 2>&1; then
+    warn "${name}: ${binary} is not installed — the victim runs without it"
+    return 0
+  fi
+  run ip netns exec "$LAB_NETNS" "$@"
+  ok "${name} started in ${LAB_NETNS}"
+}
+
+lab_start_services() {
+  local nginx_conf="${LAB_RUN_DIR}/nginx.conf"
+  if (( ! DRY_RUN )); then
+    cat > "$nginx_conf" <<NGINX
+pid ${LAB_RUN_DIR}/nginx.pid;
+error_log ${LAB_RUN_DIR}/nginx-error.log;
+events {}
+http {
+  access_log off;
+  server { listen ${LAB_VICTIM_IP}:80; location / { return 200 "pirewall lab victim\n"; } }
+}
+NGINX
+  fi
+  lab_service sshd /usr/sbin/sshd /usr/sbin/sshd -o "PidFile=${LAB_RUN_DIR}/sshd.pid" -o "ListenAddress=${LAB_VICTIM_IP}"
+  lab_service nginx nginx nginx -c "$nginx_conf"
+  lab_service iperf3 iperf3 iperf3 -s -D -B "$LAB_VICTIM_IP" --pidfile "${LAB_RUN_DIR}/iperf3.pid"
+  lab_service dns dnsmasq dnsmasq --conf-file=/dev/null --no-resolv --no-hosts --bind-interfaces \
+    "--listen-address=${LAB_VICTIM_IP}" "--address=/#/${LAB_VICTIM_IP}" "--pid-file=${LAB_RUN_DIR}/dns.pid"
+}
+
+lab_down() {
+  step "Lab victim down: netns ${LAB_NETNS}"
+  local name pidfile
+  for name in sshd nginx iperf3 dns; do
+    pidfile="${LAB_RUN_DIR}/${name}.pid"
+    if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+      run kill "$(cat "$pidfile")"
+      ok "stopped ${name}"
+    fi
+    run rm -f "$pidfile"
+  done
+
+  # add + delete in one file: removes the table if present, succeeds if not.
+  local retire="${RENDERED}/pirewall_lab-down.nft"
+  if (( ! DRY_RUN )); then
+    mkdir -p "$RENDERED"
+    printf '%s\n' '#!/usr/sbin/nft -f' "add table inet ${LAB_TABLE}" "delete table inet ${LAB_TABLE}" > "$retire"
+  fi
+  run nft -c -f "$retire" || die "removing ${LAB_TABLE} failed its syntax check"
+  run nft -f "$retire"
+  ok "table inet ${LAB_TABLE} removed: LAN -> lab forwarding is closed again"
+
+  # Deleting the netns deletes both veth ends with it.
+  if lab_netns_exists; then run ip netns del "$LAB_NETNS"; ok "deleted netns ${LAB_NETNS}"; else skip "netns ${LAB_NETNS} already gone"; fi
+  if ip link show "$LAB_HOST_IF" >/dev/null 2>&1; then run ip link del "$LAB_HOST_IF"; fi
+}
+
+# -------------------------------------------------------------- mock mode
+
+# ADDENDUM_4.md D7 `mock`: no root, no nft, nothing on the host changes.
+# pirewall-core replays pcaps (capture.backend = replay) against in-memory
+# firewall fakes; pirewall-api serves https://127.0.0.1 from a throwaway
+# certificate. Everything lives in the run directory. Env tag: mock, always.
+mock_main() {
+  step "Mock mode (no root, no nft)"
+  (( EUID != 0 )) || refuse "--data-mode mock never needs root; run it as your own user" \
+    "It writes only to its run directory, and root would leave files there you cannot remove."
+  cd "$REPO_ROOT"
+  require_venv
+  local config_source="$CONFIG_FILE"
+  [[ -f "$config_source" ]] || config_source="${REPO_ROOT}/config/default_config.toml"
+  local pcap="${PCAP:-${REPO_ROOT}/lab/mock/out}"
+  [[ -e "$pcap" ]] || refuse "no pcap at ${pcap}" \
+    "Pass one:  --pcap PATH  (a .pcap/.pcapng file or a directory of them). lab/mock/out is written
+by the phase 18 mock generator, which does not exist yet."
+  local run_dir="${RUN_DIR:-${REPO_ROOT}/.pirewall-mock}"
+  local api_port="${PIREWALL_MOCK_API_PORT:-18443}"
+
+  local -a pre=(preflight --data-mode mock)
+  [[ -n "$ENGINE" ]] && pre+=(--engine "$ENGINE")
+  local status=0
+  "$VENV_PY" -m scripts.deployment.startup --config "$config_source" "${pre[@]}" || status=$?
+  (( status == 0 )) || refuse "mock preflight refused to start (see above)"
+  (( CHECK_ONLY )) && { printf '\n%spreflight passed — nothing was changed (--check)%s\n' "$C_GREEN" "$C_RESET"; exit "$EXIT_OK"; }
+
+  if (( DRY_RUN )); then
+    run "$VENV_PY" -m scripts.deployment.startup --config "$config_source" mock-config \
+      --run-dir "$run_dir" --pcap "$pcap" --api-port "$api_port"
+    run "$VENV_PY" -m pirewall.main --config "${run_dir}/mock_config.toml" --data-mode mock
+    run "$VENV_PY" -m pirewall.api --config "${run_dir}/mock_config.toml"
+    run "$VENV_PY" -m scripts.deployment.startup --config "${run_dir}/mock_config.toml" manifest \
+      --out "${run_dir}/manifest.json" --data-mode mock --no-kernel
+    return 0
+  fi
+
+  local mock_env
+  mock_env="$("$VENV_PY" -m scripts.deployment.startup --config "$config_source" mock-config \
+    --run-dir "$run_dir" --pcap "$pcap" --api-port "$api_port")" || die "could not prepare ${run_dir}"
+  eval "$mock_env"
+  ok "run directory ${run_dir} (config, throwaway TLS, admin password)"
+
+  local core_pid api_pid
+  "$VENV_PY" -m pirewall.main --config "$MOCK_CONFIG" --data-mode mock >"${run_dir}/core.out" 2>&1 &
+  core_pid=$!
+  # shellcheck disable=SC2064  # expand the pids now, not at signal time
+  trap "kill ${core_pid} 2>/dev/null || true" EXIT
+  wait_for "core RPC socket" "test -S '${MOCK_CORE_SOCK}'" || die "pirewall-core did not start; see ${run_dir}/core.out"
+  "$VENV_PY" -m pirewall.api --config "$MOCK_CONFIG" >"${run_dir}/api.out" 2>&1 &
+  api_pid=$!
+  # shellcheck disable=SC2064
+  trap "kill ${api_pid} ${core_pid} 2>/dev/null || true" EXIT
+  wait_for "API on 127.0.0.1:${MOCK_API_PORT}" \
+    "curl -skf -o /dev/null 'https://127.0.0.1:${MOCK_API_PORT}/api/v1/health'" \
+    || die "pirewall-api did not start; see ${run_dir}/api.out"
+
+  local -a manifest=(manifest --out "${run_dir}/manifest.json" --data-mode mock --no-kernel)
+  [[ -n "$MANIFEST_COPY" ]] && manifest+=(--out "$MANIFEST_COPY")
+  [[ -n "$ENGINE" ]] && manifest+=(--engine "$ENGINE")
+  "$VENV_PY" -m scripts.deployment.startup --config "$MOCK_CONFIG" "${manifest[@]}"
+
+  printf '\n%s%s%s\n' "$C_BOLD" "pirewall (mock) is up — env tag: mock." "$C_RESET"
+  printf '  Control panel   https://127.0.0.1:%s/control-panel  (self-signed certificate)\n' "$MOCK_API_PORT"
+  printf '  Login           admin / %s\n' "$(cat "$MOCK_PASSWORD_FILE")"
+  printf '  Replaying       %s\n' "$pcap"
+  printf '  Logs            %s/core.out, %s/api.out\n' "$run_dir" "$run_dir"
+  printf '  Stop            Ctrl-C (or kill %s)\n' "$$"
+  # For anything scripting a mock run: both processes are serving.
+  : > "${run_dir}/up"
+  # Stop both and wait for them, so Ctrl-C returns only once core has shut
+  # down cleanly (its socket removed) and nothing is left running.
+  # shellcheck disable=SC2064
+  trap "kill ${api_pid} ${core_pid} 2>/dev/null || true; wait ${api_pid} ${core_pid} 2>/dev/null || true; exit 0" INT TERM
+  wait "$core_pid"
+}
+
 # ------------------------------------------------------------------ main
 
 main() {
+  if (( PANIC )); then panic_main "$@"; exit "$EXIT_OK"; fi
+  if [[ -n "$LAB_VICTIM" ]]; then lab_main; exit "$EXIT_OK"; fi
+  if [[ "$DATA_MODE" == "mock" ]]; then mock_main; exit "$EXIT_OK"; fi
+
   need_root "$@"
   preflight
 
@@ -710,11 +1139,15 @@ main() {
   ensure_directories
   render_templates
   load_base_ruleset
+  load_v2_tables
+  seed_kernel_sets
+  set_guard_verdicts
   install_units
   start_core_and_api
   start_portal
   load_portal_gate
   install_dnsmasq_dropin
+  write_manifest
   verify
   summary
 }

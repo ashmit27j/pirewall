@@ -96,6 +96,12 @@ class Answers:
     admin_username: str
     admin_password_hash: str
     static_bindings: tuple[StaticBinding, ...] = ()
+    # v2 (ADDENDUM_4.md D3): the admin rule matches interface + MAC + IP.
+    # Optional so a caller that predates v2 still renders a loadable config;
+    # `collect_answers` always fills both, and pirewall-start refuses while
+    # the MAC is unset.
+    admin_interface: str | None = None
+    admin_pc_mac: str | None = None
 
 
 # --------------------------------------------------------------------- prompts
@@ -158,6 +164,66 @@ def prompt_admin_pc_ip(discovered: DiscoveredNetwork) -> ipaddress.IPv4Address:
             if _prompt("  Use it anyway? (yes/no)", "no").lower() not in {"y", "yes"}:
                 continue
         return address
+
+
+def admin_identity_candidates(
+    discovered: DiscoveredNetwork, admin_pc_ip: ipaddress.IPv4Address
+) -> list[tuple[str, str]]:
+    """(interface, MAC) pairs at which `admin_pc_ip` was seen, unicast MACs only, normalised."""
+    found: set[tuple[str, str]] = set()
+    for address, mac, interface in discovered.all_neighbours:
+        if address != admin_pc_ip:
+            continue
+        try:
+            found.add((interface, _UNICAST_MAC.validate_python(mac)))
+        except ValidationError:
+            continue
+    return sorted(found)
+
+
+def _prompt_unicast_mac(question: str) -> str:
+    while True:
+        answer = _prompt(question)
+        try:
+            return _UNICAST_MAC.validate_python(answer)
+        except ValidationError:
+            print(f"  {answer!r} is not a unicast MAC (multicast, broadcast and all-zero are refused).")
+
+
+def prompt_admin_identity(
+    discovered: DiscoveredNetwork, admin_pc_ip: ipaddress.IPv4Address
+) -> tuple[str, str]:
+    """Ask which interface and MAC the Admin PC uses; returns `(admin_interface, admin_pc_mac)`.
+
+    v2's admin rule is `iifname <interface> ether saddr <MAC> ip saddr <IP>`
+    (ADDENDUM_4.md D3), because an IP alone is spoofable. The neighbour
+    table is offered as candidates, never chosen by default, for the same
+    reason the Admin PC's address is never guessed: a MAC seen at that
+    address could be the spoofer. Typing both by hand is always available.
+    """
+    print("\nThe Admin PC's interface and MAC (config: network.admin_interface, admin.admin_pc_mac)")
+    print("  SSH and the control panel accept only this interface + MAC + IP together.")
+    print("  Read the MAC on the Admin PC itself (`ip link`, `ipconfig /all`) to confirm it.")
+    candidates = admin_identity_candidates(discovered, admin_pc_ip)
+    if candidates:
+        print(f"\n  {admin_pc_ip} was seen at (candidates, not a guess):")
+        for index, (interface, mac) in enumerate(candidates, start=1):
+            print(f"    {index}) {mac} on {interface}")
+        print("    or type m to enter them by hand")
+        while True:
+            answer = _prompt("  Admin PC MAC")
+            if answer.isdigit() and 1 <= int(answer) <= len(candidates):
+                return candidates[int(answer) - 1]
+            if answer.lower() == "m":
+                break
+            print(f"  Pick 1-{len(candidates)}, or m.")
+    else:
+        print(f"\n  {admin_pc_ip} is not in the neighbour table right now; enter both by hand.")
+    interfaces = [name for name, _ in discovered.interface_macs]
+    if interfaces:
+        print(f"  Interfaces on this Pi: {', '.join(interfaces)}")
+    interface = _prompt("  Interface the Admin PC connects on")
+    return interface, _prompt_unicast_mac("  Admin PC MAC")
 
 
 def prompt_password_hash() -> str:
@@ -269,6 +335,7 @@ def prompt_static_bindings(
 def collect_answers(discovered: DiscoveredNetwork) -> Answers:
     """Ask for everything that is a policy decision rather than an observable fact."""
     admin_pc_ip = prompt_admin_pc_ip(discovered)
+    admin_interface, admin_pc_mac = prompt_admin_identity(discovered, admin_pc_ip)
     username = _prompt("\nAdmin username (config: authentication.admin_username)", "admin")
     password_hash = prompt_password_hash()
     lease_file = Path(lease_file_for(discovered.lan_interface))
@@ -284,6 +351,8 @@ def collect_answers(discovered: DiscoveredNetwork) -> Answers:
         admin_username=username,
         admin_password_hash=password_hash,
         static_bindings=prompt_static_bindings(candidates, lease_file, leases_readable=leased is not None),
+        admin_interface=admin_interface,
+        admin_pc_mac=admin_pc_mac,
     )
 
 
@@ -325,7 +394,7 @@ upstream_gateway = "{discovered.upstream_gateway}"
 # The Pi's own LAN address: every client's default gateway, and where the
 # Admin PC reaches the control panel. Also never blockable (spec §24).
 pirewall_lan_ip = "{discovered.pirewall_lan_ip}"
-
+{_render_admin_interface(discovered, answers)}
 [capture]
 # The interface facing the protected LAN — not the uplink.
 interface = "{discovered.lan_interface}"
@@ -449,7 +518,7 @@ token_expiry_seconds = 3600
 
 [admin]
 admin_pc_ip = "{answers.admin_pc_ip}"
-
+{_render_admin_mac(answers)}
 [logging]
 level = "INFO"
 log_dir = "/var/log/pirewall"
@@ -479,7 +548,56 @@ watchdog_sec = 30
 crash_loop_restart_count = 3
 crash_loop_window_seconds = 300
 
-{render_antispoof_section(answers.static_bindings)}'''
+{render_antispoof_section(answers.static_bindings)}
+{render_guards_section()}
+{render_lab_section()}'''
+
+
+def _render_admin_interface(discovered: DiscoveredNetwork, answers: Answers) -> str:
+    lan_mac = discovered.lan_mac or "not reported"
+    lines = [f"# This Pi's LAN interface MAC, as detected: {lan_mac}"]
+    if answers.admin_interface is not None:
+        lines += [
+            "# The interface the Admin PC connects on. SSH and the API accept only",
+            "# this interface + admin.admin_pc_mac + admin.admin_pc_ip (ADDENDUM_4.md D3).",
+            f'admin_interface = "{answers.admin_interface}"',
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def _render_admin_mac(answers: Answers) -> str:
+    if answers.admin_pc_mac is None:
+        return "# admin_pc_mac is unset: pirewall-start refuses until it is set (--set-admin-pc).\n"
+    return (
+        "# Confirmed by an operator; never blockable, and the only MAC the admin rule accepts.\n"
+        f'admin_pc_mac = "{answers.admin_pc_mac}"\n'
+    )
+
+
+def render_guards_section() -> str:
+    """`[guards]` with the D2 default modes; the meter thresholds keep their model defaults."""
+    return '''[guards]
+# ADDENDUM_4.md D2 — static kernel guards. Separate from enforcement_mode.
+# raw "enforce" means enforce IF the bindings were seeded at startup.
+# Leave forward in observe until the benign false-positive check has passed.
+# Meter thresholds default to config/default_config.toml's starting values;
+# override them here only after benign calibration.
+raw_mode = "enforce"
+input_mode = "enforce"
+forward_mode = "observe"
+'''
+
+
+def render_lab_section() -> str:
+    """`[lab]`: the on-Pi victim. `env_tag` is left to pirewall-start, which sets it per --data-mode."""
+    return '''[lab]
+# ADDENDUM_4.md D7 — env_tag is set by `pirewall-start --data-mode`; it is
+# never written here, so it can never default to a pi-* tag.
+# The forward-path victim for `pirewall-start --lab-victim up|down`.
+victim_netns = "labvictim"
+victim_host_interface = "lab0"
+victim_network = "10.250.0.0/30"
+'''
 
 
 def render_static_binding(binding: StaticBinding) -> str:
@@ -533,6 +651,24 @@ def replace_scalar(text: str, section: str, key: str, value: str) -> str:
             lines[index] = f'{match.group(1)}{key}{match.group(2)}"{value}"\n'
             return "".join(lines)
     raise ConfigurationError(f"could not find `{key}` under `[{section}]` — edit the file by hand")
+
+
+def set_scalar(text: str, section: str, key: str, value: str) -> str:
+    """`replace_scalar`, or insert the key right after the `[section]` header if it is absent.
+
+    For keys a 1.x config predates (`admin_pc_mac`, `admin_interface`).
+    Still raises `ConfigurationError` when the section itself is missing.
+    """
+    try:
+        return replace_scalar(text, section, key, value)
+    except ConfigurationError:
+        pass
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if line.strip() == f"[{section}]":
+            lines.insert(index + 1, f'{key} = "{value}"\n')
+            return "".join(lines)
+    raise ConfigurationError(f"could not find `[{section}]` — edit the file by hand")
 
 
 def replace_admin_pc_allowlist(text: str, admin_pc_ip: ipaddress.IPv4Address) -> str:
@@ -621,6 +757,7 @@ def describe(discovered: DiscoveredNetwork) -> str:
         f"  LAN interface      {discovered.lan_interface}   (capture happens here)",
         f"  Protected network  {discovered.protected_network}",
         f"  This Pi's LAN IP   {discovered.pirewall_lan_ip}",
+        f"  LAN interface MAC  {discovered.lan_mac or 'not reported'}",
     ]
     if discovered.admin_pc_candidates:
         seen = ", ".join(str(candidate) for candidate in discovered.admin_pc_candidates)
@@ -647,13 +784,29 @@ def run_full_setup(path: Path) -> int:
     print(f"  scripts/deployment/make_certs.sh {discovered.pirewall_lan_ip}")
     print(f"  python -m pirewall.main --config {path} --check-config")
     print(f"  python -m pirewall.api  --config {path} --check-config")
+    print(f"  sudo scripts/deployment/pirewall-start --config {path} --check")
     print("\nSee docs/SETUP.md for the rest.")
     return EXIT_OK
 
 
-def run_set_admin_pc(path: Path, requested: str | None) -> int:
-    """Change only `admin.admin_pc_ip`, the matching allowlist entry, and the integration hosts."""
+def run_set_admin_pc(
+    path: Path,
+    requested: str | None,
+    requested_mac: str | None = None,
+    requested_interface: str | None = None,
+) -> int:
+    """Change only the Admin PC's address, MAC and interface, its allowlist entry and the integration hosts.
+
+    Interactive: the MAC and interface are asked for after the address,
+    because the v2 admin rule matches all three and a stale MAC locks the
+    new Admin PC out. Scripted (`--admin-pc-ip`): they change only when
+    `--admin-pc-mac` / `--admin-interface` are given.
+    """
     text = path.read_text(encoding="utf-8")
+    identity: tuple[str | None, str | None] = (
+        requested_interface,
+        None if requested_mac is None else _UNICAST_MAC.validate_python(requested_mac),
+    )
     if requested is not None:
         admin_pc_ip = ipaddress.IPv4Address(requested)
     else:
@@ -665,11 +818,17 @@ def run_set_admin_pc(path: Path, requested: str | None) -> int:
             return EXIT_FAILURE
         print(describe(discovered))
         admin_pc_ip = prompt_admin_pc_ip(discovered)
+        identity = prompt_admin_identity(discovered, admin_pc_ip)
 
     current = load_config(path)
     previous = current.admin.admin_pc_ip
     text = replace_scalar(text, "admin", "admin_pc_ip", str(admin_pc_ip))
     text = replace_admin_pc_allowlist(text, admin_pc_ip)
+    admin_interface, admin_pc_mac = identity
+    if admin_interface is not None:
+        text = set_scalar(text, "network", "admin_interface", admin_interface)
+    if admin_pc_mac is not None:
+        text = set_scalar(text, "admin", "admin_pc_mac", admin_pc_mac)
 
     # Follow the Admin PC only for an integration host that still points at
     # the *old* one — an operator who aimed Wazuh somewhere else meant it.
@@ -689,7 +848,15 @@ def run_set_admin_pc(path: Path, requested: str | None) -> int:
     write_validated(path, text)
 
     print(f"\nAdmin PC changed: {previous} -> {admin_pc_ip}")
-    print("Restart pirewall-api for it to take effect:  sudo systemctl restart pirewall-api")
+    if admin_pc_mac is not None:
+        print(f"Admin PC MAC: {admin_pc_mac} on {admin_interface or current.network.admin_interface}")
+    elif current.admin.admin_pc_mac is not None:
+        print(
+            f"  note: admin.admin_pc_mac left at {current.admin.admin_pc_mac}; "
+            "pass --admin-pc-mac if it changed"
+        )
+    print("Re-run pirewall-start (the admin rule is rendered into the base table), then")
+    print("restart pirewall-api for it to take effect:  sudo systemctl restart pirewall-api")
     print(f"The old Admin PC ({previous}) can no longer reach the control panel.")
     return EXIT_OK
 
@@ -765,6 +932,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="with --set-admin-pc, set this address instead of prompting (for scripted use)",
     )
+    parser.add_argument(
+        "--admin-pc-mac",
+        default=None,
+        help="with --set-admin-pc --admin-pc-ip, also set admin.admin_pc_mac (v2 admin rule)",
+    )
+    parser.add_argument(
+        "--admin-interface",
+        default=None,
+        help="with --set-admin-pc --admin-pc-ip, also set network.admin_interface",
+    )
     return parser
 
 
@@ -783,7 +960,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return EXIT_FAILURE
             if args.set_admin_pc:
-                return run_set_admin_pc(path, args.admin_pc_ip)
+                return run_set_admin_pc(path, args.admin_pc_ip, args.admin_pc_mac, args.admin_interface)
             if args.static_bindings:
                 return run_static_bindings(path)
             return run_set_password(path)

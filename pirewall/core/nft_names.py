@@ -46,6 +46,23 @@ PANIC_TABLES: Final[tuple[tuple[str, str], ...]] = (
 )
 """(family, table) pairs panic deletes, in this order (ADDENDUM_4.md D5). Nothing else is ever deleted."""
 
+LAB_TABLE: Final = "pirewall_lab"
+"""The lab victim's forward allowance (phase 16, `pirewall-start --lab-victim up`).
+
+Loaded only while the `labvictim` netns is up, removed by `--lab-victim
+down`. Never written by core, never part of panic: it is lab tooling, not
+enforcement. Rendered from `deploy/lab/pirewall_lab.nft.template`.
+"""
+
+LAB_FORWARD_MARK: Final = 0x00007077
+"""Packet mark `pirewall_lab` sets on LAN -> victim forwards; `pirewall_base`'s forward chain accepts it.
+
+An accept only ends its own chain, so a separate table cannot override
+`pirewall_base`'s `policy drop` by accepting. The base template therefore
+carries one `meta mark` accept, inert unless `pirewall_lab` is loaded to set
+it. Clients cannot set a packet mark; only kernel rules can.
+"""
+
 # --- pirewall_static chains -------------------------------------------------------
 
 CHAIN_PREROUTING_FRAG: Final = "prerouting_frag"

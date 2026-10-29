@@ -18,6 +18,9 @@ Wants=network-online.target
 # crash-loop bound ADDENDUM.md A6 asks for is never actually armed.
 StartLimitIntervalSec=300
 StartLimitBurst=3
+# Phase 16: once the limit above trips and the unit is `failed`, raise a
+# CRITICAL to syslog and Wazuh. The guards keep running in the kernel.
+OnFailure=pirewall-crashloop-alert.service
 
 [Service]
 Type=notify
@@ -117,6 +120,11 @@ SystemCallErrorNumber=EPERM
 # ProtectSystem=strict. Config and ML model artifacts are read-only inputs.
 ReadWritePaths=/var/log/pirewall /run/pirewall /run/pirewall-portal /var/lib/pirewall
 ReadOnlyPaths=/opt/pirewall/config /opt/pirewall/pirewall/ml/artifacts
+# v2 (ADDENDUM_4.md D3): lease sync reads NetworkManager's dnsmasq lease file
+# (antispoof.lease_file). The leading `-` lets core start where the
+# directory does not exist; lease sync then reports the file unreadable and
+# the raw guard stays in observe.
+ReadOnlyPaths=-/var/lib/NetworkManager
 
 # --- Resource limits (spec §27 "Resource exhaustion") -----------------------
 # A 4GB Pi target (spec §3) running one dedicated capture/detection/firewall

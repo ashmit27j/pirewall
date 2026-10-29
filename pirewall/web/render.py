@@ -34,6 +34,7 @@ from pirewall.core.models.portal import PortalSession, PortalUser
 from pirewall.core.models.rule import FirewallRule
 from pirewall.core.models.status import StatusResult
 from pirewall.core.models.threat import ThreatAssessment
+from pirewall.web.v2_panel import V2PanelState, render_v2_section
 
 _STYLE = """<style>
 /* Dark mode is the default theme (only `:root`'s values are defined so
@@ -673,6 +674,9 @@ def _panel(section_id: str, title: str, html_block: str, *, loggy: bool, importa
 _HELP_SECTIONS: tuple[tuple[str, str], ...] = (
     ("System", "Core process health: uptime, current enforcement/failure mode, active and pending-approval "
      "rule counts, tracked flows, whether the ML models are loaded, and the emergency kill-switch."),
+    ("Kernel guards & identity", "The static nftables guards (raw, input, forward) and their observe/enforce "
+     "mode, the panic button, kernel offenders, the IP-MAC bindings, and the capture engine's counters "
+     "(ADDENDUM_4.md D2, D3, D5)."),
     ("Network", "Live packet-capture counters for the configured interface: packets seen, dropped, and "
      "malformed. Dropped/malformed rising steadily can mean capture is falling behind."),
     ("Detections", "Raw per-flow evidence from the detectors (known-attack classification, anomaly score, "
@@ -696,6 +700,10 @@ _HELP_SCENARIOS: tuple[tuple[str, str], ...] = (
      "target IP/CIDR, optional port/protocol, and a reason → Add."),
     ("You need to stop all adaptive enforcement immediately", "System section → red \"Emergency "
      "kill-switch\" button. Reverts to SHADOW mode and removes every active adaptive rule (ADDENDUM.md A8)."),
+    ("You need pirewall out of the data path entirely", "Kernel guards section → Panic → type panic. "
+     "Deletes the v2 tables only; restore with `sudo scripts/deployment/pirewall-start` on the Pi."),
+    ("You want a guard to start dropping", "Kernel guards section → enter the admin password next to "
+     "the guard → Switch to enforce. Switching to observe needs no password."),
     ("You want to see what pirewall would block before turning enforcement on", "Shadow log section — "
      "SHADOWED rows show what would have happened in ACTIVE mode."),
     ("A deployed rule turns out to be wrong", "Firewall section → find the ACTIVE row → Disable "
@@ -777,11 +785,25 @@ def render_dashboard(
     detections: list[DetectionRecord],
     portal_users: list[PortalUser] | None = None,
     portal_sessions: list[PortalSession] | None = None,
+    v2: V2PanelState | None = None,
 ) -> str:
-    """Render the full control panel (spec §30's sections, plus the addendum additions)."""
+    """Render the full control panel (spec §30's sections, plus the addendum additions).
+
+    `v2` adds the guards/panic/offenders/bindings/engine panel
+    (`pirewall.web.v2_panel`); without it the panel is omitted.
+    """
+    v2_panel = (
+        ""
+        if v2 is None
+        else _panel(
+            "v2", "Kernel guards & identity (ADDENDUM_4.md)", render_v2_section(v2), loggy=False,
+            importance="priority",
+        )
+    )
     body = (
         f'<div class="page-header"><h1>pirewall control panel</h1>{_help_button()}</div>'
         + _panel("system", "System", _render_system_section(status), loggy=False, importance="priority")
+        + v2_panel
         + _panel("network", "Network", _render_network_section(capture_stats), loggy=False)
         + _panel("detections", "Detections", _render_detections_section(detections), loggy=True)
         + _panel("threats", "Threats", _render_threats_section(threats), loggy=True, importance="priority")

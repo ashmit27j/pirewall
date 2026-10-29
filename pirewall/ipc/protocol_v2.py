@@ -1,10 +1,10 @@
 """v2 RPC operations: names, result models and signatures only (docs/V2_CONTRACTS.md "RPC").
 
 Frozen by phase 11 so the API (phase 16) and core (phases 13/14/16) agree
-before either is written. Deliberately **not** added to `RpcOperation` yet:
-an enum member with no dispatcher handler would be a live operation that
-fails at runtime. Phase 16, which owns `pirewall/ipc/dispatcher.py`, adds
-these names to `RpcOperation` and handlers to `CoreRpcDispatcher`.
+before either is written. Phase 16 added these names to `RpcOperation`
+(same string values), with handlers in `CoreRpcDispatcher` and typed
+methods on `BaseRpcClient`; `tests/unit/test_v2_rpc.py` pins the two lists
+to each other.
 
 All six are admin operations on `core.sock` only. None may ever be added to
 `PortalRpcDispatcher` (ADDENDUM_3.md C1): `set_guard_mode` and `panic` are

@@ -55,6 +55,13 @@ table inet pirewall_base {
 		# handled separately by ../network/nat-masquerade.nft.template.
 		iifname "${LAN_INTERFACE}" oifname "${WAN_INTERFACE}" ip saddr ${PROTECTED_NETWORK} accept
 
+		# Lab victim (phase 16, `pirewall-start --lab-victim up`): LAN -> the
+		# labvictim netns. Inert unless table inet pirewall_lab is loaded:
+		# only its forward chain sets this mark (nft_names.LAB_FORWARD_MARK),
+		# and `--lab-victim down` deletes that table. A separate table cannot
+		# override this chain's policy drop by accepting, hence the mark.
+		meta mark 0x00007077 accept
+
 		# WAN -> LAN: nothing new is allowed by default (policy drop,
 		# above). Add explicit port-forward exceptions here only if a
 		# specific deployment genuinely needs inbound WAN access to a

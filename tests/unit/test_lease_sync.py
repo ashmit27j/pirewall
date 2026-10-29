@@ -234,7 +234,8 @@ def test_run_polls_until_stopped(lease_file: Path) -> None:
     config = make_config(antispoof={"lease_file": str(lease_file), "poll_seconds": 0.05})
     table = LeaseBindingTable()
     manager = FirewallManager(config, FakeFirewallBackend())
-    sync = LeaseSync(config, table, manager, lambda _event: None)
+    # Pinned clock: the lease expires an hour after NOW, so the real clock would age it out.
+    sync = LeaseSync(config, table, manager, lambda _event: None, now_fn=lambda: NOW)
     stop = threading.Event()
     thread = threading.Thread(target=sync.run, args=(stop,))
     thread.start()

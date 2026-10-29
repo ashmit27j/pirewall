@@ -1,0 +1,49 @@
+[Unit]
+Description=pirewall — CRITICAL alert when pirewall-core stops restarting (crash loop)
+# TEMPLATE — installed by scripts/deployment/pirewall-start; review before
+# trusting it in production. Not enabled on its own: pirewall-core.service
+# pulls it in through OnFailure= when the unit enters `failed`, which with
+# Restart=on-failure happens once StartLimitBurst= restarts inside
+# StartLimitIntervalSec= are spent (ADDENDUM.md A6).
+#
+# What it reports: detection and adaptive enforcement are down. What it
+# does NOT change: the static kernel guards (ADDENDUM_4.md D2) and the base
+# policy keep running in nftables, which has no dependency on core being
+# alive. Recovery is manual and printed in the alert itself.
+Documentation=file:///opt/pirewall/docs/SETUP.md
+
+[Service]
+Type=oneshot
+# Syslog (journald) first, needing no config; then Wazuh when
+# integration.wazuh_enabled. Exits 1 if the Wazuh send failed, so a dead
+# collector shows up in `systemctl status pirewall-crashloop-alert`.
+ExecStart=/opt/pirewall/.venv/bin/python -m scripts.deployment.startup --config /opt/pirewall/config/local_config.toml crashloop-alert --unit pirewall-core.service
+WorkingDirectory=/opt/pirewall
+SyslogIdentifier=pirewall-crashloop-alert
+
+# Reads the config (group pirewall-ipc, like core) and opens one outbound
+# TCP connection to Wazuh. Nothing else.
+User=pirewall-core
+Group=pirewall-ipc
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @swap @reboot @obsolete
+SystemCallErrorNumber=EPERM
+ReadOnlyPaths=/opt/pirewall
+TimeoutStartSec=30s

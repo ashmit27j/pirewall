@@ -254,6 +254,108 @@ alone.
 The rest of this section documents what the script does, for when you want
 to run a step by hand or understand a failure.
 
+## v2 bring-up: kernel guards, MAC identity, adaptive sets
+
+From phase 16, `pirewall-start` brings up the v2 data plane (ADDENDUM_4.md):
+three kernel tables beside the base one, IP↔MAC anti-spoofing seeded from
+the DHCP lease file, and the adaptive sets that `FirewallManager` alone
+writes. The v1 pipeline still drives detection (`pipeline.engine = "v1"`)
+until phase 17. Four one-time steps come first:
+
+1. **Install `python3-nftables` and link it into the venv.** Optional. Set
+   updates take about 0.36 ms through it against about 10 ms through the `nft`
+   subprocess fallback (`docs/v2/v2/RESULTS.md`; sandbox numbers, not Pi numbers):
+
+   ```sh
+   sudo apt install python3-nftables
+   sudo scripts/deployment/install_nftables_pth.sh            # --venv DIR if not /opt/pirewall/.venv
+   scripts/deployment/install_nftables_pth.sh --check         # verify only
+   ```
+
+   It links *only* the `nftables` package into a private directory on the
+   venv's path, never all of `dist-packages`. `--uninstall` reverts it.
+
+2. **Configure the MACs.** The admin rule matches interface + MAC + IP,
+   because an IP alone is spoofable. `configure.py` offers the Admin PC's
+   MAC from the neighbour table and asks you to confirm it. Read the MAC on
+   the Admin PC itself (`ip link`, `ipconfig /all`) before you accept it:
+
+   ```sh
+   uv run python -m scripts.deployment.configure                  # new config: asks for both
+   uv run python -m scripts.deployment.configure --set-admin-pc   # existing config: adds them
+   uv run python -m scripts.deployment.configure --static-bindings  # fixed-address devices
+   ```
+
+   A 1.x config is upgraded first with
+   `uv run python -m scripts.deployment.migrate_config --write` (it backs the file up).
+   `pirewall-start` refuses while it still needs that.
+
+3. **Disable `nftables.service`** if its config contains `flush ruleset`. At
+   its next start it would wipe every pirewall table, and `pirewall-start`
+   refuses to run while that can happen:
+
+   ```sh
+   sudo systemctl disable --now nftables.service
+   ```
+
+4. **Disable IPv6 on the LAN interface.** v2 is IPv4-only (ADDENDUM.md A5),
+   and an IPv6 path around the guards is refused:
+
+   ```sh
+   echo "net.ipv6.conf.wlan0.disable_ipv6 = 1" | sudo tee /etc/sysctl.d/60-pirewall-ipv6.conf
+   sudo sysctl --system
+   ```
+
+Then the usual preflight and bring-up:
+
+```sh
+sudo scripts/deployment/pirewall-start --check     # refusals exit 2, each with its fix
+sudo scripts/deployment/pirewall-start
+```
+
+The load order is base → static → adaptive → seed bindings, `allow_bound`
+and the allowlist pairs → guard verdicts → core → api → portal →
+`portal.nft`. A run manifest goes to `/var/lib/pirewall/manifest.json`
+(`--manifest PATH` writes a copy). It records the git SHA, the config and
+model hashes, `nft --version`, the kernel, the guard modes, the enforcement
+mode, the engine, the env tag and a hash of the loaded ruleset.
+
+**Guard modes** are separate from `enforcement_mode`. The defaults are input
+enforce, raw enforce *if the bindings were seeded*, and forward observe. If
+the binding seed fails, the raw guard stays in observe and the script says
+so. Override them for one run with `--guards observe|enforce`, or per guard
+with `--guard-raw`, `--guard-input` and `--guard-forward`. At runtime the
+control panel's Guards panel shows them. Switching a guard to enforce there
+needs the admin password again.
+
+**Data modes and the env tag** (ADDENDUM_4.md D7):
+
+| Flag | Env tag | What runs |
+|---|---|---|
+| `--data-mode live` | `pi-live` | The real stack on real traffic. Pi only. |
+| `--data-mode scripted` | `pi-scripted` | The same, for scripted lab traffic. Start `lab/benign/background.py` on the client devices (phase 18). |
+| `--data-mode mock [--pcap PATH]` | `mock` | No root, no nft. Core replays pcaps against in-memory fakes and the API serves `https://127.0.0.1`. Runs on any Linux dev machine. |
+
+Mock mode never claims a `pi-*` tag. Without `--pcap` it reads
+`lab/mock/out/`, which phase 18's generator writes.
+
+**The lab victim** gives forward-path tests a target on the Pi itself:
+
+```sh
+sudo scripts/deployment/pirewall-start --lab-victim up     # netns + veth lab0 + sshd/nginx/iperf3/DNS
+sudo scripts/deployment/pirewall-start --lab-victim down   # removes all of it
+```
+
+Both are idempotent. While the victim is up, a small `pirewall_lab` table
+permits LAN → `lab0` forwarding, and every guard and adaptive set still
+applies to that traffic. `down` removes the table, so the hole closes with
+the victim. Addresses come from `[lab]`.
+
+**If pirewall-core crash-loops**, `pirewall-crashloop-alert.service` (pulled
+in by core's `OnFailure=`) logs a CRITICAL to the journal, and to Wazuh when
+`integration.wazuh_enabled`. Detection and adaptive enforcement are down. The
+static guards and the base policy keep running in the kernel.
+
 ## 5. Render and apply the network/firewall templates
 
 ```sh
@@ -690,8 +792,15 @@ type an address. To do it without prompts (a script, or when the new
 machine is not on the network yet):
 
 ```sh
-uv run python -m scripts.deployment.configure --set-admin-pc --admin-pc-ip 192.168.100.50
+uv run python -m scripts.deployment.configure --set-admin-pc --admin-pc-ip 192.168.100.50 \
+  --admin-pc-mac 02:11:22:33:44:55 --admin-interface eth0
 ```
+
+Interactively it also asks for the Admin PC's MAC and interface, because the
+v2 admin rule matches all three. A stale MAC locks the new Admin PC out of
+SSH and the panel. Scripted, the MAC and interface change only when you pass
+them. After changing any of the three, re-run `sudo scripts/deployment/pirewall-start`:
+the admin rule is rendered into the base table.
 
 Then:
 
@@ -757,6 +866,11 @@ HTTP would make one stolen session equivalent to owning the firewall
 | Portal shows "Could not grant network access" | `table inet pirewall_portal` is not loaded, so there is no set to authorize into. That message is the honest failure — the login is refused rather than reported as successful onto a dead network. |
 | `pirewall-core` won't start: "socket is in group ..." | `/etc/tmpfiles.d/pirewall.conf` is missing or unapplied. Run `sudo systemd-tmpfiles --create`; the portal socket's directory must be setgid `pirewall-portal-ipc`. |
 | LAN clients gated with no sign-in page | The nft table was loaded before `pirewall-portal` was running. `sudo nft delete table inet pirewall_portal` restores forwarding immediately. |
+| LAN cut off, or you need pirewall out of the path right now | **Panic:** `sudo scripts/deployment/pirewall-start --panic` deletes `pirewall_static`, `pirewall_static_arp` and `pirewall_adaptive` in one batch (through core when it answers, so its rules go REMOVED and the mode goes SHADOW). `pirewall_base` and `pirewall_portal` stay. It logs to the journal at CRITICAL and prints the restore command. To restore, fix the cause, then run `sudo scripts/deployment/pirewall-start`, which re-creates and reseeds every table. The control panel's panic button does the same thing. |
+| `pirewall-start` exits 2 at preflight | A refusal, and each one prints its fix: `nftables.service` would flush the ruleset, IPv6 is on for the LAN, the config needs `migrate_config`, `admin.admin_pc_mac` is unset, or a model file does not match its sidecar hash. `--check` re-runs just the preflight. |
+| "raw guard left in observe" | The binding seed failed, usually because the lease file is unreadable. Check `antispoof.lease_file`, then re-run `pirewall-start`. Anti-spoof enforcing with no bindings would meter every client as unbound, so this is the safe fallback. |
+| Journal shows `pirewall-crashloop-alert` CRITICAL | Core hit its restart limit. `journalctl -u pirewall-core -n 200`, fix, then `sudo systemctl reset-failed pirewall-core && sudo systemctl start pirewall-core`. The guards kept running throughout. |
+| Admin PC locked out after changing its network card | The admin rule matches the MAC as well as the IP. From the Pi's console: `configure --set-admin-pc` (it asks for the MAC again), then re-run `pirewall-start`. |
 | Portal logs nothing to file | `portal.log_dir` must be its own directory — `pirewall-portal` is not in `pirewall-ipc` and cannot write `/var/log/pirewall`. |
 | Log files stop updating after a day | A `logrotate` drop-in recreating them under the wrong owner. pirewall rotates its own logs; delete `/etc/logrotate.d/pirewall`. |
 | No threats ever detected | Expected without trained models — pirewall runs behaviour-only detection and says so at startup. See `docs/ML_PIPELINE.md`. |

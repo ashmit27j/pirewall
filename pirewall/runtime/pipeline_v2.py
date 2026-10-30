@@ -6,8 +6,8 @@ completed records, new-flow signals, slow clusters, portal failures, bindings
   -> pirewall.detection_v2.d1.D1State                         (D1 evidence)
 @offenders, guard counters, set fill
   -> pirewall.detection_v2.kernel.KernelPoller                (K evidence)
-optional LightGBM output
-  -> ClassifierEvidence                                       (D3: corroboration only)
+optional LightGBM output (D3) and Isolation Forest output (D2)
+  -> ClassifierEvidence / AnomalyEvidence              (ML: MONITOR only)
 per-device bundles
   -> pirewall.policy.engine.PolicyEngine                      (PolicyDecision)
   -> FirewallDecision + CandidateRule
@@ -17,6 +17,13 @@ per-device bundles
 Each arrow is a call into a module that knows nothing of the next. Like
 `pirewall.runtime.pipeline.FlowPipeline` (v1, kept as the baseline), this
 is wiring: no detection, scoring or rule logic of its own.
+
+**ML evidence is optional and never acts alone.** Under `engine = "v2"`
+the phase-19 3.0.0 models are scored in this pipeline: D3 through
+`DetectionCoordinator.classify_known_v2`, D2 through
+`detect_anomaly_v2`, both fed a `SCHEMA_VERSION` vector. Their evidence can
+lift a bundle to MONITOR at most; the policy table owns that ceiling
+(`pirewall/policy/table.toml`, proven by `tests/unit/test_policy_matrix.py`).
 
 **Scores never choose an action.** A `CandidateRule` must carry a
 `threat_score` (the schema stage) and the dashboard shows one, so each
@@ -64,7 +71,9 @@ from pirewall.core.enums import (
 )
 from pirewall.core.models.decision import FirewallDecision
 from pirewall.core.models.event import SecurityEvent
+from pirewall.core.models.evidence import AnomalyEvidence
 from pirewall.core.models.evidence_v2 import ClassifierEvidence, D1Evidence, KernelGuardEvidence
+from pirewall.core.models.feature_vector import FeatureVector
 from pirewall.core.models.flow import Flow
 from pirewall.core.models.identity import Binding, RuleTarget
 from pirewall.core.models.metrics import V2Gauges
@@ -75,6 +84,7 @@ from pirewall.detection_v2.d1 import D1State, start_from_record, start_from_sign
 from pirewall.detection_v2.kernel import KernelPollResult
 from pirewall.detection_v2.thresholds import D1ThresholdFile
 from pirewall.features.extractor import extract_features
+from pirewall.features.schema import SCHEMA_VERSION
 from pirewall.firewall.manager import FirewallManager
 from pirewall.flow.aggregator import NewFlowSignal, SlowConnectionCluster
 from pirewall.flow.connection_start import ConnectionStartTracker
@@ -163,6 +173,7 @@ class V2Pipeline:
         self._evaluated_at: OrderedDict[str, float] = OrderedDict()
         self._kernel: dict[str, tuple[KernelGuardEvidence, ...]] = {}
         self._ml: dict[str, deque[ClassifierEvidence]] = {}
+        self._anomalies: dict[str, deque[AnomalyEvidence]] = {}
         self._aggregate_seen: OrderedDict[str, None] = OrderedDict()
         self._last_global = float("-inf")
         self._gauges = V2Gauges()
@@ -210,13 +221,13 @@ class V2Pipeline:
             self._touched_destinations.add(start.destination_ip)
 
     def observe_record(self, flow: Flow, now: datetime) -> None:
-        """A completed flow record: connection-start accounting, then optional D3 corroboration."""
+        """A completed flow record: connection-start accounting, then optional ML evidence."""
         start = start_from_record(flow, self._tracker.observe(flow))
         if start is not None:
             self._d1.observe(start)
             self._touched_macs.add(start.mac)
             self._touched_destinations.add(start.destination_ip)
-        self._classify(flow, now)
+        self._run_ml(flow, now)
 
     def observe_slow_cluster(self, cluster: SlowConnectionCluster, now: datetime) -> None:
         """A v1 slow-connection cluster (ADDENDUM_2 B2), as the D1 slow-rate DoS input."""
@@ -330,7 +341,7 @@ class V2Pipeline:
     def _decide_for(self, mac: str, now: datetime, extra: Sequence[D1Evidence] = ()) -> None:
         d1 = [*self._d1.evaluate_device(mac, now), *extra]
         self._gauges = self._gauges.model_copy(update={"d1_evidence": self._gauges.d1_evidence + len(d1)})
-        ml = self._recent_ml(mac, now)
+        ml = (*self._recent_ml(mac, now), *self._recent_anomalies(mac, now))
         bundle_items = (*self._kernel.get(mac, ()), *d1, *ml)
         if not bundle_items:
             return
@@ -420,33 +431,59 @@ class V2Pipeline:
 
     # ------------------------------------------------------------------ ML
 
-    def _classify(self, flow: Flow, now: datetime) -> None:
-        """D3 corroboration from the loaded LightGBM model, if any (MONITOR or corroboration only)."""
+    def _run_ml(self, flow: Flow, now: datetime) -> None:
+        """Score the phase-19 3.0.0 models for one completed flow, if loaded."""
         coordinator = self._coordinator
         mac = unicast_mac(flow.source_mac)
-        if coordinator is None or mac is None or coordinator.models.lightgbm is None:
+        if coordinator is None or mac is None or not coordinator.models.any_v2_loaded:
             return
         if not coordinator.in_model_domain(flow):
             return
         try:
-            outcome = coordinator.analyze_except_anomaly(flow, extract_features(flow), now)
-        except Exception:  # a model failure costs this flow's corroboration, never the pipeline
-            _logger.exception("D3 corroboration failed for flow %s", flow.flow_id)
+            features = extract_features(flow, SCHEMA_VERSION)
+        except Exception:  # feature extraction failure costs this flow's ML evidence only
+            _logger.exception("v2 feature extraction failed for flow %s", flow.flow_id)
             return
-        known = outcome.record.known_evidence
+        if coordinator.models.v2_lightgbm is not None:
+            self._classify(flow, features, mac, now)
+        if coordinator.models.v2_isolation_forest is not None:
+            self._score_anomaly(features, mac, now)
+
+    def _classify(
+        self, flow: Flow, features: FeatureVector, mac: str, now: datetime
+    ) -> None:
+        """D3 corroboration at the artifact's benign-FPR operating point."""
+        coordinator = self._coordinator
+        assert coordinator is not None
+        known = coordinator.classify_known_v2(features, now)
         if known is None:
             return
-        benign = sum(p for label, p in known.class_probabilities.items() if not is_attack_label(label))
-        probability = min(max(1.0 - benign if known.class_probabilities else known.confidence, 0.0), 1.0)
-        operating = self._config.detection.known_attack_confidence_threshold
+        probabilities = known.class_probabilities
+        attack_probability = (
+            sum(p for label, p in probabilities.items() if is_attack_label(label))
+            if probabilities
+            else known.confidence
+        )
+        probability = min(max(attack_probability, 0.0), 1.0)
+        operating = known.operating_threshold
+        if operating is None:
+            operating = self._config.detection.known_attack_confidence_threshold
+        is_attack = probability >= operating
+        family: str | None = None
+        family_probability: float | None = None
+        if is_attack and coordinator.models.v2_family is not None:
+            family_known = coordinator.classify_family_v2(features, now)
+            if family_known is not None and is_attack_label(family_known.predicted_class):
+                family = family_known.predicted_class
+                family_probability = family_known.confidence
         evidence = ClassifierEvidence(
             flow_id=flow.flow_id,
             mac=mac,
             attack_probability=probability,
             operating_threshold=operating,
-            is_attack=probability >= operating,
-            family=known.predicted_class if is_attack_label(known.predicted_class) else None,
-            family_probability=known.confidence if is_attack_label(known.predicted_class) else None,
+            is_attack=is_attack,
+            family=family,
+            family_probability=family_probability,
             model_version=known.model_version,
             feature_schema_version=known.feature_schema_version,
             generated_at=now,
@@ -459,8 +496,29 @@ class V2Pipeline:
             del self._ml[next(iter(self._ml))]
         self._touched_macs.add(mac)
 
+    def _score_anomaly(self, features: FeatureVector, mac: str, now: datetime) -> None:
+        """D2 anomaly evidence, kept per device and folded into its next bundle."""
+        coordinator = self._coordinator
+        assert coordinator is not None
+        evidence = coordinator.detect_anomaly_v2(features, now)
+        if evidence is None or not evidence.is_anomaly:
+            return
+        recent = self._anomalies.setdefault(mac, deque(maxlen=_ML_PER_DEVICE))
+        recent.append(evidence)
+        while len(self._anomalies) > self._config.d1.max_tracked_macs:
+            del self._anomalies[next(iter(self._anomalies))]
+        self._touched_macs.add(mac)
+
     def _recent_ml(self, mac: str, now: datetime) -> tuple[ClassifierEvidence, ...]:
         recent = self._ml.get(mac)
+        if not recent:
+            return ()
+        while recent and recent[0].generated_at < now - _ML_MEMORY:
+            recent.popleft()
+        return tuple(recent)
+
+    def _recent_anomalies(self, mac: str, now: datetime) -> tuple[AnomalyEvidence, ...]:
+        recent = self._anomalies.get(mac)
         if not recent:
             return ()
         while recent and recent[0].generated_at < now - _ML_MEMORY:

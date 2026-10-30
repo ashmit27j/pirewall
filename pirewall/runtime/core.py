@@ -571,12 +571,20 @@ class CoreDaemon:
             config.detection.known_tool_fingerprints_path,
         )
 
-        models = load_models(config.ml)
+        models = load_models(config.ml, load_v2=config.pipeline.engine is PipelineEngine.V2)
         self._model_load_errors = models.load_errors
-        if models.lightgbm is not None:
-            self._state.lightgbm_metadata = models.lightgbm.metadata
-        if models.isolation_forest is not None:
-            self._state.isolation_forest_metadata = models.isolation_forest.metadata
+        if config.pipeline.engine is PipelineEngine.V2:
+            # Report the artifacts this engine actually scores with, not v1's
+            # CICIDS models it loaded only as the untouched baseline.
+            state_lightgbm = models.v2_lightgbm
+            state_isolation = models.v2_isolation_forest
+        else:
+            state_lightgbm = models.lightgbm
+            state_isolation = models.isolation_forest
+        if state_lightgbm is not None:
+            self._state.lightgbm_metadata = state_lightgbm.metadata
+        if state_isolation is not None:
+            self._state.isolation_forest_metadata = state_isolation.metadata
         self._coordinator = DetectionCoordinator(
             config.detection, models, on_event=self._forwarder
         )
@@ -620,7 +628,7 @@ class CoreDaemon:
                 counters=self._counters,
                 lock=self._lock,
                 resolve_ip=self._resolve_bound_ip,
-                coordinator=self._coordinator if models.lightgbm is not None else None,
+                coordinator=self._coordinator if models.any_v2_loaded else None,
             )
             if self._manager.uses_set_backend:
                 self._kernel_poller = KernelPoller(

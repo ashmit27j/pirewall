@@ -13,6 +13,7 @@ deliberate choice with a stated reason, not an oversight.
 Last reviewed: **2026-09-10**, after the first real client session and the
 move to a new uplink network. Items 1, 2 and 23 updated 2026-10-28 (v2
 phase 14b). Items 12, 18, 19 and 21 updated 2026-10-28 (final pass).
+Items 1, 2, V6 and V15 updated 2026-10-30 (v2 phase 19).
 "v2 open items" added 2026-10-29 (after phase 17).
 
 ---
@@ -60,7 +61,7 @@ phase that closes each one.
 | V3 | The templates have passed `nft -c` on nft 1.0.2 and 1.0.9 (sandbox) but not on the Pi's nft (expected 1.0.6). | High | Environment-dependent | RUNBOOK_PI step 7 |
 | V4 | Raw guard enforcing with an incomplete binding seed could drop a legitimate device, or the Admin PC if its MAC is wrong in config. Mitigated: raw stays in observe if seeding fails, and the admin rule pins interface + MAC + IP. Still unproven on hardware. | High | Reasoned; mitigated in code | RUNBOOK_PI steps 12–14 (second SSH session open) |
 | V5 | D1 thresholds are the shipped floors (`frozen = false`). `engine = "v2"` refuses ASSISTED/ACTIVE without a valid file; SHADOW warns. | Medium | By design until fitted | RUNBOOK_PI H20, H35 |
-| V6 | ML models are v1's CICIDS-trained schema-2.0.0 models (#1, #2). Under v2, D3 is corroboration only and D2 is not wired. | Medium | Capped at MONITOR | Phase 19 |
+| V6 | v1 D3 is the CICIDS model (#1, #2); under `engine = "v2"` phase-19 3.0.0 D2 and D3 are wired as MONITOR/corroboration evidence. The current phase-19 artifacts are trained on mock pcaps only, so they do not replace v1 quality. | Medium | Wired; capped at MONITOR; artifacts mock-only | RUNBOOK_PI H0/H28, then re-run phase-19 training + audit + evaluation |
 | V7 | Forward guard stays in observe until the offline G5 check passes on `pi-live` data. Forward-path floods are only observed until then. | Medium | By design (D2) | Phase 18 `lab/benign_fp.py`, RUNBOOK_PI step 24 |
 | V8 | No lab harness: no benign-capture tooling, scripted profiles, mock pcaps, campaign runner or aggregation. `--data-mode mock` needs `--pcap`; scripted mode points at a script that doesn't exist yet. | Medium | Not started | Phase 18 |
 | V9 | Native Pi benchmark (`benchmarks/v2-native-pi/`) is written but has never run. The native ring's live fallback is tested only with a fake. | Medium | Environment-dependent | RUNBOOK_PI step 10 |
@@ -69,7 +70,7 @@ phase that closes each one.
 | V12 | Default `pipeline.engine` is `"v1"`. Flipping it changes what the Pi runs on its next start. | Decision | Human's call | Phase 20 presents the evidence |
 | V13 | D1 threshold hot-reload exists (`D1State.replace_thresholds`) but nothing triggers it; a new thresholds file needs a core restart. | Low | Implemented, not wired | Unscheduled |
 | V14 | `pcap_to_flows` Parquet output has never run (no pyarrow anywhere). CSV is tested. | Low | Not yet validated | Phase 19 if needed |
-| V15 | Model sidecars predate `artifact_sha256`, so preflight only warns about them. | Low | Accepted until retrain | Phase 19 |
+| V15 | v1 model sidecars predate `artifact_sha256`, so preflight only warns about them. Phase-19 v2 sidecars carry it, dataset and input hashes, the operating point and its rationale. | Low | Fixed for phase-19 artifacts; v1 accepted until retrain | Phase 19 |
 | V16 | Client↔client traffic on the onboard radio is bridged in firmware and invisible to pirewall. | — | Out of scope (D8) | Paper limitation |
 | V17 | Benign capture records household traffic headers. Consent is needed, and pcaps must never be committed or leave your own machines. | Process | Operator's duty | RUNBOOK_PI step 5 |
 
@@ -136,6 +137,17 @@ schema 3.0.0, which forces a retrain anyway. The order is:
    against the lab victim.
 3. Train on that (phase 19).
 
+**2026-10-30 (phase 19): the pipeline exists; the data does not.** Feature
+schema 3.0.0, the leak-free split builder, D2/D3 training with validation
+operating points, the shortcut audit, the one-shot evaluator and the
+`engine = "v2"` wiring are implemented and tested. The artifacts currently
+under `data/phase19/models` and the report under `reports/phase19/mock` are
+trained on **mock** pcaps and are marked `is_placeholder: true`; they are
+regression evidence, not a fix for this issue. Real `pi-live` benign
+captures and `pi-scripted` attack runs (RUNBOOK_PI H0, H28) are still
+required before any number can be quoted, and until then the model remains
+the wrong one — keep `ml_evidence_can_enforce = false`.
+
 ## 2. Isolation Forest flags benign traffic as anomalous
 
 **Status: Observed.** Every non-ALLOW decision in the session carried
@@ -160,6 +172,16 @@ action. Alone it scores 15 (LOW, ALLOW), and alongside a classification it
 is capped at MONITOR. It still appears in explanations. The threshold
 itself was not recalibrated, because no Pi baseline was available.
 Environment-dependent.
+
+**2026-10-30 (phase 19):** D2 is now wired under `engine = "v2"` as
+`AnomalyEvidence`, and its sidecar threshold is chosen on the benign
+validation block at a per-flow FPR of `1e-3` instead of a contamination
+setting. That is the mechanism this item asked for; the number is still not
+a Pi baseline, because the artifacts are mock-only (`is_placeholder: true`).
+On `pi-live` data the same code reports the achieved FPR, its resolution and
+expected alerts/day, so the threshold can be set from this network rather
+than from the model default. Until then the `engine = "v1"` threshold and
+the MONITOR cap stay as they are.
 
 ## 3. Behaviour thresholds are still tuned for a quiet network
 

@@ -43,7 +43,7 @@ are regression evidence and are labelled as such.
 | 17 | D1 detectors, kernel offender poller, policy engine | Complete: **v2.1 (engine)** (Implemented/Tested/Mocked) | See "Phase 17 details" below. `pipeline.engine = "v2"` runs; default stays `"v1"` (human's call). Suite 1914 passed / 39 skipped as `pw`, netns tier 34/34 as root, env=sandbox/mock only. Thresholds ship as floors, `frozen = false`; fitting on `pi-live` data is Environment-dependent. Nothing ran on the Pi. |
 | — | Handoff pass: phase 18–20 prompts, `RUNBOOK_PI.md`, `HANDOFF.md`, v2 merged to `main` | Complete (documentation only) | See "Handoff pass (2026-10-29)" below. No code changed. |
 | 18 | Lab harness and data modes | Complete: **v2.1 (engine + harness)** (Implemented/Tested/Mocked) | See "Phase 18 details" below. Suite 2034 passed / 39 skipped as `pw`, netns tier 34/34 as root, env=mock/sandbox only. `pirewall-start --check --data-mode mock` passes without `--pcap`. Benign capture, campaigns #1/#2 and the real G5 run are Environment-dependent. Finding: fast mock replays over-count D1 on benign devices (hand-over to 16/17). Nothing ran on the Pi. |
-| 19 | ML on feature schema 3.0.0, from own pcaps | Not started; prompt ready | `docs/v2/prompts/phase-19-ml-schema3.md`. Needs 18; real numbers need `pi-live` data (RUNBOOK_PI H0, H28). |
+| 19 | ML on feature schema 3.0.0, from own pcaps | Complete: **v2.2 (ML)** (Implemented/Tested/Mocked) | See "Phase 19 details" below. Schema 3.0.0, leak-free dataset builder, D2/D3 training with validation operating points, shortcut audit, one-shot evaluator and `engine = "v2"` wiring. Suite 2079 passed / 66 skipped on the Pi; env=mock only for the model numbers. Real `pi-live`/`pi-scripted` quality is Environment-dependent (RUNBOOK_PI H0, H28). |
 | 20 | Evaluation support, docs reconciliation, paper tables | Not started; prompt ready | `docs/v2/prompts/phase-20-eval-docs-paper.md`. Needs everything, plus the human's Pi campaigns. |
 
 ### Phase 18 details
@@ -183,6 +183,79 @@ capture for H0, because the capture must start hours before phase 18's
 persistent is installed. Harness command lines in the runbook (H24+) are the
 planned shape and are marked to be checked against `lab/README.md` by
 phase 18.
+
+### Phase 19 details
+
+**Scope.** `docs/v2/prompts/phase-19-ml-schema3.md`: train D2/D3 on
+pirewall's own pcap-derived flows under a new feature schema, with the
+critique_ml methodology (leak-free splits, validation operating points,
+shortcut audit, one-shot test read). Integrator for `pirewall/runtime/core.py`
+(ML wiring only). `engine = "v1"` keeps loading the shipped 2.0.0 artifacts;
+the new 3.0.0 artifacts are loaded only under `engine = "v2"`.
+
+**Delivered.**
+
+| Deliverable | Label | Evidence |
+|---|---|---|
+| Feature schema 3.0.0 (`pirewall/features/schema.py`): raw `destination_port` replaced by coarse `destination_port_category`; 2.0.0 frozen projection | Tested | `28515dc`; version registry, pinned name/definition tables, loader schema gate, v1 explicitly requests 2.0.0; schema tests |
+| `scripts/dataset/pcap_to_flows.py --schema {2.0.0,3.0.0}` (default 3.0.0) | Tested | `54e9b66`; manifest records version and names; unknown version refused; parity tests over both versions |
+| `scripts/dataset/build_dataset.py`: temporal benign 60/15/≥1 h gap/25, attack run/tool/parameter holdouts, connection leak check, per-run caps, split SHA-256s, append-only test-access ledger, mixed-env refusal | Tested | `04774a4`; builder tests |
+| `pirewall/ml/training/{dataset,phase19}.py`, `pirewall/ml/calibration.py`, `scripts/train/train_phase19.py`: D2 benign-only Isolation Forest, binary D3 + optional family head, isotonic calibration on validation, operating thresholds at validation benign FPR `1e-3`, complete sidecars | Tested | sidecars carry schema, feature order, env tag, dataset/input hashes, threshold/calibration and rationale; mock artifacts marked `is_placeholder: true` |
+| `scripts/train/shortcut_audit.py`: gain, single-feature, permutation, port ablation and run/capture separation, benign training block only | Tested | a planted capture-identifying feature is named in the failure; groups <2 are recorded as skipped |
+| `pirewall/ml/evaluation.py`, `scripts/train/evaluate_phase19.py`: AUC/AP/recall at FPR, reliability, PSI, expected alerts/day; refuses a failed/mismatched audit or a second test read | Tested | outputs `metrics.json`, `table_v.csv`, `fig3`–`fig5` CSVs, each with env tag and `reportable_as_model_quality` |
+| `engine = "v2"` ML wiring: `v2_*` config paths, separate `ModelRegistry` fields, `classify_known_v2`/`classify_family_v2`/`detect_anomaly_v2`, per-MAC evidence windows in `V2Pipeline` | Tested | `tests/unit/test_v2_pipeline.py` proves D2+D3 alone stay MONITOR in SHADOW/ASSISTED/ACTIVE; missing files degrade to no ML evidence |
+| Docs: `docs/ML_PIPELINE.md`, `docs/FEATURE_SCHEMA.md`, `docs/KNOWN_ISSUES.md` #1/#2/V6/V15, `docs/v2/RUNBOOK_PI.md` H28–H30 | Implemented | commands checked against the current CLIs |
+
+**Gates (2026-10-30, Raspberry Pi 4, aarch64, Python 3.12.14).**
+- `.venv/bin/ruff check .` clean; `git diff --check` clean.
+- Targeted phase-19/ML/v2/deployment suites: **469 passed, 1 skipped**.
+- Full `pytest` as `raspberrypi`: **2079 passed, 66 skipped** (the skipped
+  tier is the usual native/root/Node-dependent set; `.pytest_cache`
+  permission warnings are environmental).
+- **Not run:** `pyright` (no Node/pyright on the Pi; `nodeenv` cannot
+  bootstrap), native parity (installed `pirewall_native` wheel is x86_64,
+  host is aarch64; no cargo/maturin/uv), and the root netns traffic tier
+  (34 skipped: `hping3`, `conntrack` and the system `python3-nftables` are
+  absent on this host).
+- Env tags: `mock` and `sandbox` only. **Nothing was trained on real
+  traffic and no attack ran against anything.**
+
+**Mock numbers (regression/bootstrap only — not model quality).** Dataset
+`7991e00196cfc02747a162a62bbf97c5e1fa2aad1295148cc6d4f3b91a8af742`, 68,191
+rows; benign 1688/468/420/822 and attack 6228/5396/5030/12989/762 across
+the split files. On the test blocks: D3 FPR 0, recall 0.2798, AP 0.9791,
+ROC-AUC 0.8273 (validation recall 0.0556); D2 FPR 0, recall 0, AP 0.9211,
+ROC-AUC 0.5303; no feature shows a major PSI shift. Every report file says
+`env_tags: ["mock"]` and `reportable_as_model_quality: false`. The mock
+generator's benign and attack flows overlap on most features, which is why
+D2 is near chance — this says nothing about `pi-live` traffic.
+
+**Deviations.**
+1. Phase-19 ML runtime wiring edits `pirewall/detection/coordinator.py`,
+   `pirewall/runtime/pipeline_v2.py` and `pirewall/runtime/core.py`, as the
+   phase prompt authorises for ML wiring only. The policy table and the
+   MONITOR ceiling are unchanged; `ml_evidence_can_enforce` stays `false`.
+2. The full-suite run exposed a real robustness bug in
+   `scripts/deployment/lease_check.py`: `Path.exists()` raises
+   `PermissionError` when a parent directory is root-only, so a non-root
+   CLI run crashed instead of reporting a problem. It now returns
+   `UNREADABLE` and a regression test monkeypatches `Path.exists` to raise.
+   This is a phase 14/16 deployment file, fixed here because it blocked the
+   phase gate.
+3. The run/capture shortcut check runs on the benign training block only,
+   and records groups with fewer than two ids as skipped. Attack-specific
+   constants are behaviour, not leakage; a single capture makes every value
+   trivially "exclusive".
+4. Under `engine = "v2"`, dashboard/state ML metadata reports the v2
+   artifacts only, never the unused v1 CICIDS sidecars.
+5. D2 and D3 both report the validation block's FPR resolution when `1e-3`
+   is finer than one row, rather than claiming the target was achieved.
+
+**Environment-dependent (RUNBOOK_PI H0/H28).** Real `pi-live` benign pcaps,
+`pi-scripted` attack runs, re-running dataset → train → audit → evaluate
+with `pi-*` tags, and only then copying models to the Pi. Until that
+happens, the v1 CICIDS model remains the deployed quality baseline and the
+ML ceiling stays on.
 
 ### Phase 11 details
 

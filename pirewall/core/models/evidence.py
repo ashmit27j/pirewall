@@ -11,12 +11,18 @@ from pirewall.core.models.common import PirewallModel
 
 
 class KnownEvidence(PirewallModel):
-    """LightGBM known-attack classification output for one flow (spec §14)."""
+    """LightGBM known-attack classification output for one flow (spec §14).
+
+    `operating_threshold` is the phase-19 benign-FPR operating point the
+    artifact was trained to; it is `None` for v1 artifacts, which have no
+    per-model calibrated threshold.
+    """
 
     flow_id: str = Field(min_length=1)
     predicted_class: str = Field(min_length=1)
     confidence: float = Field(ge=0.0, le=1.0)
     class_probabilities: dict[str, float] = Field(default_factory=dict)
+    operating_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     model_version: str = Field(min_length=1)
     feature_schema_version: str = Field(min_length=1)
     generated_at: AwareDatetime

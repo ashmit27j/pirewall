@@ -7,7 +7,7 @@ must be unmistakably marked as such everywhere its metadata is shown,
 never presented as a real detection-performance result.
 """
 
-from pydantic import AwareDatetime, Field
+from pydantic import AwareDatetime, Field, model_validator
 
 from pirewall.core.enums import ModelType
 from pirewall.core.models.common import PirewallModel
@@ -39,3 +39,23 @@ class ModelMetadata(PirewallModel):
     # because artifacts trained before phase 16 carry none; for those the
     # preflight warns and records the computed hash instead.
     artifact_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    # Phase 19 provenance. Additive and optional so every v1 artifact and
+    # every test fixture written before this phase still validates.
+    env_tag: str | None = None
+    dataset_id: str | None = None
+    dataset_manifest_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    input_manifest_sha256: dict[str, str] = Field(default_factory=dict)
+    operating_threshold: float | None = None
+    operating_threshold_rationale: str | None = None
+    calibration_method: str | None = None
+    calibration_x: tuple[float, ...] = ()
+    calibration_y: tuple[float, ...] = ()
+
+    @model_validator(mode="after")
+    def _check_calibration(self) -> "ModelMetadata":
+        if len(self.calibration_x) != len(self.calibration_y):
+            raise ValueError("calibration_x and calibration_y must have the same length")
+        if self.calibration_method is None and self.calibration_x:
+            raise ValueError("calibration points require calibration_method")
+        return self

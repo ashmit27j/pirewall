@@ -111,9 +111,16 @@ anomaly_batch_max_wait_seconds = 0.2
 source_assessment_cooldown_seconds = 10.0
 
 [ml]
+# v1 (`pipeline.engine = "v1"`): the frozen CICIDS2017 artifacts, feature schema 2.0.0.
 lightgbm_model_path = "pirewall/ml/artifacts/lightgbm_model.txt"
 isolation_forest_model_path = "pirewall/ml/artifacts/isolation_forest_model.joblib"
 feature_schema_version = "2.0.0"
+# v2 (`pipeline.engine = "v2"`): the phase-19 models trained on this network's
+# own captures, feature schema 3.0.0. Missing files degrade to no ML evidence.
+v2_lightgbm_model_path = "pirewall/ml/artifacts/phase19/lightgbm_model.txt"
+v2_isolation_forest_model_path = "pirewall/ml/artifacts/phase19/isolation_forest_model.joblib"
+v2_family_model_path = "pirewall/ml/artifacts/phase19/lightgbm_family_model.txt"
+v2_feature_schema_version = "3.0.0"
 
 [threat]
 low_threshold = 25.0

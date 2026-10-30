@@ -297,13 +297,41 @@ already established and conntrack keeps it alive.
 ## H28–H30 — ML training on own data (after phase 19)
 
 22. Copy the pcap-derived rows (not the pcaps, if you can avoid it) to the dev
-    machine and run phase 19's dataset builder and trainers there. The data
-    stays out of git (`.gitignore` covers `*.pcap`, `*.csv`, `data/`, `reports/`).
+    machine and run phase 19's dataset builder, trainers, audit and evaluator
+    there. The data stays out of git (`.gitignore` covers `*.pcap`, `*.csv`,
+    `data/`, `reports/`).
 
     ```sh
     # dev machine
     rsync -a pi:~/flows-benign ./data/flows-benign-pi-live/
+    rsync -a pi:~/flows-attack ./data/flows-attack-pi-scripted/
+
+    # one dataset: pi-live benign + pi-scripted attacks, schema 3.0.0
+    uv run python -m scripts.dataset.build_dataset \
+      data/flows-benign-pi-live data/flows-attack-pi-scripted \
+      --out data/phase19/dataset-pi --max-rows-per-run 5000
+
+    uv run python -m scripts.train.train_phase19 \
+      --dataset data/phase19/dataset-pi --output-dir data/phase19/models-pi
+
+    # must exit 0 and name no feature; a failure blocks the report
+    uv run python -m scripts.train.shortcut_audit \
+      --dataset data/phase19/dataset-pi \
+      --model data/phase19/models-pi/lightgbm_model.txt \
+      --output reports/phase19/pi/audit.json
+
+    # ONE read of the test blocks; a second needs --allow-repeat-test-read
+    uv run python -m scripts.train.evaluate_phase19 \
+      --dataset data/phase19/dataset-pi \
+      --d2 data/phase19/models-pi/isolation_forest_model.joblib \
+      --d3 data/phase19/models-pi/lightgbm_model.txt \
+      --audit reports/phase19/pi/audit.json \
+      --output-dir reports/phase19/pi
     ```
+
+    Every file must say `pi-live`/`pi-scripted`. If the audit fails, stop:
+    fix the dataset or the feature, not the threshold. Only then copy the
+    `models-pi` artifacts and sidecars to the Pi and review the numbers.
 
 ## H35–H41 — freeze, campaign #2 (eval), held-out benign window (after phase 18)
 

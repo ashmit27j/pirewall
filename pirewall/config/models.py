@@ -209,11 +209,23 @@ class DetectionConfig(PirewallModel):
 
 
 class MLConfig(PirewallModel):
-    """Model artifact locations and expected feature schema (spec §15)."""
+    """Model artifact locations and expected feature schema (spec §15).
+
+    The un-prefixed paths are the frozen v1 artifacts (feature schema
+    2.0.0), loaded under `pipeline.engine = "v1"`. The `v2_*` paths are the
+    phase-19 artifacts (feature schema 3.0.0), loaded only under
+    `pipeline.engine = "v2"`; they may be unset, in which case v2 simply
+    runs without ML evidence.
+    """
 
     lightgbm_model_path: str = Field(min_length=1)
     isolation_forest_model_path: str = Field(min_length=1)
     feature_schema_version: str = Field(default="2.0.0", min_length=1)
+
+    v2_lightgbm_model_path: str | None = None
+    v2_isolation_forest_model_path: str | None = None
+    v2_family_model_path: str | None = None
+    v2_feature_schema_version: str = Field(default="3.0.0", min_length=1)
 
 
 class ThreatConfig(PirewallModel):

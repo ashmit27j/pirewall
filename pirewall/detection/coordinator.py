@@ -74,28 +74,87 @@ _INFERENCE_FAILURE_EVENT_INTERVAL = 100
 class ModelRegistry:
     """The ML artifacts pirewall-core actually managed to load at startup.
 
-    Either field being `None` is a supported operating state, not an error —
-    see this module's docstring. `load_errors` carries one human-readable
-    line per artifact that failed, so the caller can log precisely what is
-    missing instead of a generic "ML unavailable".
+    Either v1 field being `None` is a supported operating state, not an
+    error — see this module's docstring. `load_errors` carries one
+    human-readable line per artifact that failed, so the caller can log
+    precisely what is missing instead of a generic "ML unavailable".
+
+    The `v2_*` fields are the phase-19 feature-schema-3.0.0 artifacts. They
+    are only populated when the v2 pipeline is selected, and are kept
+    separate from the v1 pair so neither engine can ever feed a model a
+    vector from the other's schema.
     """
 
     lightgbm: LoadedLightGBMModel | None = None
     isolation_forest: LoadedIsolationForestModel | None = None
+    v2_lightgbm: LoadedLightGBMModel | None = None
+    v2_isolation_forest: LoadedIsolationForestModel | None = None
+    v2_family: LoadedLightGBMModel | None = None
     load_errors: tuple[str, ...] = ()
 
     @property
     def any_loaded(self) -> bool:
-        return self.lightgbm is not None or self.isolation_forest is not None
+        return (
+            self.lightgbm is not None
+            or self.isolation_forest is not None
+            or self.v2_lightgbm is not None
+            or self.v2_isolation_forest is not None
+        )
+
+    @property
+    def any_v2_loaded(self) -> bool:
+        return self.v2_lightgbm is not None or self.v2_isolation_forest is not None
 
 
-def load_models(config: MLConfig) -> ModelRegistry:
-    """Load both ML artifacts, degrading to `None` for whichever one is unusable.
+def _load_v2_models(config: MLConfig, errors: list[str]) -> tuple[
+    LoadedLightGBMModel | None,
+    LoadedIsolationForestModel | None,
+    LoadedLightGBMModel | None,
+]:
+    """Load the 3.0.0 artifacts, each failing independently and loudly."""
+    lightgbm: LoadedLightGBMModel | None = None
+    if config.v2_lightgbm_model_path is not None:
+        try:
+            lightgbm = load_lightgbm_model(
+                Path(config.v2_lightgbm_model_path),
+                expected_schema_version=config.v2_feature_schema_version,
+            )
+        except (ModelLoadError, ModelInferenceError) as exc:
+            errors.append(f"v2 lightgbm: {exc}")
+            _logger.warning("v2 LightGBM model unavailable, D3 corroboration disabled: %s", exc)
+
+    isolation_forest: LoadedIsolationForestModel | None = None
+    if config.v2_isolation_forest_model_path is not None:
+        try:
+            isolation_forest = load_isolation_forest_model(
+                Path(config.v2_isolation_forest_model_path),
+                expected_schema_version=config.v2_feature_schema_version,
+            )
+        except (ModelLoadError, ModelInferenceError) as exc:
+            errors.append(f"v2 isolation_forest: {exc}")
+            _logger.warning("v2 Isolation Forest unavailable, D2 anomaly evidence disabled: %s", exc)
+
+    family: LoadedLightGBMModel | None = None
+    if config.v2_family_model_path is not None:
+        try:
+            family = load_lightgbm_model(
+                Path(config.v2_family_model_path),
+                expected_schema_version=config.v2_feature_schema_version,
+            )
+        except (ModelLoadError, ModelInferenceError) as exc:
+            errors.append(f"v2 family: {exc}")
+            _logger.warning("v2 family head unavailable; D3 family label will be absent: %s", exc)
+    return lightgbm, isolation_forest, family
+
+
+def load_models(config: MLConfig, *, load_v2: bool = False) -> ModelRegistry:
+    """Load both ML artifact pairs, degrading to `None` for whichever is unusable.
 
     Never raises. A missing file, an unreadable artifact, a missing metadata
     sidecar, and a feature-schema mismatch (spec §15) are all treated the
     same way: warn, record the reason in `load_errors`, and continue without
-    that model.
+    that model. `load_v2=True` additionally loads the phase-19 3.0.0
+    artifacts from the `v2_*` paths.
     """
     errors: list[str] = []
 
@@ -115,22 +174,32 @@ def load_models(config: MLConfig) -> ModelRegistry:
         errors.append(f"isolation_forest: {exc}")
         _logger.warning("Isolation Forest model unavailable, anomaly detection disabled: %s", exc)
 
-    if lightgbm is not None:
-        _logger.info(
-            "loaded LightGBM model version=%s schema=%s placeholder=%s",
-            lightgbm.metadata.model_version,
-            lightgbm.metadata.feature_schema_version,
-            lightgbm.metadata.is_placeholder,
-        )
-    if isolation_forest is not None:
-        _logger.info(
-            "loaded Isolation Forest model version=%s schema=%s placeholder=%s",
-            isolation_forest.metadata.model_version,
-            isolation_forest.metadata.feature_schema_version,
-            isolation_forest.metadata.is_placeholder,
-        )
+    v2_lightgbm, v2_isolation_forest, v2_family = (
+        _load_v2_models(config, errors) if load_v2 else (None, None, None)
+    )
+
+    for label, loaded in (
+        ("v1 LightGBM", lightgbm),
+        ("v1 Isolation Forest", isolation_forest),
+        ("v2 LightGBM", v2_lightgbm),
+        ("v2 Isolation Forest", v2_isolation_forest),
+        ("v2 family head", v2_family),
+    ):
+        if loaded is not None:
+            _logger.info(
+                "loaded %s model version=%s schema=%s placeholder=%s",
+                label,
+                loaded.metadata.model_version,
+                loaded.metadata.feature_schema_version,
+                loaded.metadata.is_placeholder,
+            )
     return ModelRegistry(
-        lightgbm=lightgbm, isolation_forest=isolation_forest, load_errors=tuple(errors)
+        lightgbm=lightgbm,
+        isolation_forest=isolation_forest,
+        v2_lightgbm=v2_lightgbm,
+        v2_isolation_forest=v2_isolation_forest,
+        v2_family=v2_family,
+        load_errors=tuple(errors),
     )
 
 
@@ -303,7 +372,23 @@ class DetectionCoordinator:
         )
 
     def _classify_known(self, features: FeatureVector, now: datetime) -> KnownEvidence | None:
-        model = self._models.lightgbm
+        return self._classify_with(self._models.lightgbm, features, now)
+
+    def classify_known_v2(
+        self, features: FeatureVector, now: datetime
+    ) -> KnownEvidence | None:
+        """D3 evidence from the phase-19 3.0.0 model (v2 pipeline only)."""
+        return self._classify_with(self._models.v2_lightgbm, features, now)
+
+    def classify_family_v2(
+        self, features: FeatureVector, now: datetime
+    ) -> KnownEvidence | None:
+        """The coarse family head's labels for one flow, when that head is loaded."""
+        return self._classify_with(self._models.v2_family, features, now)
+
+    def _classify_with(
+        self, model: LoadedLightGBMModel | None, features: FeatureVector, now: datetime
+    ) -> KnownEvidence | None:
         if model is None:
             return None
         try:
@@ -313,11 +398,27 @@ class DetectionCoordinator:
             return None
 
     def _detect_anomaly(self, features: FeatureVector, now: datetime) -> AnomalyEvidence | None:
-        model = self._models.isolation_forest
+        return self._detect_with(self._models.isolation_forest, features, now)
+
+    def detect_anomaly_v2(
+        self, features: FeatureVector, now: datetime
+    ) -> AnomalyEvidence | None:
+        """D2 evidence from the phase-19 3.0.0 model (v2 pipeline only)."""
+        return self._detect_with(self._models.v2_isolation_forest, features, now)
+
+    def _detect_with(
+        self,
+        model: LoadedIsolationForestModel | None,
+        features: FeatureVector,
+        now: datetime,
+    ) -> AnomalyEvidence | None:
         if model is None:
             return None
+        threshold = model.metadata.operating_threshold
+        if threshold is None:
+            threshold = self._config.anomaly_score_threshold
         try:
-            return detect_anomaly(model, features, self._config.anomaly_score_threshold, now)
+            return detect_anomaly(model, features, threshold, now)
         except (ModelInferenceError, ValueError) as exc:
             self._report_inference_failure(ModelType.ISOLATION_FOREST, features.flow_id, now, exc)
             return None

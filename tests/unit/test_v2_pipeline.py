@@ -18,11 +18,14 @@ from pirewall.core.enums import (
     FirewallAction,
     GuardMode,
     GuardName,
+    Protocol,
     RuleStatus,
     SecurityEventType,
 )
 from pirewall.core.models.allowlist import AllowlistEntry
 from pirewall.core.models.event import SecurityEvent
+from pirewall.core.models.evidence import AnomalyEvidence, KnownEvidence
+from pirewall.core.models.feature_vector import FeatureVector
 from pirewall.core.nft_names import OffenderCode
 from pirewall.detection_v2.kernel import KernelPoller
 from pirewall.detection_v2.thresholds import load_thresholds
@@ -48,7 +51,11 @@ T0: Final = datetime.now(UTC)
 
 class _Harness:
     def __init__(
-        self, mode: EnforcementMode, forward: GuardMode = GuardMode.ENFORCE, **sections: dict[str, Any]
+        self,
+        mode: EnforcementMode,
+        forward: GuardMode = GuardMode.ENFORCE,
+        coordinator: Any = None,
+        **sections: dict[str, Any],
     ) -> None:
         self.now = T0
         config = make_config(firewall={"enforcement_mode": mode.value}, **sections)
@@ -75,6 +82,7 @@ class _Harness:
             counters=RuntimeCounters(),
             lock=lock,
             resolve_ip=lambda mac: IP if mac == MAC else None,
+            coordinator=coordinator,
             monotonic=lambda: (self.now - T0).total_seconds(),
         )
         self.poller = KernelPoller(
@@ -249,3 +257,76 @@ def test_portal_failures_cross_threads_through_the_inbox(clock: Callable[[], Non
     harness.pipeline.evaluate(harness.now)
 
     assert harness.elements(nft_names.SET_RATELIMIT_MAC) == [MAC]  # one account, one device: D1 standard
+
+
+# --------------------------------------------------------------- ML ceiling
+
+
+class _FakeV2Models:
+    any_v2_loaded = True
+    v2_lightgbm = object()
+    v2_isolation_forest = object()
+    v2_family = None
+
+
+class _FakeV2Coordinator:
+    """D2 + D3 evidence on every flow, with no D1 and no real model."""
+
+    models = _FakeV2Models()
+
+    @staticmethod
+    def in_model_domain(flow: Any) -> bool:
+        del flow
+        return True
+
+    @staticmethod
+    def classify_known_v2(features: FeatureVector, now: datetime) -> KnownEvidence:
+        return KnownEvidence(
+            flow_id=features.flow_id,
+            predicted_class="attack",
+            confidence=0.99,
+            class_probabilities={"benign": 0.01, "attack": 0.99},
+            operating_threshold=0.9,
+            model_version="3.0.0",
+            feature_schema_version="3.0.0",
+            generated_at=now,
+        )
+
+    @staticmethod
+    def detect_anomaly_v2(features: FeatureVector, now: datetime) -> AnomalyEvidence:
+        return AnomalyEvidence(
+            flow_id=features.flow_id,
+            anomaly_score=-0.9,
+            threshold=-0.2,
+            is_anomaly=True,
+            model_version="3.0.0",
+            feature_schema_version="3.0.0",
+            generated_at=now,
+        )
+
+
+@pytest.mark.parametrize(
+    "mode", [EnforcementMode.SHADOW, EnforcementMode.ASSISTED, EnforcementMode.ACTIVE]
+)
+def test_d2_and_d3_evidence_alone_never_exceed_monitor(mode: EnforcementMode) -> None:
+    harness = _Harness(mode, coordinator=_FakeV2Coordinator())
+    # UDP is never a connection start, so the bundle holds only ML evidence.
+    flow = make_flow(
+        flow_id="ml-only",
+        source_ip=str(IP),
+        destination_ip="192.168.1.10",
+        destination_port=53,
+        protocol=Protocol.UDP,
+    ).model_copy(update={"source_mac": MAC})
+
+    harness.pipeline.observe_record(flow, harness.now)
+    harness.pipeline.evaluate(harness.now)
+    harness.pipeline.evaluate(harness.now + timedelta(seconds=5))
+
+    decisions = [
+        event for event in harness.events if event.event_type is SecurityEventType.POLICY_DECISION
+    ]
+    assert decisions, "ML-only evidence should still be reported"
+    assert {event.decision for event in decisions} == {FirewallAction.MONITOR}
+    for name in nft_names.ADAPTIVE_ENFORCEMENT_SETS:
+        assert harness.elements(name) == [], f"{name} must stay empty for ML-only evidence"

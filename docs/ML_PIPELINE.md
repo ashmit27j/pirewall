@@ -10,6 +10,128 @@ outright, two open data-hygiene issues (NaN/Infinity acceptance, label
 mojibake), a label-leakage check on `destination_port`, and measured
 per-flow inference latency for both models.
 
+## Phase 19: schema 3.0.0 models trained on this network (current)
+
+The pipeline above is the **v1 baseline**: it adapts public CSV datasets
+into schema 2.0.0 and its artifacts stay exactly as shipped. Phase 19 adds a
+second, separate track, used only when `pipeline.engine = "v2"`:
+
+| | v1 baseline | phase 19 / v2 |
+|---|---|---|
+| feature schema | `2.0.0` (frozen projection) | `3.0.0` (`destination_port` → `destination_port_category`) |
+| training rows | CICIDS2017 / UNSW-NB15 adapters | `pcap_to_flows` rows from our own captures |
+| D3 | flat multiclass LightGBM | binary benign-vs-attack LightGBM + optional coarse family head |
+| D2 | Isolation Forest at a contamination setting | Isolation Forest at a validation benign FPR of `1e-3` |
+| config | `ml.lightgbm_model_path`, `ml.isolation_forest_model_path` | `ml.v2_*` paths, `ml.v2_feature_schema_version = "3.0.0"` |
+| runtime | `FlowPipeline` (v1) | `V2Pipeline`, ML evidence capped at MONITOR |
+
+`engine = "v1"` never loads the v2 files, so the shipped 2.0.0 artifacts
+keep working unchanged. `ModelRegistry` keeps the two sets in separate
+fields; the schema gate refuses a v2 artifact whose sidecar does not say
+`3.0.0`, and vice versa.
+
+### Dataset: build once, read hashes only
+
+`scripts/dataset/build_dataset.py` is the only splitter. Given one or more
+`pcap_to_flows` output directories (each with its manifest and
+`ground_truth.jsonl`), it writes:
+
+* benign: temporal `benign_train` / `benign_validation` / `benign_gap` /
+  `benign_test` (60 / 15 / ≥1 h / 25), with whole connections kept inside
+  one split;
+* attacks: `attack_train` / `attack_validation`, plus three test blocks:
+  run-holdout, leave-one-tool-out and parameter-holdout;
+* `dataset_manifest.json` with the schema, feature-name order, env tags,
+  input manifest hashes, per-split SHA-256 and row counts;
+* an append-only `test_access_ledger.jsonl`.
+
+Training and evaluation read splits only through
+`pirewall.ml.training.dataset.load_dataset`, which re-checks every split
+hash. A changed file is refused rather than trained on. Reading a test split
+appends a ledger entry, and `evaluate_phase19.py` refuses a second test read
+unless `--allow-repeat-test-read` is passed deliberately. Env tags are
+carried through; mixing `mock` with `pi-*` is refused by the builder.
+
+### Training, operating points and sidecars
+
+```sh
+.venv/bin/python -m scripts.train.train_phase19 \
+    --dataset data/phase19/dataset --output-dir data/phase19/models
+```
+
+`pirewall.ml.training.phase19` never re-splits rows. D2 fits on
+`benign_train` only; D3 fits binary LightGBM on benign + attack train rows,
+fits isotonic calibration on validation, then chooses the D3 operating
+threshold as the validation benign quantile for `1e-3`. D2's threshold is
+chosen the same way (lower score is more anomalous). Both record the
+validation block's FPR resolution when `1e-3` is finer than one row instead
+of pretending the target was met. Each artifact's sidecar carries schema,
+feature order, env tag, dataset + input manifest hashes,
+`artifact_sha256`, the threshold, its rationale, and the calibration knots;
+mock training is marked `is_placeholder: true`.
+
+### Shortcut audit gates the report
+
+`scripts/train/shortcut_audit.py` runs before any metric is shown. It trains
+from train/validation only (test is untouched) and checks:
+
+1. LightGBM gain importance per feature;
+2. a one-feature model per feature (a single feature that nearly solves the
+   task is a shortcut, not learned behaviour);
+3. permutation importance on validation;
+4. ablation with and without `destination_port_category`;
+5. run/capture separation on the **benign training block**: no feature value
+   may be almost exclusive to one run or capture, and no feature's variance
+   may be almost fully explained by a run/capture id.
+
+A failure exits non-zero, names the feature, and `evaluate_phase19.py`
+refuses to render a report whose audit did not pass for the same dataset and
+model. The benign-only scope of check 5 is deliberate: an attack run using
+64-byte datagrams is behaviour, not leakage.
+
+### Report data (test blocks, read once)
+
+```sh
+.venv/bin/python -m scripts.train.shortcut_audit \
+    --dataset data/phase19/dataset --model data/phase19/models/lightgbm_model.txt \
+    --output /tmp/phase19_audit.json
+.venv/bin/python -m scripts.train.evaluate_phase19 \
+    --dataset data/phase19/dataset \
+    --d2 data/phase19/models/isolation_forest_model.joblib \
+    --d3 data/phase19/models/lightgbm_model.txt \
+    --audit /tmp/phase19_audit.json --output-dir reports/phase19/<env>
+```
+
+`reports/` stays gitignored. Outputs (all carry the env tag and a
+`reportable_as_model_quality` flag):
+
+* `metrics.json` — every number, threshold, test-split hash and caveat;
+* `table_v.csv` — PR-AUC, ROC-AUC, recall at FPR `1e-3` / `1e-4`, expected
+  alerts/day;
+* `fig3_score_distributions.csv`, `fig4_reliability.csv`, `fig5_psi.csv` —
+  the data behind the paper figures, including per-feature train/test PSI
+  (a major shift is PSI ≥ 0.25).
+
+**Only `pi-live` + `pi-scripted` tags make those numbers model quality.**
+The report generated for this session under `reports/phase19/mock`
+(gitignored) is labelled `mock` and is regression/bootstrap evidence, not a
+result: D3 validation recall is only 0.0556 and D2's mock ROC-AUC is 0.53
+because the mock generator's benign and attack flows overlap on most
+features. Do not copy those numbers into a paper or a deployment decision.
+
+### Runtime wiring
+
+Under `engine = "v2"`, `V2Pipeline` extracts a `3.0.0` vector per completed
+flow (only for TCP/UDP, as in v1) and asks the coordinator for D3
+(`classify_known_v2`) and D2 (`detect_anomaly_v2`). D3's attack probability
+comes from the calibrated binary model compared with the sidecar's
+operating threshold; the family head runs only when D3 fires. Evidence is
+kept per MAC for a short window and folded into that device's next bundle.
+Both use the existing policy table, where `ml_only` is capped at MONITOR and
+`ml_with_d1` corroborates D1; `tests/unit/test_v2_pipeline.py` proves D2+D3
+alone stay at MONITOR in SHADOW, ASSISTED and ACTIVE. Missing v2 files
+degrade to no ML evidence, never to a failed start.
+
 ## Pipeline overview
 
 ```text
@@ -142,6 +264,11 @@ shell command. Evidence flows onward into `pirewall.engine.threat.assess_threat`
 
 ## Retraining procedure
 
+**The v1 procedure below is for the public-dataset baseline.** For the
+phase-19 models, use the dataset → train → audit → evaluate commands in
+"Phase 19" above; the gate that matters there is the shortcut audit plus the
+one-shot test read, not the CICIDS metrics.
+
 1. On a development machine (spec §4), obtain a real, current dataset.
 2. Run both training CLIs above **without** `--placeholder`, with a new
    `--model-version` (semantic version bump).
@@ -162,6 +289,14 @@ shell command. Evidence flows onward into `pirewall.engine.threat.assess_threat`
   both training CLIs, schema-mismatch refusal (load-time and per-call), and
   successful inference — all against small synthetic fixture data
   (`tests/ml/`).
+- **Tested (phase 19)**: isotonic/FPR arithmetic, frozen-split hash checks
+  and ledger writes, end-to-end mock D2/D3 training and sidecars, audit
+  pass/fail (a planted capture-identifying feature is named), evaluator
+  single-read refusal and audit gating, calibrated-predictor parity, and
+  D2+D3-only evidence staying at MONITOR in every enforcement mode
+  (`tests/unit/test_phase19_training.py`,
+  `tests/unit/test_phase19_evaluation.py`,
+  `tests/unit/test_v2_pipeline.py`).
 - **Environment-dependent**: real detection accuracy against *live* attack
   traffic on the Pi still needs the spec §34 attack-lab exercise. Held-out
   accuracy on the real CICIDS2017 dataset is no longer environment-dependent

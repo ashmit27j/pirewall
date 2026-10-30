@@ -43,6 +43,7 @@ def classify(
         predicted_class=predicted_class,
         confidence=confidence,
         class_probabilities=class_probabilities,
+        operating_threshold=model.metadata.operating_threshold,
         model_version=model.metadata.model_version,
         feature_schema_version=model.metadata.feature_schema_version,
         generated_at=generated_at,

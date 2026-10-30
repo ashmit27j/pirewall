@@ -44,7 +44,7 @@ are regression evidence and are labelled as such.
 | — | Handoff pass: phase 18–20 prompts, `RUNBOOK_PI.md`, `HANDOFF.md`, v2 merged to `main` | Complete (documentation only) | See "Handoff pass (2026-10-29)" below. No code changed. |
 | 18 | Lab harness and data modes | Complete: **v2.1 (engine + harness)** (Implemented/Tested/Mocked) | See "Phase 18 details" below. Suite 2034 passed / 39 skipped as `pw`, netns tier 34/34 as root, env=mock/sandbox only. `pirewall-start --check --data-mode mock` passes without `--pcap`. Benign capture, campaigns #1/#2 and the real G5 run are Environment-dependent. Finding: fast mock replays over-count D1 on benign devices (hand-over to 16/17). Nothing ran on the Pi. |
 | 19 | ML on feature schema 3.0.0, from own pcaps | Complete: **v2.2 (ML)** (Implemented/Tested/Mocked) | See "Phase 19 details" below. Schema 3.0.0, leak-free dataset builder, D2/D3 training with validation operating points, shortcut audit, one-shot evaluator and `engine = "v2"` wiring. Suite 2079 passed / 66 skipped on the Pi; env=mock only for the model numbers. Real `pi-live`/`pi-scripted` quality is Environment-dependent (RUNBOOK_PI H0, H28). |
-| 20 | Evaluation support, docs reconciliation, paper tables | Not started; prompt ready | `docs/v2/prompts/phase-20-eval-docs-paper.md`. Needs everything, plus the human's Pi campaigns. |
+| 20 | Evaluation support, docs reconciliation, paper tables | In progress | `docs/v2/prompts/phase-20-eval-docs-paper.md`. Needs everything, plus the human's Pi campaigns. |
 
 ### Phase 18 details
 
@@ -282,6 +282,95 @@ decisions (engine flip, forward guard to enforce, enforcement mode).
 
 **Phase 20 status.** Not started → in progress (first increment delivered).
 
+
+### Pi bring-up (2026-10-31) — the first time v2 ran on real hardware
+
+**Scope.** RUNBOOK_PI H0-H10 on the real Pi, plus the AP the LAN side needed.
+Env tag of everything below: **`pi-live`**. Nothing here is a sandbox or mock
+number. No attack tool ran against anything, and no campaign was walked.
+
+**Hardware and software actually present** (the docs assumed Raspberry Pi OS
+Bookworm with nft 1.0.6; this host is neither):
+
+| | |
+|---|---|
+| OS | Debian GNU/Linux 13 (trixie) |
+| Kernel | 6.18.39+rpt-rpi-v8, aarch64 |
+| nftables | **v1.1.3** |
+| Python | 3.12.14 (uv-managed), system Python is 3.13.5 |
+| tcpdump | 4.99.5 |
+
+**Network layout as built.** The runbook assumed a USB dongle uplink and the
+onboard radio as the AP. That is what this Pi needs, for a reason worth
+recording: `phy0` (the TP-Link `rtl8xxxu` dongle) advertises only `managed`
+and `monitor` — it **cannot** be an access point. `phy1` (onboard
+`brcmfmac`) advertises `AP`. So the config's `wan_interface = "wlan1"` /
+`lan_interface = "wlan0"` is the only workable assignment on this hardware.
+
+| Interface | Role | Address |
+|---|---|---|
+| `wlan1` (`rtl8xxxu`) | WAN, client of a phone hotspot | DHCP, default route |
+| `wlan0` (`brcmfmac`) | **LAN, AP** (NetworkManager shared mode, WPA2-CCMP, 2.4 GHz) | `192.168.100.1/24`, DHCP pool `.50-.200` |
+| `eth0` | Admin PC, out-of-band management | `192.168.101.1/24` |
+
+| Deliverable | Label | Evidence |
+|---|---|---|
+| Every rendered nft template parses on this Pi's nft | **Tested (pi-live)** | `nft -c -f` on all 8 files in `deploy/rendered/` under nft 1.1.3: all OK. Closes KNOWN_ISSUES V3, which was sandbox-only (1.0.2/1.0.9) |
+| `pirewall-start --check --data-mode live` | **Tested (pi-live)** | passes; warns only about the native engine, `python3-nftables` and chrony, all absent for want of an uplink |
+| v2 kernel tables loaded | **Tested (pi-live)** | `pirewall_base`, `pirewall_static`, `arp pirewall_static_arp`, `pirewall_adaptive`, `pirewall_portal` all present |
+| Guard verdicts at their D2 defaults | **Tested (pi-live)** | `guard_verdict_raw` = `drop`, `guard_verdict_input` = `drop`, `guard_verdict_forward` = counter only (observe) |
+| Adaptive sets present and empty | **Tested (pi-live)** | `block_mac`, `block4`, `ratelimit_mac`, `ratelimit4`, `rl_meter`, `rl4_meter`, `allow_bound`; `infra4` holds the gateway and the Pi's LAN IP |
+| `pirewall-core`, `-api`, `-portal` running under systemd | **Tested (pi-live)** | all three `active`; core reports `enforcement=shadow failure=fail_open models=loaded` |
+| Control panel over TLS from the Admin PC | **Tested (pi-live)** | `GET /api/v1/health` -> `{"message":"ok"}` over TLS 1.3 from `192.168.101.2`; certificate SANs cover both `192.168.100.1` and `192.168.101.1` |
+| Portal sign-in page | **Tested (pi-live)** | responds 200 on `http://192.168.100.1:8080/portal` |
+| Deployment manifest | **Tested (pi-live)** | `/var/lib/pirewall/manifest.json` written with `"env": "pi-live"` — the project's first genuine `pi-*` artifact |
+| Demo portal accounts removed | **Tested (pi-live)** | `portal_users remove-demo`; the store is now empty. Closes KNOWN_ISSUES #4 on this deployment |
+| Benign capture running | **Implemented (pi-live)** | transient unit `pirewall-benign-capture`, session `/var/lib/pirewall-lab/benign/20261030T202007Z`. **No data yet**: see the finding below |
+
+**Three defects found by running the code, each fixed.**
+
+1. **`ProtectHome=true` is incompatible with a uv-managed interpreter
+   (new, High for any fresh deployment).** `.venv/bin/python` was a symlink
+   into `/home/raspberrypi/.local/share/uv/python/...`. `pirewall-core.service`
+   sets `ProtectHome=true`, so systemd could not see the target and the unit
+   died with `status=203/EXEC` and the misleading message "Unable to locate
+   executable". Fixed by copying the interpreter to `/opt/pirewall-python`
+   and repointing `.venv/bin/python` and `pyvenv.cfg`; the hardening is
+   unchanged. A venv built against a *system* Python would not have hit this,
+   which is why no sandbox run did.
+2. **`make_certs.sh` leaves the key unreadable by `pirewall-api`.** It writes
+   `root:root 0600`; the unit runs as `pirewall-api`, which then refuses to
+   start ("not readable by this user"). Set to `root:pirewall-api 0640`.
+3. **The lease file under NetworkManager is unreachable without help.** NM's
+   shared mode writes `/var/lib/NetworkManager/dnsmasq-<lan>.leases`, inside a
+   `0700 root:root` directory. Preflight *detected* the path correctly (phase
+   14b's work) but `pirewall-core` could not read it. Granted with ACLs
+   (`setfacl` on the directory plus a default ACL for new files) rather than
+   loosening the directory mode, which would also have exposed NM's
+   `secret_key`.
+
+**Findings, not defects.**
+
+* **`enforcement_mode` was `assisted` in the deployed config.** Set to
+  `shadow` for the first soak, per ADDENDUM A1 and RUNBOOK step 20. The
+  previous file is kept at `config/local_config.toml.pre-shadow.bak`.
+* **NetworkManager already masquerades the LAN** (`table ip nm-shared-wlan0`),
+  so `pirewall-start` correctly declined to load `nat-masquerade.nft`. Worth
+  documenting: the shared-mode AP path makes that template redundant.
+
+**Not done, and why.**
+
+| Item | Blocker |
+|---|---|
+| `python3-nftables` (faster set transport), chrony, the native Rust engine | The phone hotspot providing the uplink went down mid-session and stayed down; `apt` cannot reach the archive. Capture is on the **Python path**, which drops packets under load |
+| `ether saddr` on `brcmfmac` (KNOWN_ISSUES V2, High) | Needs a LAN client. **No device has joined the AP**, so the test cannot run |
+| D1 threshold fitting, phase-19 ML on own data | Need >= 12 h of benign capture. The capture is running but has recorded **0 bytes** — no clients |
+| Panic/restore drill, crash-safety (G6), lab victim, campaigns | Deliberately left until the LAN has clients and the uplink is stable |
+
+**Honest summary.** The v2 control and data planes are proven to load, start
+and serve on real Raspberry Pi hardware under nft 1.1.3 — KNOWN_ISSUES V1 is
+no longer "nothing has run on the Pi". Everything that needs *traffic*
+remains Environment-dependent.
 
 ### Phase 11 details
 

@@ -8,6 +8,8 @@ import pytest
 from lab.manifest import Json
 from lab.paper import make_tables
 from lab.paper.make_tables import (
+    NOT_YET_RUN,
+    TABLE_TITLES,
     WATERMARK_FORMAT,
     ReportError,
     build_tables,
@@ -130,14 +132,26 @@ def test_table_v_entries_cover_each_model_and_operating_fpr() -> None:
     assert [str(entry["model"]) for entry in entries] == ["D2", "D2", "D2", "D3", "D3", "D3"]
 
 
-def test_build_tables_renders_table_v_with_the_phase19_source() -> None:
+def test_build_tables_renders_every_paper_table_in_order() -> None:
+    """Tables I-VII (critique_ml.md §10), each with its source and env tag."""
     tables = build_tables(_metrics(ENV_TAG), {"env_tag": ENV_TAG})
-    assert len(tables) == 1
-    assert tables[0].number == "V"
-    assert tables[0].title == "ML"
-    assert tables[0].source
-    assert tables[0].env_tag == ENV_TAG
-    assert tables[0].watermark is None
+    assert [table.number for table in tables] == ["I", "II", "III", "IV", "V", "VI", "VII"]
+    assert all(table.source for table in tables)
+    assert all(table.env_tag == ENV_TAG for table in tables)
+    assert all(table.watermark is None for table in tables)
+    table_v = next(table for table in tables if table.number == "V")
+    assert table_v.title == "ML"
+
+
+def test_tables_without_their_campaign_say_so_rather_than_showing_a_zero() -> None:
+    """An input that has not been produced yet gives `not yet run`, never a number."""
+    tables = {table.number: table for table in build_tables(_metrics(ENV_TAG), {"env_tag": ENV_TAG})}
+    ablation_arms = tables["VI"].entries
+    assert [str(entry["arm"]) for entry in ablation_arms] == ["kernel only", "+D1", "+D2", "+D3"]
+    assert all(entry["attacks_detected"] == NOT_YET_RUN for entry in ablation_arms)
+    assert tables["IV"].entries[0]["action"] == NOT_YET_RUN
+    assert tables["VII"].entries[0]["pps"] == NOT_YET_RUN
+    assert tables["II"].entries[0]["detector"] == NOT_YET_RUN
 
 
 def test_make_tables_refuses_a_mock_report_without_regression(tmp_path: Path) -> None:
@@ -159,13 +173,14 @@ def test_make_tables_writes_a_regression_watermarked_table(tmp_path: Path) -> No
     assert document["regression"] is True
     assert document["watermark"] == WATERMARK_FORMAT.format(env_tag=ENV_TAG)
     tables = document["tables"]
-    assert isinstance(tables, list) and len(tables) == 1
-    first = tables[0]
-    assert isinstance(first, dict)
-    assert first["number"] == "V"
-    assert first["watermark"] == WATERMARK_FORMAT.format(env_tag=ENV_TAG)
-    entries = first["entries"]
-    assert isinstance(entries, list) and len(entries) > 0
+    assert isinstance(tables, list) and len(tables) == len(TABLE_TITLES)
+    assert [table["number"] for table in tables if isinstance(table, dict)] == list(TABLE_TITLES)
+    for table in tables:
+        assert isinstance(table, dict)
+        # The watermark is on *every* table, not just the first (phase-20 prompt).
+        assert table["watermark"] == WATERMARK_FORMAT.format(env_tag=ENV_TAG)
+        entries = table["entries"]
+        assert isinstance(entries, list) and len(entries) > 0
     assert (out / "paper_tables.csv").is_file()
 
 

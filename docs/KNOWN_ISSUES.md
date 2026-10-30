@@ -25,7 +25,7 @@ Items 1, 2, V6 and V15 updated 2026-10-30 (v2 phase 19).
 | 1 | ML models misclassify ordinary browsing as attacks | High | Observed; actions capped at MONITOR (2026-10-28); retrain Environment-dependent |
 | 2 | Isolation Forest flags benign traffic as anomalous | High | Observed; cannot change an action under the cap (2026-10-28); threshold Environment-dependent |
 | 3 | Behaviour thresholds still tuned for a quiet network | Medium | Partly fixed (2026-10-15) |
-| 4 | Demo portal accounts are live on this deployment | High | Tooling fixed (2026-10-28); removal on the Pi is the operator's step |
+| 4 | Demo portal accounts are live on this deployment | High | **Fixed 2026-10-31**: removed on the Pi; the store is empty. Core refuses ASSISTED/ACTIVE while they exist, which is how this was caught |
 | 5 | Enforcement is `assisted` without the recommended SHADOW soak | Medium | Fixed |
 | 6 | Wazuh and Netdata integrations never verified end to end | Medium | Fixed |
 | 7 | Portal serves plaintext HTTP | Medium | Deferred |
@@ -45,6 +45,9 @@ Items 1, 2, V6 and V15 updated 2026-10-30 (v2 phase 19).
 | 21 | A flood evicts the bounded history buffers within seconds | Medium | Fixed for single-source floods (2026-10-28); spoofed-source floods still evict |
 | 22 | Restart button can't be built as `sudo` + sudoers under `NoNewPrivileges` | Low | Blocked |
 | 23 | Identity keyed on source IP; blocking weaponisable by spoofing (audit #12, #16) | High | Fixed in code (2026-10-28); kernel half live with phase 16; Pi `ether saddr` Environment-dependent |
+| 24 | `ProtectHome=true` kills a venv whose interpreter lives under `/home` | High | **Fixed on this deployment 2026-10-31**; the packaging question is open |
+| 25 | `make_certs.sh` writes a key `pirewall-api` cannot read | Medium | **Fixed on this deployment 2026-10-31**; the script still needs changing |
+| 26 | NetworkManager's lease file is unreadable without an ACL | Medium | **Fixed on this deployment 2026-10-31** via `setfacl`; not yet automated |
 
 ---
 
@@ -56,15 +59,15 @@ phase that closes each one.
 
 | # | Item | Severity | Status | Where it's handled |
 |---|---|---|---|---|
-| V1 | No v2 code has run on the Pi. Every kernel, systemd, libnftables and native-ring claim is sandbox/mock evidence only. | High | Environment-dependent | RUNBOOK_PI H1–H22 |
+| V1 | ~~No v2 code has run on the Pi.~~ **Partly closed 2026-10-31**: the tables load, the three services run and the panel/portal serve, on Debian 13 / nft 1.1.3 (`pi-live`; PROGRESS "Pi bring-up"). Everything needing *traffic* — offenders, bindings, detection, campaigns — is still unproven. | High → Medium | Partly closed; traffic half Environment-dependent | RUNBOOK_PI H10 done; H18–H41 open |
 | V2 | `ether saddr` on brcmfmac `wlan0` is unverified. If it does not carry the station MAC, MAC identity, anti-spoof and per-MAC sets do not work on this hardware. | High | Environment-dependent | RUNBOOK_PI step 8 |
-| V3 | The templates have passed `nft -c` on nft 1.0.2 and 1.0.9 (sandbox) but not on the Pi's nft (expected 1.0.6). | High | Environment-dependent | RUNBOOK_PI step 7 |
+| V3 | ~~Templates unverified on the Pi's nft.~~ **Closed 2026-10-31**: all 8 rendered templates pass `nft -c` on this Pi's **nft 1.1.3** (`pi-live`). Note the host is Debian 13 trixie, not the Bookworm/1.0.6 the docs assumed. | High | **Closed** | RUNBOOK_PI step 7 |
 | V4 | Raw guard enforcing with an incomplete binding seed could drop a legitimate device, or the Admin PC if its MAC is wrong in config. Mitigated: raw stays in observe if seeding fails, and the admin rule pins interface + MAC + IP. Still unproven on hardware. | High | Reasoned; mitigated in code | RUNBOOK_PI steps 12–14 (second SSH session open) |
 | V5 | D1 thresholds are the shipped floors (`frozen = false`). `engine = "v2"` refuses ASSISTED/ACTIVE without a valid file; SHADOW warns. | Medium | By design until fitted | RUNBOOK_PI H20, H35 |
 | V6 | v1 D3 is the CICIDS model (#1, #2); under `engine = "v2"` phase-19 3.0.0 D2 and D3 are wired as MONITOR/corroboration evidence. The current phase-19 artifacts are trained on mock pcaps only, so they do not replace v1 quality. | Medium | Wired; capped at MONITOR; artifacts mock-only | RUNBOOK_PI H0/H28, then re-run phase-19 training + audit + evaluation |
 | V7 | Forward guard stays in observe until the offline G5 check passes on `pi-live` data. Forward-path floods are only observed until then. | Medium | By design (D2) | Phase 18 `lab/benign_fp.py`, RUNBOOK_PI step 24 |
 | V8 | No lab harness: no benign-capture tooling, scripted profiles, mock pcaps, campaign runner or aggregation. `--data-mode mock` needs `--pcap`; scripted mode points at a script that doesn't exist yet. | Medium | Not started | Phase 18 |
-| V9 | Native Pi benchmark (`benchmarks/v2-native-pi/`) is written but has never run. The native ring's live fallback is tested only with a fake. | Medium | Environment-dependent | RUNBOOK_PI step 10 |
+| V9 | Native Pi benchmark (`benchmarks/v2-native-pi/`) is written but has never run. The native ring's live fallback is tested only with a fake. **2026-10-31: `pirewall_native` is not installed on the Pi at all** (no Rust toolchain, and the uplink was down), so live capture runs the Python path, which drops packets under load. | Medium | Environment-dependent | RUNBOOK_PI step 10 |
 | V10 | Wazuh decoder and `pirewall.v2.*` Netdata gauges were never seen in a real Wazuh/Netdata. | Medium | Environment-dependent | RUNBOOK_PI after H22 |
 | V11 | Crash-loop alert and `ReadOnlyPaths` lease access are systemd behaviour, tested only statically. | Medium | Environment-dependent | RUNBOOK_PI step 17 |
 | V12 | Default `pipeline.engine` is `"v1"`. Flipping it changes what the Pi runs on its next start. | Decision | Human's call | Phase 20 presents the evidence |
@@ -1161,3 +1164,83 @@ Recorded because they look like problems and are not:
   on the LAN side — v1 is IPv4-only for the adaptive pipeline (ADDENDUM.md
   A5), so a client with IPv6 connectivity would be unanalysed and ungated.
   Check this before enabling IPv6 on the AP.
+
+---
+
+## 24. `ProtectHome=true` kills a venv whose interpreter lives under `/home`
+
+**Status: fixed on this deployment (2026-10-31); the packaging question is open.**
+
+`uv venv` symlinks `.venv/bin/python` at the uv-managed interpreter, which
+lives under `~/.local/share/uv/python/...`. `pirewall-core.service` sets
+`ProtectHome=true`, so for the service `/home` is empty and the symlink
+dangles. systemd reports:
+
+```
+pirewall-core.service: Unable to locate executable '/opt/pirewall/.venv/bin/python': No such file or directory
+pirewall-core.service: Failed at step EXEC spawning ...: No such file or directory
+status=203/EXEC
+```
+
+The message names the venv path, not the symlink target, so it reads like a
+missing venv. No sandbox run reproduced it: a venv built on a *system*
+Python has no `/home` component.
+
+**Fixed here** by copying the interpreter to `/opt/pirewall-python` and
+repointing `.venv/bin/python` and `pyvenv.cfg` at it. The hardening is
+untouched — relaxing `ProtectHome` would have been the wrong trade.
+
+**Still open:** `docs/SETUP.md` should either require a system-Python venv on
+the Pi or document the relocation, and preflight could detect an `ExecStart`
+interpreter that resolves under `/home`.
+
+---
+
+## 25. `make_certs.sh` writes a key `pirewall-api` cannot read
+
+**Status: fixed on this deployment (2026-10-31); the script is unchanged.**
+
+The script writes `pirewall.key` as `root:root 0600`. `pirewall-api.service`
+runs as `User=pirewall-api`, which then refuses to start:
+
+```
+pirewall-api cannot start:
+  - api.tls_key_path points at deploy/certificates/pirewall.key, which is not readable by this user
+```
+
+Set to `root:pirewall-api 0640` here. The script should do this itself, or
+`docs/SETUP.md` should say so immediately after the `make_certs.sh` step.
+
+Note also that `make_certs.sh` refuses to overwrite an existing pair, so a
+first run with one SAN has to be deleted deliberately before re-running with
+both the LAN and admin addresses — easy to get wrong, worth a line in SETUP.
+
+---
+
+## 26. NetworkManager's lease file is unreadable without an ACL
+
+**Status: fixed on this deployment (2026-10-31); not automated.**
+
+With the LAN AP on NetworkManager shared mode, DHCP leases land in
+`/var/lib/NetworkManager/dnsmasq-<lan>.leases`, inside a `0700 root:root`
+directory. Preflight finds the path correctly, then fails honestly:
+
+```
+pirewall-core cannot read /var/lib/NetworkManager/dnsmasq-wlan0.leases
+```
+
+Without it there are no IP↔MAC bindings, so MAC identity, anti-spoof and
+portal sign-in have nothing to work from.
+
+**Fixed here** with ACLs — a traverse bit on the directory, a read ACL on the
+file, and a *default* ACL so the ACL survives dnsmasq rewriting the file:
+
+```sh
+sudo setfacl -m u:pirewall-core:--x /var/lib/NetworkManager
+sudo setfacl -d -m u:pirewall-core:r-- /var/lib/NetworkManager
+sudo setfacl -m u:pirewall-core:r-- /var/lib/NetworkManager/dnsmasq-wlan0.leases
+```
+
+`chmod o+rx` on the directory would also work and is worse: it exposes NM's
+`secret_key` and saved connection state. This belongs in `install` tooling
+or SETUP.md, not in a human's memory.

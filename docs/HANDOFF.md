@@ -1,6 +1,6 @@
 # HANDOFF — start here if you are new to pirewall (human or model)
 
-Last updated **2026-10-29**, after phase 17. This file is the shortest path
+Last updated **2026-10-31**, after the first Pi bring-up. This file is the shortest path
 from zero to productive. It does not replace the rulebooks; it tells you
 which ones to read, in what order, and where everything lives.
 
@@ -12,12 +12,12 @@ which ones to read, in what order, and where everything lives.
 |---|---|
 | Branch | `main` (v2 work merged in, fast-forward from the `v2` branch, 2026-10-29). Work on `main` from here on. |
 | v1 (phases 1–10) | Complete. Ran on the real Pi (portal verified there). |
-| v2 (phases 11–17) | Complete in code: kernel guards + adaptive sets + MAC identity + hardened native engine + `pirewall-start` v2 + D1/K detectors + policy engine. **Nothing from v2 has run on the Pi yet.** All of it is sandbox/mock-tested only. |
+| v2 (phases 11–19) | Complete in code. **v2 now runs on the Pi** (2026-10-31): tables load, the three services run, panel and portal serve, manifest tagged `pi-live`. Anything needing *traffic* is still unproven — see PROGRESS "Pi bring-up (2026-10-31)". |
 | Default engine | `pipeline.engine = "v1"` (the human decides when to flip to `"v2"`). |
-| Next build phases | 18 (lab harness) → 19 (ML on schema 3.0.0) → 20 (evaluation, docs, paper tables). Prompts: `docs/v2/prompts/phase-18-*.md`, `phase-19-*.md`, `phase-20-*.md`. 18 can start now; 19 needs 18; 20 needs everything. |
-| Next human steps | `docs/v2/RUNBOOK_PI.md`, stages H0 → H22 can run now. A model helping on the Pi uses `docs/v2/prompts/pi-session.md`. |
+| Next build phases | 18 and 19 complete. **20 in progress**: Tables I–VII and the docs-consistency test exist; the docs pass and the real numbers need the Pi campaigns. |
+| Next human steps | H0–H10 are **done**. Next: get LAN clients onto the AP, let the benign capture mature ≥ 12 h, then H18 (smoke checks) → H20 (fit thresholds) → H24+ (campaigns). |
 | Open risks | `docs/KNOWN_ISSUES.md` → "v2 open items". |
-| Test baseline | 1914 passed / 39 skipped as `pw` in WSL, netns 34/34 as root (phase 17, env=sandbox). |
+| Test baseline | **2080 passed / 83 skipped on the Pi itself** (2026-10-31, Python 3.12.14). `ruff` clean. `pyright` and the netns tier cannot run on this host (no Node; no `hping3`/`conntrack`/`python3-nftables`). |
 
 ## 2. How to resume (a new session, any model)
 
@@ -47,10 +47,13 @@ then the critiques in `docs/v2/critique_*.md`.
 
 ## 3. Running the gates
 
-The dev host is Windows. Windows Python has no `AF_UNIX`/`fcntl`, so a
-Windows-only `pytest` silently skips the socket/daemon tests: **never treat a
-Windows run as a full verification.** Use WSL (Ubuntu, repo at
-`/mnt/d/CodingProjects_D/pirewall`):
+Two host shapes have been used. The original dev host was Windows + WSL
+(Windows Python has no `AF_UNIX`/`fcntl`, so a Windows-only `pytest` silently
+skips the socket/daemon tests: **never treat a Windows run as a full
+verification**). Since 2026-10-31 the gates also run **directly on the Pi**
+(`/opt/pirewall`, `.venv/bin/python`), which is a real POSIX host and does not
+skip those tests — but has no Node, so `pyright` cannot run there, and lacks
+`hping3`/`conntrack`/`python3-nftables`, so the netns tier skips.
 
 | Gate | Where | Command |
 |---|---|---|

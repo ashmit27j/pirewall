@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# pirewall-boot — arm the data plane and bring the services up, in one command.
+#
+# The everyday counterpart to `pirewall-start`, which it calls. It exists
+# because of docs/KNOWN_ISSUES.md #28: the three services are `enabled`, so a
+# power-on starts them, but nothing loaded the kernel tables — core ran
+# against an empty ruleset while the control panel reported perfect health.
+#
+# Run it by hand after a reboot (docs/v2/RESUME_PI.md §2), or let
+# deploy/systemd/pirewall-boot.service run it at boot. Idempotent: running it
+# on an already-armed Pi re-renders, reloads and reports, which is what you
+# want when you have just changed the config.
+#
+# It deliberately does NOT: modify network configuration (spec §21), install
+# packages, or change the enforcement mode. It reports what it finds and
+# refuses rather than improvising.
+set -uo pipefail
+
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT" || exit 1
+
+ENGINE=""
+DATA_MODE="live"
+WAIT_SECONDS=0
+CHECK_ONLY=0
+MANIFEST=""
+
+C_BOLD=""; C_RESET=""; C_RED=""; C_GREEN=""; C_YELLOW=""
+if [[ -t 1 ]]; then
+  C_BOLD=$'\033[1m'; C_RESET=$'\033[0m'
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+fi
+ok()    { printf '    %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn()  { printf '    %s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+fail()  { printf '    %s✗%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+step()  { printf '\n%s==> %s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
+
+usage() {
+  cat <<'USAGE'
+usage: pirewall-boot [options]
+
+Arms the kernel data plane and starts pirewall-core/-api/-portal.
+
+  --engine {v1,v2}         override pipeline.engine for this run
+  --data-mode {live,mock}  passed to pirewall-start (default: live)
+  --wait-for-network SECS  wait up to SECS for the LAN address and a default
+                           route before arming (default: 0, i.e. do not wait)
+  --manifest PATH          write the deployment manifest here as well
+  --check                  preflight and report only; load nothing
+  -h, --help               this text
+
+Exit: 0 armed (or check passed), 1 a step failed, 2 preflight refused.
+USAGE
+}
+
+while (( $# )); do
+  case "$1" in
+    --engine)           ENGINE="${2:-}"; shift 2 ;;
+    --data-mode)        DATA_MODE="${2:-}"; shift 2 ;;
+    --wait-for-network) WAIT_SECONDS="${2:-0}"; shift 2 ;;
+    --manifest)         MANIFEST="${2:-}"; shift 2 ;;
+    --check)            CHECK_ONLY=1; shift ;;
+    -h|--help)          usage; exit 0 ;;
+    *) printf 'pirewall-boot: unknown option %s\n\n' "$1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+if [[ $EUID -ne 0 ]]; then
+  fail "must run as root (it loads nftables tables and restarts units)"
+  printf '  sudo %s %s\n' "$0" "$*" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------- network
+
+config_value() {
+  # One value out of the config, through the real loader so a malformed file
+  # fails here with a real message rather than halfway through arming.
+  # A fixed lookup table rather than an expression: nothing from outside this
+  # script may name an attribute to read (spec §20).
+  local name="$1"
+  ./.venv/bin/python - "$name" <<'PY' 2>/dev/null
+import sys
+
+from pirewall.config.loader import load_config
+
+config = load_config("config/local_config.toml")
+values = {
+    "lan_interface": config.network.lan_interface,
+    "enforcement_mode": config.firewall.enforcement_mode.value,
+}
+value = values.get(sys.argv[1])
+if value is not None:
+    print(value)
+PY
+}
+
+wait_for_network() {
+  local deadline=$(( SECONDS + WAIT_SECONDS ))
+  local lan; lan="$(config_value lan_interface)"
+  if [[ -z "$lan" ]]; then
+    fail "could not read network.lan_interface from config/local_config.toml"
+    return 1
+  fi
+
+  # Wi-Fi comes up well after network-online.target on a cold boot: the LAN
+  # address and the default route are what preflight actually checks, so
+  # those are what we wait for, not a target that has already fired.
+  while :; do
+    local have_lan=0 have_route=0
+    ip -4 addr show dev "$lan" 2>/dev/null | grep -q 'inet ' && have_lan=1
+    [[ -n "$(ip -4 route show default 2>/dev/null)" ]] && have_route=1
+    if (( have_lan && have_route )); then
+      ok "LAN address on ${lan} and a default route present"
+      return 0
+    fi
+    if (( SECONDS >= deadline )); then
+      (( have_lan ))   || warn "${lan} still has no IPv4 address after ${WAIT_SECONDS}s"
+      (( have_route )) || warn "no IPv4 default route after ${WAIT_SECONDS}s (uplink down?)"
+      # Not fatal. The LAN side can be armed without an uplink, and
+      # pirewall-start reports the gateway mismatch itself.
+      return 0
+    fi
+    sleep 2
+  done
+}
+
+# ------------------------------------------------------------------- arm
+
+step "pirewall-boot"
+printf '    repo        %s\n' "$REPO_ROOT"
+printf '    data mode   %s%s\n' "$DATA_MODE" "${ENGINE:+   engine ${ENGINE}}"
+
+if [[ ! -x ./.venv/bin/python ]]; then
+  fail "no virtualenv at ${REPO_ROOT}/.venv — run: uv sync"
+  exit 1
+fi
+
+if (( WAIT_SECONDS > 0 )); then
+  step "Waiting for the network (up to ${WAIT_SECONDS}s)"
+  wait_for_network || exit 1
+fi
+
+START_ARGS=(--data-mode "$DATA_MODE")
+[[ -n "$ENGINE"   ]] && START_ARGS+=(--engine "$ENGINE")
+[[ -n "$MANIFEST" ]] && START_ARGS+=(--manifest "$MANIFEST")
+
+step "Preflight"
+if ! ./scripts/deployment/pirewall-start --check "${START_ARGS[@]}"; then
+  status=$?
+  fail "preflight refused (exit ${status}) — nothing was changed"
+  exit 2
+fi
+
+if (( CHECK_ONLY )); then
+  printf '\n%spreflight passed; --check, so nothing was loaded.%s\n' "$C_BOLD" "$C_RESET"
+  exit 0
+fi
+
+step "Arming"
+if ! ./scripts/deployment/pirewall-start "${START_ARGS[@]}"; then
+  status=$?
+  fail "pirewall-start failed (exit ${status})"
+  printf '  Roll back with:  sudo %s/scripts/deployment/pirewall-start --panic\n' "$REPO_ROOT" >&2
+  exit 1
+fi
+
+# --------------------------------------------------------------- verify
+
+step "Verify"
+rc=0
+
+# The check that would have caught #28: tables present, not just services up.
+missing=()
+for table in pirewall_base pirewall_static pirewall_adaptive; do
+  nft list table inet "$table" >/dev/null 2>&1 || missing+=("inet ${table}")
+done
+nft list table arp pirewall_static_arp >/dev/null 2>&1 || missing+=("arp pirewall_static_arp")
+if (( ${#missing[@]} )); then
+  fail "kernel tables missing: ${missing[*]}"
+  fail "  core would be running against an empty ruleset (KNOWN_ISSUES #28)"
+  rc=1
+else
+  ok "kernel tables loaded"
+fi
+
+for unit in pirewall-core pirewall-api; do
+  if [[ "$(systemctl is-active "$unit")" == "active" ]]; then
+    ok "${unit} active"
+  else
+    fail "${unit} is $(systemctl is-active "$unit")"
+    rc=1
+  fi
+done
+if systemctl list-unit-files pirewall-portal.service >/dev/null 2>&1; then
+  state="$(systemctl is-active pirewall-portal 2>/dev/null || true)"
+  [[ "$state" == "active" ]] && ok "pirewall-portal active" || warn "pirewall-portal is ${state:-absent}"
+fi
+
+enforcement="$(config_value enforcement_mode)"
+[[ -n "$enforcement" ]] && printf '    enforcement %s\n' "$enforcement"
+
+if (( rc == 0 )); then
+  printf '\n%spirewall is armed.%s\n' "$C_BOLD" "$C_RESET"
+else
+  printf '\n%spirewall came up with problems — see above.%s\n' "$C_BOLD" "$C_RESET" >&2
+fi
+exit "$rc"

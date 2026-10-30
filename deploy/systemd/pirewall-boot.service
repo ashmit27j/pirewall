@@ -1,0 +1,49 @@
+[Unit]
+Description=pirewall-boot — arm the kernel data plane and start the three services
+# Closes docs/KNOWN_ISSUES.md #28. pirewall-core/-api/-portal are `enabled`,
+# so a power-on starts all three — but nothing loaded the kernel tables, so
+# core came up against an empty ruleset: no guards, no adaptive sets, no
+# portal table, and a control panel that looked perfectly healthy. A
+# deployment that enforces nothing while reporting fine is worse than one
+# that fails loudly.
+#
+# This unit runs scripts/deployment/pirewall-boot, which is the same thing a
+# human runs by hand (RESUME_PI.md §2). It is a one-shot: `pirewall-start`
+# restarts the three services itself, so this unit must NOT also be
+# Wants=/After= them, or systemd would race its own restarts.
+Documentation=file:///opt/pirewall/docs/v2/RESUME_PI.md
+
+# The uplink matters: preflight compares network.upstream_gateway against
+# the live default route, and the LAN interface must have its address before
+# the templates render. network-online.target is necessary but not
+# sufficient on Wi-Fi, so the script waits for the interfaces itself.
+After=network-online.target NetworkManager-wait-online.service
+Wants=network-online.target
+
+# One attempt per boot. A failure here leaves the previous ruleset in place
+# (pirewall-start is transactional and keeps a rollback), and the journal
+# carries the refusal with its fix. Retrying blindly against a network that
+# is not ready just buries the real error.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/pirewall
+
+# Full privileges, deliberately: this loads nftables tables and restarts
+# units. It is the one step that cannot run unprivileged, which is exactly
+# why it is a short, auditable script and not part of pirewall-core.
+ExecStart=/opt/pirewall/scripts/deployment/pirewall-boot --wait-for-network 90
+
+# Generous: template rendering, five nft table loads and three service
+# starts with their readiness waits. Shorter than this and a cold boot on a
+# Pi 4 can be killed mid-transaction.
+TimeoutStartSec=420
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pirewall-boot
+
+[Install]
+WantedBy=multi-user.target

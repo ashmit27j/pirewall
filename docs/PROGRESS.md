@@ -257,6 +257,32 @@ with `pi-*` tags, and only then copying models to the Pi. Until that
 happens, the v1 CICIDS model remains the deployed quality baseline and the
 ML ceiling stays on.
 
+### Phase 20 details — in progress (2026-10-31)
+
+**Scope.** `docs/v2/prompts/phase-20-eval-docs-paper.md`: evaluation support,
+paper tables and figures, docs reconciliation, paper-ready outputs.
+
+**Increment delivered (this session).** First deliverable increment, env=mock
+only; no Pi runs, no campaign steps walked for real.
+
+| Deliverable | Label | Evidence |
+|---|---|---|
+| `lab/paper/make_tables.py` | Tested (env=mock) | `tests/unit/test_phase20_paper.py`: refuses a non-`pi-*` report without `--regression` (exit 2), refuses an aggregate/report env-tag mismatch (D7), `--regression` watermarks every emitted table, output is a pure function (hash-stable). Renders Table V from the phase-19 report + aggregate. |
+| `lab/paper/make_figures.py` | Tested (env=mock) | `tests/unit/test_phase20_figures.py`: same refusal/watermark/purity contract for the figure data (Figs 3-5 from the phase-19 report). |
+
+**Gates.** `ruff check .` clean; targeted pytest green (phase-20 paper suites
+plus the phase-18/19 lab, ML and v2 suites: 86 passed). `pyright --strict` not
+runnable in this environment (no Node; the same environmental limit phase 19
+recorded for the Pi).
+
+**Not done here (phase 20).** Tables I-VII beyond V, Figs 1-2, the v1-vs-v2
+(G8) columns and the kernel-only → +D1 → +D2 → +D3 ablation inputs, manifest-hash
+footnotes from real run manifests, the docs reconciliation pass, the human
+decisions (engine flip, forward guard to enforce, enforcement mode).
+
+**Phase 20 status.** Not started → in progress (first increment delivered).
+
+
 ### Phase 11 details
 
 **Scope.** Contracts, documents, typed stubs and additive config only. No

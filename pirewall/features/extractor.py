@@ -4,38 +4,61 @@ The one canonical feature-extraction layer — Phase 4's dataset adapters and
 Phase 5's runtime inference both call `extract_features`, never
 reimplementing this math (CLAUDE.md "one canonical feature-extraction
 module").
+
+**Versioned projection.** The primitive math below is computed once per
+flow. `extract_features(flow, schema_version=...)` then projects that one
+value map through the requested schema's frozen column list. Schema 2.0.0
+therefore keeps producing exactly the vectors it always did (including the
+raw `destination_port`), while 3.0.0 gets the coarse
+`destination_port_category` instead. No second extractor exists.
 """
 
 from pirewall.core.enums import Protocol
 from pirewall.core.exceptions import FeatureExtractionError
 from pirewall.core.models.feature_vector import FeatureVector
 from pirewall.core.models.flow import Flow
-from pirewall.features.schema import FEATURE_NAMES, SCHEMA_VERSION
+from pirewall.features.schema import (
+    SCHEMA_VERSION,
+    feature_names,
+    port_category,
+)
 
 
-def extract_features(flow: Flow) -> FeatureVector:
-    """Deterministically compute the canonical `FeatureVector` for `flow`.
+def extract_features(flow: Flow, schema_version: str = SCHEMA_VERSION) -> FeatureVector:
+    """Deterministically compute the `FeatureVector` for `flow` under `schema_version`.
 
     Pure function of `flow`'s own fields — no wall-clock or other hidden
     input, so calling this twice on an identical `Flow` always produces an
     identical `FeatureVector` (including `computed_at`, which is derived
     from `flow.last_seen` rather than `datetime.now()`).
+
+    `schema_version` selects a frozen column projection (2.0.0 or 3.0.0);
+    an unknown version is refused rather than silently mapped to the
+    current one.
     """
     try:
-        return _extract_features(flow)
+        return _extract_features(flow, schema_version)
     except FeatureExtractionError:
         raise
     except Exception as exc:
         raise FeatureExtractionError(f"failed to extract features for flow {flow.flow_id}: {exc}") from exc
 
 
-def _extract_features(flow: Flow) -> FeatureVector:
+def _extract_features(flow: Flow, schema_version: str) -> FeatureVector:
+    try:
+        names = feature_names(schema_version)
+    except KeyError as exc:
+        raise FeatureExtractionError(
+            f"unknown feature schema version {schema_version!r}; "
+            "expected one of the frozen versions in pirewall.features.schema"
+        ) from exc
+
     payload = flow.payload_stats
     if payload is None:
         # Never substitute zeros or IP-level sizes: that is exactly the
         # training/runtime mismatch schema 2.0.0 exists to remove.
         raise FeatureExtractionError(
-            f"flow {flow.flow_id} has no payload_stats; schema {SCHEMA_VERSION} requires them"
+            f"flow {flow.flow_id} has no payload_stats; schema {schema_version} requires them"
         )
     duration = flow.duration_seconds
     payload_total = float(payload.total_bytes)
@@ -60,9 +83,12 @@ def _extract_features(flow: Flow) -> FeatureVector:
         "forward_backward_payload_ratio": (
             payload.forward_bytes / payload.backward_bytes if payload.backward_bytes > 0 else 0.0
         ),
+        # Raw port: present only for the frozen 2.0.0 projection.
         "destination_port": (
             float(flow.destination_port) if flow.destination_port is not None else -1.0
         ),
+        # Coarse category: present only for 3.0.0.
+        "destination_port_category": float(port_category(flow.destination_port)),
         "protocol_is_tcp": 1.0 if flow.protocol is Protocol.TCP else 0.0,
         "protocol_is_udp": 1.0 if flow.protocol is Protocol.UDP else 0.0,
         "protocol_is_icmp": 1.0 if flow.protocol is Protocol.ICMP else 0.0,
@@ -71,12 +97,12 @@ def _extract_features(flow: Flow) -> FeatureVector:
         else 0.0,
     }
 
-    values = tuple(values_by_name[name] for name in FEATURE_NAMES)
+    values = tuple(values_by_name[name] for name in names)
 
     return FeatureVector(
         flow_id=flow.flow_id,
-        schema_version=SCHEMA_VERSION,
-        feature_names=FEATURE_NAMES,
+        schema_version=schema_version,
+        feature_names=names,
         values=values,
         computed_at=flow.last_seen,
     )

@@ -53,6 +53,7 @@ from pirewall.engine.decision import EvidenceMaturityTracker, decide
 from pirewall.engine.scoring import score_evidence
 from pirewall.engine.threat import assess_threat
 from pirewall.features.extractor import extract_features
+from pirewall.features.schema import LEGACY_SCHEMA_VERSION
 from pirewall.firewall.generator import MacResolver, generate_candidate_rule
 from pirewall.firewall.manager import FirewallManager
 from pirewall.ipc.state import CoreStateStore
@@ -217,7 +218,10 @@ class FlowPipeline:
             self._state.record_flow(flow)
 
         try:
-            features = extract_features(flow)
+            # `engine = "v1"` is the frozen-schema baseline: its artifacts
+            # were trained on 2.0.0, so it must project that version even
+            # though 3.0.0 is now the default for new models/runtime v2.
+            features = extract_features(flow, schema_version=LEGACY_SCHEMA_VERSION)
         except FeatureExtractionError as exc:
             self._report_failure(flow, now, exc)
             return

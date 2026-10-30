@@ -1,36 +1,80 @@
 # pirewall — Canonical Feature Schema (spec §11, §15)
 
 The single source of truth for feature names, order, units, and semantics
-is `pirewall.features.schema` (`FEATURE_NAMES`, `SCHEMA_VERSION`,
-`FEATURE_DEFINITIONS`). This document is a human-readable rendering of that
-module — if the two ever disagree, the code wins; update this file to match
-it, not the other way around.
+is `pirewall.features.schema` (`SCHEMA_VERSION`, `FEATURE_NAMES`,
+`FEATURE_DEFINITIONS`, and the frozen legacy exports). This document is a
+human-readable rendering of that module — if the two ever disagree, the
+code wins; update this file to match it, not the other way around.
 
-**Current schema version: `2.0.0`** (23 features). Bump `SCHEMA_VERSION`
-whenever feature names, order, count, **or meaning** change — 2.0.0 is the
-proof that meaning matters as much as names: see "Why 2.0.0" below. The
-model loader refuses any artifact trained against a different version, so
-a 1.x model is simply not loaded (detection degrades to behavior-only and
-says so) rather than fed features it was never trained on.
+**Current schema version: `3.0.0`** (23 features). Phase 19 introduced it
+for the v2 models trained from pirewall's own pcaps. Version `2.0.0` is
+frozen and remains computable only so the shipping v1 models keep working
+under `engine = "v1"`.
 
-## Why one canonical schema
+Bump `SCHEMA_VERSION` whenever feature names, order, count, **or meaning**
+change — 2.0.0 is the proof that meaning matters as much as names: see
+"Why 2.0.0" below. The model loader refuses an unknown version, a version
+the caller did not ask for, or an artifact whose ordering disagrees with
+its own declared version, so a mismatched model is simply not loaded
+(detection degrades to behavior-only and says so) rather than fed features
+it was never trained on.
+
+## Why one canonical schema, and how versions coexist
 
 CLAUDE.md: "One canonical feature-extraction module. Training-time and
 runtime inference call the *same* extractor — never reimplement feature
 math twice." Concretely:
 
-- `pirewall.features.extractor.extract_features(flow: Flow) -> FeatureVector`
+- `pirewall.features.extractor.extract_features(flow, schema_version=...)`
   is the only code that computes these values, called both by the dataset
-  adapters (training data) and runtime inference.
-- `pirewall.ml.inference.loader` refuses to load a model artifact whose
-  `ModelMetadata.feature_schema_version`/`feature_ordering` don't exactly
-  match the runtime `SCHEMA_VERSION`/`FEATURE_NAMES`.
+  scripts (training data) and runtime inference.
+- The primitive math is computed once per flow. A **versioned column
+  projection** then selects the ordered names for the requested frozen
+  version. 2.0.0 therefore keeps emitting exactly its old vector (including
+  the raw `destination_port`), while 3.0.0 emits the coarse
+  `destination_port_category` instead. There is no second extractor and no
+  duplicated arithmetic.
+- `pirewall.ml.inference.loader` validates an artifact against the frozen
+  ordering **of its own declared version**, and optionally pins an expected
+  version. `pirewall.ml.inference.common.validate_feature_vector` performs
+  the equivalent per-call check, so a vector from one version can never
+  reach a model trained on another.
 
-**Sharing the extractor is necessary, not sufficient.** The extractor reads
-`Flow` fields; at training time those fields are filled from CICFlowMeter's
-CSV columns, at runtime from pirewall's own packet aggregation. If the two
-fill the same field with different *quantities*, one extractor faithfully
-computes two different features. That is what happened in 1.0.0.
+Supported versions live in `SUPPORTED_SCHEMA_VERSIONS`:
+
+| Version | Status | Used by |
+|---|---|---|
+| `3.0.0` | current | v2 D2/D3 models, new dataset builds |
+| `2.0.0` | frozen legacy | shipping v1 models under `engine = "v1"` |
+
+## Why 3.0.0
+
+3.0.0 changes exactly one thing relative to 2.0.0: the raw integer
+`destination_port` becomes a coarse, documented service category.
+
+Raw ports, IPs, MACs, OUIs, SNI, application names and timestamps are
+identity or shortcut features and must never be model inputs
+(`docs/ADDENDUM_4.md` D3, `docs/v2/critique_ml.md` §3). A model trained on
+raw ports can learn "8080 means Bot" rather than the shape of an attack. The
+category keeps the useful service signal (web vs DNS vs SSH vs mail vs
+other well-known vs ephemeral) while discarding the exact port. The
+shortcut audit reports the model with and without the category; if the
+category is doing suspicious work, that ablation shows it.
+
+### Port-category mapping (total over `int | None`)
+
+| Code | Category | Ports |
+|---:|---|---|
+| 0 | `NONE` | no L4 destination port (e.g. ICMP) |
+| 1 | `WEB` | 80, 443, 8080, 8443 |
+| 2 | `DNS` | 53 |
+| 3 | `SSH` | 22 |
+| 4 | `MAIL` | 25, 110, 143, 465, 587, 993, 995 |
+| 5 | `OTHER_WELL_KNOWN` | any other port in 0..1023 |
+| 6 | `EPHEMERAL` | any port ≥ 1024 not in a named bucket |
+
+The integer is a stable category code, not an ordinal measurement. A tree
+model may split on it; no consumer may treat "web > dns" as a magnitude.
 
 ## Why 2.0.0 (measured on the real CICIDS2017 CSVs, 2026-10-15)
 
@@ -44,10 +88,10 @@ computes two different features. That is what happened in 1.0.0.
 
 So every real flow sat in a region the models had never seen. Tree models
 answer confidently there: the first real client session logged ordinary
-Shopify/Cloudflare/Microsoft traffic as `Bot`/`FTP-Patator` at
-99.99%+ (`docs/KNOWN_ISSUES.md` #1), and Isolation Forest flagged
-essentially all benign traffic as anomalous (#2). The inter-arrival
-features the timestamps distorted carry 47% of the model's gain.
+Shopify/Cloudflare/Microsoft traffic as `Bot`/`FTP-Patator` at 99.99%+
+(`docs/KNOWN_ISSUES.md` #1), and Isolation Forest flagged essentially all
+benign traffic as anomalous (#2). The inter-arrival features the timestamps
+distorted carry 47% of the model's gain.
 
 2.0.0 fixes each row:
 
@@ -79,7 +123,7 @@ Every feature is defined in terms of `pirewall.core.models.Flow`, whose
 `pirewall.flow.aggregator.FlowAggregator` (and the native engine, which
 mirrors it) never route an IPv6 packet into the flow table.
 
-## The 23 features
+## The 23 features (3.0.0)
 
 All values are computed once per completed `Flow`, deterministically (pure
 function of the flow's own fields — no wall-clock or other hidden input).
@@ -105,28 +149,40 @@ function of the flow's own fields — no wall-clock or other hidden input).
 | 16 | `min_inter_arrival_seconds` | duration | seconds | Smallest inter-packet time. |
 | 17 | `max_inter_arrival_seconds` | duration | seconds | Largest inter-packet time. |
 | 18 | `forward_backward_payload_ratio` | ratio | ratio | Forward/backward payload bytes (0 if backward is 0). |
-| 19 | `destination_port` | port | port | Destination port, or `-1` if none (e.g. ICMP). |
+| 19 | `destination_port_category` | category | code | Coarse service bucket; mapping above. |
 | 20 | `protocol_is_tcp` | flag | boolean | `1.0` if the flow's protocol is TCP, else `0.0`. |
 | 21 | `protocol_is_udp` | flag | boolean | `1.0` if the flow's protocol is UDP, else `0.0`. |
 | 22 | `protocol_is_icmp` | flag | boolean | `1.0` if the flow's protocol is ICMP, else `0.0`. |
 | 23 | `protocol_is_other` | flag | boolean | `1.0` if the protocol is none of TCP/UDP/ICMP. |
 
+The frozen 2.0.0 list is identical except that row 19 is
+`destination_port` (raw port, `-1` for none). `LEGACY_FEATURE_NAMES` and
+`LEGACY_FEATURE_DEFINITIONS` expose it; new code must not train on it.
+
 ## Determinism and testing
 
-- `tests/unit/test_feature_schema.py`, `tests/unit/test_feature_extractor.py`:
-  no duplicate names, schema order, determinism, zero-division guards, a
-  flow without `payload_stats` is refused (never zero-filled), and changing
-  only IP-level byte counts moves no feature.
+- `tests/unit/test_feature_schema.py`: pinned name/order/version for both
+  versions, 3.0.0 excludes the raw port and all identity fields, and the
+  port-category mapping is total over every port plus `None`.
+- `tests/unit/test_feature_extractor.py`: no duplicate names, schema order,
+  determinism, zero-division guards, **the exact 2.0.0 vector is pinned
+  unchanged**, an unknown version is refused, a flow without
+  `payload_stats` is refused (never zero-filled), and changing only
+  IP-level byte counts moves no feature.
 - `tests/unit/test_flow_state.py`: payload accumulation and sample std.
 - `tests/ml/test_cicids_adapter.py`: CSV payload columns land in
-  `payload_stats`, pooled std is the exact sample std, padding normalization.
+  `payload_stats`, pooled std is the exact sample std, padding
+  normalization.
 - `tests/unit/test_native_parity.py`: the native engine produces bit-identical
   `Flow`s to the Python aggregator on a mixed 6,700-frame stream — a second
   runtime implementation must not reopen the gap this version closed.
+- `tests/integration/test_pcap_to_flows_parity.py`: rows written by
+  `scripts/dataset/pcap_to_flows.py --schema 3.0.0` equal the live
+  `extract_features(..., schema_version="3.0.0")` vector exactly.
 
 ## Dataset-adapter caveats
 
-- **CICIDS2017** (the dataset the shipped models train on): per-direction
+- **CICIDS2017** (the dataset the shipped v1 models train on): per-direction
   payload mean/std are pooled into one overall sample mean/std
   (`pirewall.ml.preprocessing.common.combine_weighted_sample_stats`). The
   published "MachineLearningCVE" release has no Source IP, Source Port,
@@ -136,8 +192,9 @@ function of the flow's own fields — no wall-clock or other hidden input).
   `protocol_is_*` trained from it as heuristic. IP-level `Flow` fields are
   reconstructed (payload + the CSV's L4 header-length columns + 20 bytes of
   IPv4 header per packet) only so the `Flow` is internally consistent; they
-  are not features.
+  are not features. Phase 19 uses this data only as an external test set,
+  never for training.
 - **UNSW-NB15**: no IP/port columns, no flag counts, per-flow means only;
   and Argus byte counts include headers with no header-length column, so
   `payload_stats` is an approximation (40 bytes of header assumed per
-  packet). Treat UNSW-trained 2.0.0 models as experimental.
+  packet). Treat UNSW-trained models as experimental.

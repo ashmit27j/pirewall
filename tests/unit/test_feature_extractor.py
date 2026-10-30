@@ -5,7 +5,13 @@ import pytest
 from pirewall.core.enums import Protocol
 from pirewall.core.exceptions import FeatureExtractionError
 from pirewall.features.extractor import extract_features
-from pirewall.features.schema import FEATURE_NAMES, SCHEMA_VERSION
+from pirewall.features.schema import (
+    FEATURE_NAMES,
+    LEGACY_FEATURE_NAMES,
+    LEGACY_SCHEMA_VERSION,
+    SCHEMA_VERSION,
+    PortCategory,
+)
 from tests.helpers.flows import make_flow
 
 
@@ -16,11 +22,15 @@ def test_extraction_is_deterministic() -> None:
     assert first == second
 
 
-def test_feature_vector_carries_current_schema_version() -> None:
+def test_feature_vector_carries_requested_schema_version() -> None:
     flow = make_flow()
     vector = extract_features(flow)
     assert vector.schema_version == SCHEMA_VERSION
     assert vector.feature_names == FEATURE_NAMES
+
+    legacy = extract_features(flow, schema_version=LEGACY_SCHEMA_VERSION)
+    assert legacy.schema_version == LEGACY_SCHEMA_VERSION
+    assert legacy.feature_names == LEGACY_FEATURE_NAMES
 
 
 def test_feature_values_match_flow_fields() -> None:
@@ -56,9 +66,58 @@ def test_feature_values_match_flow_fields() -> None:
     assert values["forward_backward_payload_ratio"] == 1.5
     assert values["min_payload_size"] == 0.0
     assert values["std_payload_size"] == 70.0
-    assert values["destination_port"] == 443.0
+    assert values["destination_port_category"] == float(PortCategory.WEB)
+    assert "destination_port" not in values
     assert values["protocol_is_tcp"] == 1.0
     assert values["protocol_is_udp"] == 0.0
+
+
+def test_legacy_2_0_0_projection_is_unchanged() -> None:
+    """The v1 vector is pinned exactly: phase 19 must not perturb 2.0.0."""
+    flow = make_flow(
+        packet_count=10,
+        byte_count=1000,
+        forward_packet_count=6,
+        backward_packet_count=4,
+        forward_byte_count=600,
+        backward_byte_count=400,
+        duration_seconds=10.0,
+        payload_stats={
+            "forward_bytes": 360,
+            "backward_bytes": 240,
+            "min_bytes": 0,
+            "max_bytes": 200,
+            "mean_bytes": 60.0,
+            "std_bytes": 70.0,
+        },
+    )
+    vector = extract_features(flow, schema_version=LEGACY_SCHEMA_VERSION)
+    assert vector.feature_names == LEGACY_FEATURE_NAMES
+    assert vector.values == (
+        10.0,  # duration_seconds
+        10.0,  # packet_count
+        6.0,  # forward_packet_count
+        4.0,  # backward_packet_count
+        600.0,  # payload_byte_count
+        360.0,  # forward_payload_byte_count
+        240.0,  # backward_payload_byte_count
+        1.0,  # packets_per_second
+        60.0,  # payload_bytes_per_second
+        60.0,  # mean_payload_size
+        70.0,  # std_payload_size
+        0.0,  # min_payload_size
+        200.0,  # max_payload_size
+        0.1,  # mean_inter_arrival_seconds
+        0.05,  # std_inter_arrival_seconds
+        0.001,  # min_inter_arrival_seconds
+        1.0,  # max_inter_arrival_seconds
+        1.5,  # forward_backward_payload_ratio
+        443.0,  # destination_port (raw, 2.0.0 only)
+        1.0,  # protocol_is_tcp
+        0.0,  # protocol_is_udp
+        0.0,  # protocol_is_icmp
+        0.0,  # protocol_is_other
+    )
 
 
 def test_zero_duration_flow_does_not_divide_by_zero() -> None:
@@ -78,13 +137,22 @@ def test_zero_backward_bytes_does_not_divide_by_zero() -> None:
     assert values["forward_backward_payload_ratio"] == 0.0
 
 
-def test_icmp_flow_reports_no_destination_port_as_negative_one() -> None:
+def test_icmp_flow_reports_no_destination_port_category() -> None:
     flow = make_flow(protocol=Protocol.ICMP, source_port=None, destination_port=None)
     vector = extract_features(flow)
     values = dict(zip(vector.feature_names, vector.values, strict=True))
-    assert values["destination_port"] == -1.0
+    assert values["destination_port_category"] == float(PortCategory.NONE)
     assert values["protocol_is_icmp"] == 1.0
     assert values["protocol_is_tcp"] == 0.0
+
+    legacy = extract_features(flow, schema_version=LEGACY_SCHEMA_VERSION)
+    legacy_values = dict(zip(legacy.feature_names, legacy.values, strict=True))
+    assert legacy_values["destination_port"] == -1.0
+
+
+def test_unknown_schema_version_is_refused() -> None:
+    with pytest.raises(FeatureExtractionError, match="unknown feature schema"):
+        extract_features(make_flow(), schema_version="1.0.0")
 
 
 def test_computed_at_derives_from_flow_last_seen_not_wall_clock() -> None:

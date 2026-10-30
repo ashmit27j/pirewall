@@ -21,7 +21,9 @@ that call the same authenticated API endpoints a script could.
 """
 
 import html
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from typing import Final
 from urllib.parse import quote
 
 from pirewall.core.enums import RuleStatus
@@ -63,7 +65,69 @@ _STYLE = """<style>
   --status-pending: #d99a2b;
   --status-neutral: #4b5262;
 }
-body { font-family: system-ui, sans-serif; margin: 2rem; background: var(--bg); color: var(--text); }
+body { font-family: system-ui, sans-serif; margin: 0; background: var(--bg); color: var(--text); }
+
+/* Shell: a fixed vertical nav beside a scrolling content column. The panel
+   had grown to eleven stacked sections on one page, which meant the Events
+   table — the thing you read during an incident — was several screens below
+   the fold. Each nav entry is a real route, so a page can be bookmarked and
+   reloaded straight back to where you were. */
+.shell { display: flex; min-height: 100vh; }
+.sidebar {
+  width: 15rem; flex: 0 0 15rem; background: var(--surface); border-right: 1px solid var(--border);
+  padding: 1.25rem 0; position: sticky; top: 0; height: 100vh; overflow-y: auto;
+}
+.sidebar .brand { display: block; padding: 0 1.25rem 1.25rem; }
+.sidebar .brand img { width: 100%; height: auto; display: block; }
+.nav-link {
+  display: flex; justify-content: space-between; align-items: center; gap: 0.5rem;
+  padding: 0.55rem 1.25rem; color: var(--text-muted); text-decoration: none;
+  border-left: 3px solid transparent; font-size: 0.92rem;
+}
+.nav-link:hover { background: var(--surface-raised); color: var(--text); }
+.nav-link[aria-current="page"] {
+  color: var(--text); background: var(--surface-raised); border-left-color: var(--accent); font-weight: 600;
+}
+/* A count beside the label, so you can see where the activity is without
+   opening every page. Suppressed at zero rather than showing "0". */
+.nav-count {
+  background: var(--surface); color: var(--text-muted); border: 1px solid var(--border);
+  border-radius: 0.6rem; padding: 0 0.4rem; font-size: 0.75rem; min-width: 1.2rem; text-align: center;
+}
+.nav-link[aria-current="page"] .nav-count { border-color: var(--accent); color: var(--text); }
+.nav-section {
+  padding: 1rem 1.25rem 0.35rem; font-size: 0.72rem; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--text-muted);
+}
+.content { flex: 1 1 auto; padding: 2rem; min-width: 0; }
+.sidebar-foot { padding: 1rem 1.25rem; font-size: 0.78rem; color: var(--text-muted); }
+
+/* Login: the logo carries the page, so the form stays small and centred. */
+.login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 2rem; }
+.login-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 0.75rem;
+  padding: 2rem; width: min(26rem, 100%); box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+}
+.login-card img.logo { width: 100%; max-width: 17rem; height: auto; display: block; margin: 0 auto 1.5rem; }
+.login-card label { display: block; margin-bottom: 1rem; font-size: 0.9rem; color: var(--text-muted); }
+.login-card input {
+  width: 100%; box-sizing: border-box; margin-top: 0.35rem; padding: 0.6rem 0.7rem;
+  background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 0.4rem;
+  font-size: 0.95rem;
+}
+.login-card input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.login-card button {
+  width: 100%; padding: 0.65rem; background: var(--accent); color: var(--accent-text);
+  border: 0; border-radius: 0.4rem; font-size: 0.95rem; font-weight: 600; cursor: pointer;
+}
+.login-foot { margin-top: 1.25rem; font-size: 0.78rem; color: var(--text-muted); text-align: center; }
+
+@media (max-width: 720px) {
+  .shell { flex-direction: column; }
+  .sidebar { width: auto; flex: none; height: auto; position: static;
+             border-right: 0; border-bottom: 1px solid var(--border); }
+  .content { padding: 1rem; }
+}
 h1, h2, h3 { margin-top: 2rem; }
 table { border-collapse: collapse; width: 100%; margin-bottom: 1rem; background: var(--surface); }
 th, td { border: 1px solid var(--border); padding: 0.4rem 0.6rem; text-align: left; font-size: 0.9rem; }
@@ -286,17 +350,31 @@ async function pirewallLogin(event) {
 
 
 def render_login_page() -> str:
+    """The admin sign-in page.
+
+    Says plainly that access is restricted to the Admin PC: the commonest
+    reason this page refuses is reaching it from the wrong machine, and a
+    bare "Login failed (403)" sends people hunting for a password problem
+    they do not have.
+    """
     body = f"""
-    <h1>pirewall control panel</h1>
-    <p class="error" id="login-error"></p>
-    <form onsubmit="pirewallLogin(event)">
-      <p><label>Username <input name="username" required autofocus></label></p>
-      <p><label>Password <input name="password" type="password" required></label></p>
-      <p><button type="submit">Log in</button></p>
-    </form>
+    <div class="login-wrap">
+      <div class="login-card">
+        <img class="logo" src="{LOGO_URL}" alt="pirewall">
+        <p class="error" id="login-error"></p>
+        <form onsubmit="pirewallLogin(event)">
+          <label>Username <input name="username" required autofocus autocomplete="username"></label>
+          <label>Password
+            <input name="password" type="password" required autocomplete="current-password">
+          </label>
+          <button type="submit">Log in</button>
+        </form>
+        <p class="login-foot">Control panel access is restricted to the Admin PC.</p>
+      </div>
+    </div>
     {_LOGIN_SCRIPT}
     """
-    return _page("pirewall — login", body)
+    return _page("pirewall — sign in", body)
 
 
 def render_core_unavailable_page(detail: str) -> str:
@@ -313,7 +391,7 @@ def render_core_unavailable_page(detail: str) -> str:
     `failure.mode = "fail_open"` means traffic keeps flowing unfiltered.
     """
     body = f"""
-    <h1>pirewall control panel</h1>
+    <div class="page-header"><h1>pirewall control panel</h1></div>
     <h2 class="error">pirewall-core is unreachable</h2>
     <p class="error">{_e(detail)}</p>
     <p>
@@ -774,6 +852,65 @@ def _portal_panels(
     )
 
 
+
+#: Where the logo is served from. One route, so the stylesheet and both page
+#: shells can reference it without embedding 200 KB of base64 per response.
+LOGO_URL: Final = "/control-panel/logo.png"
+
+
+@dataclass(frozen=True)
+class PanelPage:
+    """One nav entry: a route under `/control-panel` and the panels it shows.
+
+    Grouping is by the question being asked, not by which spec section
+    introduced the panel: during an incident you want Threats and Detections
+    together, and you do not want to scroll past the allowlist to reach the
+    event log.
+    """
+
+    slug: str
+    label: str
+    group: str
+
+
+PANEL_PAGES: Final = (
+    PanelPage("", "Overview", "Status"),
+    PanelPage("activity", "Activity", "Status"),
+    PanelPage("firewall", "Firewall", "Enforcement"),
+    PanelPage("allowlist", "Allowlist", "Enforcement"),
+    PanelPage("portal", "Portal", "Enforcement"),
+    PanelPage("events", "Events", "Diagnostics"),
+    PanelPage("ml", "Models", "Diagnostics"),
+)
+
+
+def _nav(active_slug: str, counts: Mapping[str, int]) -> str:
+    """The vertical nav, with a count beside any page that has something on it."""
+    out = [
+        f'<a class="brand" href="/control-panel">'
+        f'<img src="{LOGO_URL}" alt="pirewall"></a>'
+    ]
+    seen_group = ""
+    for page in PANEL_PAGES:
+        if page.group != seen_group:
+            out.append(f'<div class="nav-section">{_e(page.group)}</div>')
+            seen_group = page.group
+        count = counts.get(page.slug, 0)
+        badge = f'<span class="nav-count">{count}</span>' if count else ""
+        current = ' aria-current="page"' if page.slug == active_slug else ""
+        href = "/control-panel" + (f"/{page.slug}" if page.slug else "")
+        out.append(f'<a class="nav-link" href="{href}"{current}>{_e(page.label)}{badge}</a>')
+    return '<nav class="sidebar">' + "".join(out) + "</nav>"
+
+
+def _shell(title: str, active_slug: str, counts: Mapping[str, int], body: str) -> str:
+    """Nav + content, the layout every signed-in page uses."""
+    return _page(
+        title,
+        f'<div class="shell">{_nav(active_slug, counts)}<main class="content">{body}</main></div>',
+    )
+
+
 def render_dashboard(
     status: StatusResult,
     rules: list[FirewallRule],
@@ -786,46 +923,91 @@ def render_dashboard(
     portal_users: list[PortalUser] | None = None,
     portal_sessions: list[PortalSession] | None = None,
     v2: V2PanelState | None = None,
+    page: str = "",
 ) -> str:
-    """Render the full control panel (spec §30's sections, plus the addendum additions).
+    """Render one control-panel page (spec §30's sections, plus the addendum additions).
 
-    `v2` adds the guards/panic/offenders/bindings/engine panel
-    (`pirewall.web.v2_panel`); without it the panel is omitted.
+    `page` is a `PANEL_PAGES` slug; an unknown slug renders the Models page
+    rather than erroring, because the nav is the only thing that produces
+    these and a bad bookmark should not 500. `v2` adds the
+    guards/panic/offenders/bindings/engine panel (`pirewall.web.v2_panel`);
+    without it that panel is omitted.
     """
-    v2_panel = (
-        ""
-        if v2 is None
-        else _panel(
-            "v2", "Kernel guards & identity (ADDENDUM_4.md)", render_v2_section(v2), loggy=False,
-            importance="priority",
+    slug = page if any(candidate.slug == page for candidate in PANEL_PAGES) else ""
+    portal_users = portal_users or []
+    portal_sessions = portal_sessions or []
+    counts = {
+        "activity": len(list(threats)) + len(list(detections)),
+        "firewall": sum(1 for rule in rules if rule.status is not RuleStatus.REMOVED),
+        "allowlist": len(allowlist),
+        "portal": len(portal_sessions),
+        "events": len(list(events)),
+        "ml": len(list(models)),
+    }
+
+    sections: list[str] = []
+    if slug == "":
+        sections.append(
+            _panel("system", "System", _render_system_section(status), loggy=False, importance="priority")
         )
-    )
+        if v2 is not None:
+            sections.append(
+                _panel(
+                    "v2",
+                    "Kernel guards & identity (ADDENDUM_4.md)",
+                    render_v2_section(v2),
+                    loggy=False,
+                    importance="priority",
+                )
+            )
+        sections.append(_panel("network", "Network", _render_network_section(capture_stats), loggy=False))
+    elif slug == "activity":
+        sections.append(
+            _panel("threats", "Threats", _render_threats_section(threats), loggy=True, importance="priority")
+        )
+        sections.append(
+            _panel("detections", "Detections", _render_detections_section(detections), loggy=True)
+        )
+    elif slug == "firewall":
+        sections.append(
+            _panel(
+                "firewall",
+                "Firewall — active & adaptive rules",
+                _render_firewall_section(rules),
+                loggy=False,
+            )
+        )
+        sections.append(
+            _panel(
+                "shadow-log",
+                "Shadow log (ADDENDUM.md A1) — what would have happened",
+                _render_shadow_log_section(rules),
+                loggy=True,
+                importance="quiet",
+            )
+        )
+    elif slug == "allowlist":
+        sections.append(
+            _panel(
+                "allowlist",
+                "Allowlist (ADDENDUM.md A2) — never adaptively blocked",
+                _render_allowlist_section(allowlist),
+                loggy=False,
+            )
+        )
+    elif slug == "portal":
+        sections.append(_portal_panels(portal_users, portal_sessions))
+    elif slug == "events":
+        sections.append(
+            _panel("events", "Events", _render_events_section(events), loggy=True, importance="priority")
+        )
+    else:
+        sections.append(_panel("ml", "ML", _render_ml_section(models), loggy=False, importance="quiet"))
+
+    label = next(candidate.label for candidate in PANEL_PAGES if candidate.slug == slug)
     body = (
-        f'<div class="page-header"><h1>pirewall control panel</h1>{_help_button()}</div>'
-        + _panel("system", "System", _render_system_section(status), loggy=False, importance="priority")
-        + v2_panel
-        + _panel("network", "Network", _render_network_section(capture_stats), loggy=False)
-        + _panel("detections", "Detections", _render_detections_section(detections), loggy=True)
-        + _panel("threats", "Threats", _render_threats_section(threats), loggy=True, importance="priority")
-        + _panel(
-            "firewall", "Firewall — active & adaptive rules", _render_firewall_section(rules), loggy=False
-        )
-        + _panel(
-            "shadow-log",
-            "Shadow log (ADDENDUM.md A1) — what would have happened",
-            _render_shadow_log_section(rules),
-            loggy=True,
-            importance="quiet",
-        )
-        + _panel(
-            "allowlist",
-            "Allowlist (ADDENDUM.md A2) — never adaptively blocked",
-            _render_allowlist_section(allowlist),
-            loggy=False,
-        )
-        + _portal_panels(portal_users, portal_sessions)
-        + _panel("events", "Events", _render_events_section(events), loggy=True, importance="priority")
-        + _panel("ml", "ML", _render_ml_section(models), loggy=False, importance="quiet")
+        f'<div class="page-header"><h1>{_e(label)}</h1>{_help_button()}</div>'
+        + "".join(sections)
         + _help_dialog()
     )
-    return _page("pirewall control panel", body)
+    return _shell(f"pirewall — {label}", slug, counts, body)

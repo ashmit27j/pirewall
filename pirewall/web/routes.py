@@ -1,7 +1,10 @@
 """Control panel page routes (spec §30). Renders from RPC-fetched state only — no side effects on GET."""
 
-from fastapi import APIRouter
-from fastapi.responses import HTMLResponse
+from pathlib import Path
+from typing import Final
+
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import HTMLResponse, Response
 
 from pirewall.api.app import RpcClientDep
 from pirewall.core.exceptions import RpcError
@@ -21,8 +24,40 @@ def login_page() -> HTMLResponse:
     return HTMLResponse(render_login_page())
 
 
+#: Served from the repository rather than embedded, so the sign-in page and
+#: every panel page share one cacheable request instead of carrying ~200 KB
+#: of base64 each. Public because the sign-in page needs it before there is
+#: a session; it is a logo, not information about the network.
+_LOGO_PATH: Final = Path(__file__).resolve().parents[2] / "deploy" / "web" / "pirewall-logo.png"
+
+
+@public_router.get("/logo.png", include_in_schema=False)
+def logo() -> Response:
+    """The pirewall mark. 404s rather than erroring if the file is absent."""
+    try:
+        data = _LOGO_PATH.read_bytes()
+    except OSError:
+        raise HTTPException(status_code=404, detail="logo not installed") from None
+    return Response(
+        content=data,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @protected_router.get("", response_class=HTMLResponse)
 def dashboard(rpc_client: RpcClientDep) -> HTMLResponse:
+    """The Overview page."""
+    return _render_page(rpc_client, "")
+
+
+@protected_router.get("/{page}", response_class=HTMLResponse)
+def dashboard_page(page: str, rpc_client: RpcClientDep) -> HTMLResponse:
+    """One of the other nav pages. An unknown slug renders rather than 500s."""
+    return _render_page(rpc_client, page)
+
+
+def _render_page(rpc_client: BaseRpcClient, page: str) -> HTMLResponse:
     status = rpc_client.get_status()
     rules = rpc_client.list_rules()
     events = rpc_client.list_events()
@@ -45,6 +80,7 @@ def dashboard(rpc_client: RpcClientDep) -> HTMLResponse:
             portal_users,
             portal_sessions,
             v2=_v2_state(rpc_client),
+            page=page,
         )
     )
 

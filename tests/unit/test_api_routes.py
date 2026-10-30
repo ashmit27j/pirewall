@@ -261,6 +261,10 @@ def test_registered_route_surface_matches_spec() -> None:
         ("/api/v1/engine", "GET"),
         ("/control-panel/login", "GET"),
         ("/control-panel", "GET"),
+        # The nav split: one route per PANEL_PAGES slug, plus the logo the
+        # sign-in page needs before there is a session.
+        ("/control-panel/{page}", "GET"),
+        ("/control-panel/logo.png", "GET"),
     }
     assert routes == expected
 
@@ -312,4 +316,9 @@ def test_dashboard_renders_network_statistics_and_detections() -> None:
     assert panel_response.status_code == 200
     assert "eth0" in panel_response.text
     assert "42" in panel_response.text
-    assert "flow-1"[:8] in panel_response.text
+
+    # Detections moved to the Activity page when the panel gained its nav;
+    # both are still fetched and rendered, which is what this test is for.
+    activity = harness.get("/control-panel/activity", headers=auth_headers(token))
+    assert activity.status_code == 200
+    assert "flow-1"[:8] in activity.text

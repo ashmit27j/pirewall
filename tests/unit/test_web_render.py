@@ -19,11 +19,25 @@ from pirewall.core.models.event import SecurityEvent
 from pirewall.core.models.evidence import AnomalyEvidence
 from pirewall.core.models.model_metadata import ModelMetadata
 from pirewall.core.models.status import StatusResult
-from pirewall.web.render import render_dashboard, render_login_page
+from pirewall.web.render import PANEL_PAGES, render_dashboard, render_login_page
 from tests.helpers.rules import make_firewall_rule
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
 
+
+
+def render_every_page(*args: object, **kwargs: object) -> str:
+    """Every nav page's HTML joined together.
+
+    The panel became multi-page (`PANEL_PAGES`): a test that only asks "does
+    this content render, escaped, with its badge" should not also have to
+    know which page it landed on. Tests that are *about* the page split call
+    `render_dashboard` with an explicit `page` instead.
+    """
+    return "".join(
+        render_dashboard(*args, page=candidate.slug, **kwargs)  # type: ignore[arg-type]
+        for candidate in PANEL_PAGES
+    )
 
 def _status() -> StatusResult:
     return StatusResult(
@@ -107,7 +121,7 @@ def _detection_record() -> DetectionRecord:
 
 
 def test_dashboard_renders_every_spec_section() -> None:
-    html = render_dashboard(
+    html = render_every_page(
         status=_status(),
         rules=[make_firewall_rule(status=RuleStatus.ACTIVE), make_firewall_rule(status=RuleStatus.SHADOWED)],
         events=[_event()],
@@ -134,7 +148,7 @@ def test_dashboard_renders_every_spec_section() -> None:
 
 
 def test_dashboard_includes_addendum_specific_sections() -> None:
-    html = render_dashboard(_status(), [], [], [], [], [], None, [])
+    html = render_every_page(_status(), [], [], [], [], [], None, [])
     assert "Shadow log" in html
     assert "kill-switch" in html.lower()
     assert "Allowlist" in html
@@ -149,29 +163,29 @@ def test_dashboard_escapes_untrusted_content() -> None:
         subsystem="test",
         reason="<script>alert('xss')</script>",
     )
-    html = render_dashboard(_status(), [], [malicious_event], [], [], [], None, [])
+    html = render_every_page(_status(), [], [malicious_event], [], [], [], None, [])
     assert "<script>alert" not in html
     assert "&lt;script&gt;" in html
 
 
 def test_dashboard_renders_network_section_with_capture_stats() -> None:
-    html = render_dashboard(_status(), [], [], [], [], [], _capture_stats(), [])
+    html = render_every_page(_status(), [], [], [], [], [], _capture_stats(), [])
     assert "eth0" in html
     assert "1000" in html
 
 
 def test_dashboard_network_section_handles_no_capture_stats_yet() -> None:
-    html = render_dashboard(_status(), [], [], [], [], [], None, [])
+    html = render_every_page(_status(), [], [], [], [], [], None, [])
     assert "No capture statistics reported yet" in html
 
 
 def test_dashboard_renders_detections_section() -> None:
-    html = render_dashboard(_status(), [], [], [], [], [], None, [_detection_record()])
+    html = render_every_page(_status(), [], [], [], [], [], None, [_detection_record()])
     assert "anomaly: 0.80" in html
 
 
 def test_dashboard_detections_section_handles_empty_state() -> None:
-    html = render_dashboard(_status(), [], [], [], [], [], None, [])
+    html = render_every_page(_status(), [], [], [], [], [], None, [])
     assert "No detections recorded yet" in html
 
 
@@ -204,7 +218,7 @@ def test_ids_never_reach_an_inline_js_handler() -> None:
         )
     ]
 
-    html = render_dashboard(_status(), rules, [], [], [], allowlist, None, [])
+    html = render_every_page(_status(), rules, [], [], [], allowlist, None, [])
 
     assert "alert(1)" not in html
     # The decoded form is what the JS engine would have seen.
@@ -214,7 +228,7 @@ def test_ids_never_reach_an_inline_js_handler() -> None:
 
 def test_action_buttons_still_carry_their_target_url() -> None:
     """The escaping fix must not have silently broken the buttons it protects."""
-    html = render_dashboard(
+    html = render_every_page(
         _status(), [make_firewall_rule(id="abc123", status=RuleStatus.ACTIVE)], [], [], [], [], None, []
     )
 
@@ -224,7 +238,7 @@ def test_action_buttons_still_carry_their_target_url() -> None:
 
 
 def test_dashboard_handles_empty_state_gracefully() -> None:
-    html = render_dashboard(_status(), [], [], [], [], [], None, [])
+    html = render_every_page(_status(), [], [], [], [], [], None, [])
     assert "No rules yet" in html
     assert "No events recorded yet" in html
 
@@ -236,7 +250,7 @@ def test_login_page_renders_without_error() -> None:
 
 
 def test_dashboard_has_a_help_button_and_dialog() -> None:
-    html = render_dashboard(_status(), [], [], [], [], [], None, [])
+    html = render_every_page(_status(), [], [], [], [], [], None, [])
     assert 'id="help-dialog"' in html
     assert "help-btn" in html
     assert "Common scenarios" in html
@@ -248,7 +262,7 @@ def test_dashboard_has_a_help_button_and_dialog() -> None:
 
 
 def test_panels_have_collapse_and_export_controls() -> None:
-    html = render_dashboard(_status(), [], [], [], [], [], None, [])
+    html = render_every_page(_status(), [], [], [], [], [], None, [])
     for section_id in ("system", "network", "detections", "threats", "firewall", "shadow-log", "allowlist",
                         "events", "ml"):
         assert f'data-panel="{section_id}"' in html
@@ -258,7 +272,7 @@ def test_panels_have_collapse_and_export_controls() -> None:
 
 
 def test_only_log_shaped_panels_get_a_clear_view_control() -> None:
-    html = render_dashboard(_status(), [], [], [], [], [], None, [])
+    html = render_every_page(_status(), [], [], [], [], [], None, [])
     for section_id in ("detections", "threats", "shadow-log", "events"):
         assert f'data-clear="{section_id}"' in html
     for section_id in ("system", "network", "firewall", "allowlist", "ml"):
@@ -267,7 +281,7 @@ def test_only_log_shaped_panels_get_a_clear_view_control() -> None:
 
 def test_dashboard_uses_css_custom_properties_for_a_dark_theme() -> None:
     """Dark mode is the default theme, expressed as `:root` custom properties, not hard-coded hex values."""
-    html = render_dashboard(_status(), [], [], [], [], [], None, [])
+    html = render_every_page(_status(), [], [], [], [], [], None, [])
     assert ":root {" in html
     assert "--bg:" in html
     assert "--text:" in html
@@ -284,12 +298,12 @@ def test_event_severity_gets_a_colored_badge() -> None:
         subsystem="firewall.manager",
         reason="critical test event",
     )
-    html = render_dashboard(_status(), [], [critical_event], [], [], [], None, [])
+    html = render_every_page(_status(), [], [critical_event], [], [], [], None, [])
     assert '<span class="badge badge-severity-critical">critical</span>' in html
 
 
 def test_threat_level_gets_a_colored_badge() -> None:
-    html = render_dashboard(
+    html = render_every_page(
         status=_status(),
         rules=[],
         events=[],
@@ -321,7 +335,7 @@ def test_detection_evidence_gets_a_flag_badge_distinct_from_routine_traffic() ->
         recorded_at=NOW,
     )
 
-    html = render_dashboard(
+    html = render_every_page(
         _status(), [], [], [], [], [], None, [routine, anomalous_only, known_attack_and_anomalous]
     )
 
@@ -331,7 +345,7 @@ def test_detection_evidence_gets_a_flag_badge_distinct_from_routine_traffic() ->
 
 
 def test_priority_and_quiet_panels_get_their_hierarchy_class() -> None:
-    html = render_dashboard(_status(), [], [], [], [], [], None, [])
+    html = render_every_page(_status(), [], [], [], [], [], None, [])
     for section_id in ("system", "threats", "events"):
         assert f'class="panel panel-priority" data-panel="{section_id}"' in html
     for section_id in ("ml", "shadow-log"):
@@ -354,3 +368,54 @@ def test_render_module_cannot_invoke_any_rpc_action() -> None:
     source = inspect.getsource(render)
     assert "ipc" not in source
     assert "RpcClient" not in source
+
+
+class TestPanelPages:
+    """The nav split (`PANEL_PAGES`): one route per page, bookmarkable, with counts."""
+
+    def test_each_page_renders_only_its_own_panels(self) -> None:
+        overview = render_dashboard(_status(), [], [], [], [], [], None, [], page="")
+        events = render_dashboard(_status(), [], [], [], [], [], None, [], page="events")
+
+        assert 'data-panel="system"' in overview
+        assert 'data-panel="events"' not in overview
+        assert 'data-panel="events"' in events
+        assert 'data-panel="system"' not in events
+
+    def test_every_page_carries_the_nav_and_marks_the_current_one(self) -> None:
+        for candidate in PANEL_PAGES:
+            html = render_dashboard(_status(), [], [], [], [], [], None, [], page=candidate.slug)
+            href = "/control-panel" + (f"/{candidate.slug}" if candidate.slug else "")
+            assert f'href="{href}" aria-current="page"' in html, candidate.slug
+            # Every other page is reachable from here, or the split strands pages.
+            for other in PANEL_PAGES:
+                other_href = "/control-panel" + (f"/{other.slug}" if other.slug else "")
+                assert f'href="{other_href}"' in html
+
+    def test_an_unknown_slug_renders_instead_of_raising(self) -> None:
+        """A stale bookmark must not 500 the panel."""
+        html = render_dashboard(_status(), [], [], [], [], [], None, [], page="no-such-page")
+
+        assert "<title>" in html
+        assert 'class="sidebar"' in html
+
+    def test_counts_appear_beside_a_page_with_content_and_not_otherwise(self) -> None:
+        html = render_dashboard(_status(), [], [_event(), _event()], [], [], [], None, [], page="")
+
+        assert '<span class="nav-count">2</span>' in html
+        # Allowlist is empty, so it gets no badge rather than a "0".
+        assert '<span class="nav-count">0</span>' not in html
+
+    def test_the_logo_is_referenced_by_url_not_embedded(self) -> None:
+        """200 KB of base64 per page would be paid on every panel load."""
+        html = render_dashboard(_status(), [], [], [], [], [], None, [], page="")
+
+        assert 'src="/control-panel/logo.png"' in html
+        assert "data:image" not in html
+
+    def test_the_login_page_shows_the_logo_and_the_admin_pc_restriction(self) -> None:
+        html = render_login_page()
+
+        assert 'src="/control-panel/logo.png"' in html
+        # The commonest refusal is reaching it from the wrong machine.
+        assert "restricted to the Admin PC" in html

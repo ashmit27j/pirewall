@@ -367,6 +367,17 @@ def choose_lan_interface(
     return candidates[0], tuple(warnings)
 
 
+def discover_default_route() -> tuple[str, ipaddress.IPv4Address]:
+    """The live `(wan_interface, upstream_gateway)` from `ip -j route show default`.
+
+    The uplink half of `discover()` on its own, for `configure.py
+    --set-gateway`: refreshing the gateway after the uplink moved must not
+    depend on the LAN being in a discoverable state, and must not need the
+    full interactive flow.
+    """
+    return parse_default_route(_run_ip("route", "show", "default"))
+
+
 def discover() -> DiscoveredNetwork:
     """Read the live network layout. Raises `DiscoveryError` with an actionable message on failure."""
     wan_interface, upstream_gateway = parse_default_route(_run_ip("route", "show", "default"))

@@ -91,6 +91,13 @@ flood_connections_per_second_threshold = 100.0
 slow_connection_min_duration_seconds = 15.0
 slow_connection_max_bytes_per_second = 5.0
 concurrent_slow_connections_threshold = 8
+# A candidate must also have been active within this long. Measured cause of
+# a 45/45 false-positive rate on the first real LAN client (pi-live,
+# 2026-10-30): a flow that goes quiet has its bytes/elapsed rate *fall* into
+# the band above as idle time grows, so ordinary keepalive and push traffic
+# qualified as "slow connections". A real slowloris must keep trickling or
+# the server closes it, so requiring recent activity costs no detection.
+slow_connection_max_idle_seconds = 15.0
 
 # ADDENDUM_2.md B5 — seed list of known-attack-tool JA3 fingerprints. See
 # that file's own header for its source and honest staleness limitation.

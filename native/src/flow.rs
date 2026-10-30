@@ -443,6 +443,39 @@ fn in_prefix(address: u32, network: u32, prefix: u8) -> bool {
     address & mask == network & mask
 }
 
+/// `FlowAggregator.snapshot_slow_connection_clusters`'s candidate test.
+///
+/// Mirrors `pirewall.flow.aggregator._is_slow_connection_candidate` condition
+/// for condition — TCP, answered, not closing, open long enough, still
+/// trickling, and slow. The parity tests compare both
+/// implementations over the same flow table, so the two change together. See
+/// the Python docstring for which false positive each condition removes.
+fn is_slow_connection_candidate(
+    state: &FlowState,
+    now_us: i64,
+    min_duration_s: f64,
+    max_bytes_per_s: f64,
+    max_idle_s: f64,
+) -> bool {
+    if state.proto != Proto::Tcp {
+        return false;
+    }
+    if state.bwd_packets < 1 {
+        return false;
+    }
+    if state.saw_fin_forward || state.saw_fin_backward || state.saw_rst {
+        return false;
+    }
+    let duration = now_us.saturating_sub(state.first_seen_us) as f64 / 1e6;
+    if duration < min_duration_s {
+        return false;
+    }
+    if now_us.saturating_sub(state.last_seen_us) as f64 / 1e6 > max_idle_s {
+        return false;
+    }
+    state.byte_count as f64 / duration <= max_bytes_per_s
+}
+
 impl Engine {
     pub fn new(
         active_s: f64,
@@ -637,16 +670,19 @@ impl Engine {
         min_duration_s: f64,
         max_bytes_per_s: f64,
         threshold: usize,
+        max_idle_s: f64,
     ) -> Vec<SlowCluster> {
         let mut order: Vec<(u32, u32)> = Vec::new();
         let mut groups: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
         for slot in self.table.slots() {
             let state = &self.table.node(slot).state;
-            let duration = now_us.saturating_sub(state.first_seen_us) as f64 / 1e6;
-            if duration < min_duration_s {
-                continue;
-            }
-            if state.byte_count as f64 / duration > max_bytes_per_s {
+            if !is_slow_connection_candidate(
+                state,
+                now_us,
+                min_duration_s,
+                max_bytes_per_s,
+                max_idle_s,
+            ) {
                 continue;
             }
             let pair = (state.fwd_src, state.fwd_dst);

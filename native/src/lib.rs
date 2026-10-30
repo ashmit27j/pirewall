@@ -320,9 +320,16 @@ impl FlowEngine {
         min_duration_seconds: f64,
         max_bytes_per_second: f64,
         concurrent_threshold: usize,
+        max_idle_seconds: f64,
     ) -> PyResult<Vec<(u32, u32, usize, FlowRecord)>> {
         self.with(py, "slow_clusters", |e| {
-            e.slow_clusters(now_us, min_duration_seconds, max_bytes_per_second, concurrent_threshold)
+            e.slow_clusters(
+                now_us,
+                min_duration_seconds,
+                max_bytes_per_second,
+                concurrent_threshold,
+                max_idle_seconds,
+            )
                 .into_iter()
                 .map(|c| (c.src, c.dst, c.count, FlowRecord::from(&c.representative)))
                 .collect()

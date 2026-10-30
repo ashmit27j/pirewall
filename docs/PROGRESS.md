@@ -372,6 +372,75 @@ and serve on real Raspberry Pi hardware under nft 1.1.3 — KNOWN_ISSUES V1 is
 no longer "nothing has run on the Pi". Everything that needs *traffic*
 remains Environment-dependent.
 
+### False-positive pass and operations hardening (2026-10-31)
+
+**Scope.** The human's priority after the first Pi bring-up: remove the
+false positives seen on the first real LAN client, then make the Pi
+re-armable without guesswork. Driven by `pi-live` evidence (a saved control
+panel from 2026-10-30), not by reading code.
+
+**The false positive, measured.** 45 of 45 shadow decisions were one benign
+phone (`192.168.100.64`) over six minutes of ordinary browsing:
+`slow_rate_dos` 45/45, `repeated_connections` 42/45,
+`destination_diversity` 42/45, anomaly flag 9/45. Scored 55.0 (MEDIUM), or
+70 with the anomaly flag, against `high_threshold = 75` — five points from
+RATE_LIMIT in ACTIVE. See KNOWN_ISSUES #27 for the full diagnosis.
+
+| Deliverable | Label | Evidence |
+|---|---|---|
+| `SLOW_RATE_DOS` candidate narrowed to TCP + established + not-torn-down + still-trickling (`pirewall/flow/aggregator.py`, new `_is_slow_connection_candidate`) | **Tested** | 8 unit regressions: idle-but-established (the measured shape), UDP, unanswered SYNs, closing, single connection, below-duration, above-rate, and the qualifying slowloris |
+| `detection.slow_connection_max_idle_seconds` (new, default 15.0) in the config model and `config/default_config.toml` | Tested | additive; config-loader suites green |
+| `native/src/flow.rs` mirrors the predicate condition for condition; PyO3 binding and `typings/pirewall_native.pyi` take the new parameter | **Not yet validated** | the Rust source matches line for line, but `pirewall_native` is not built on this host or the Pi, so the parity tests skip. Must be re-run where the extension builds |
+| `tests/integration/test_core_daemon.py` B2 fixture now uses *answered* connections | Tested | its old fixture was 6 bare unanswered SYNs — a scan's shape, which B2 deliberately no longer counts. The capability it tests (detection without flow completion) is unchanged and still passes |
+| Measured effect on the observed case | **Tested (replay of a `pi-live` shape)** | 55.0 MEDIUM -> 10.0 LOW, below `low_threshold`, so no decision at all; a real slowloris at the same concurrency still clusters (10/10) |
+| `configure.py --set-gateway` (+ `discovery.discover_default_route`) | Tested | 5 tests: explicit address, live route incl. `wan_interface`, targeted edit preserves hand-tuned values and the password hash, unchanged gateway writes nothing, unreadable route reports without writing. KNOWN_ISSUES #29 |
+| `tests/unit/test_docs_consistency.py` gate fixed | Tested | it required `config/local_config.toml`, which is gitignored and cannot exist on a clean checkout; it now checks `.gitignore` still excludes it, so docs and ignore rules cannot drift apart |
+| `docs/v2/RESUME_PI.md` | Implemented (`pi-live` commands, each run) | the everyday operations file: the post-reboot arming step, dashboard URL, portal, uplink recovery, gateway re-pin, current gaps, undo |
+| KNOWN_ISSUES #27, #28, #29 | Implemented | |
+| Five demo portal accounts seeded on the Pi | **Tested (pi-live)** | `portal_users seed-demo --i-understand-these-are-insecure`; `demo-alice`..`demo-erin` listed. They block ASSISTED/ACTIVE until removed, which is correct and recorded in RESUME_PI §4 |
+
+**Gates (Admin PC, Kali, Python 3.12 venv via uv).** `ruff check .` clean.
+`pyright`: **zero new errors** against a stashed baseline (82 pre-existing on
+this host, all in phase-19/20 ML files — numpy/lightgbm partially-unknown
+types; this host's dependency versions differ from the one that recorded
+"pyright strict clean"). `pytest` (excluding `tests/netns`): **42 failed,
+2056 passed, 34 skipped** against a measured baseline of **43 failed** —
+zero new failures and one fixed. The 42 are environmental on this host
+(safety validation treats this machine's own addresses as unsafe rule
+targets; bash-3.2 lab-script tests; absent model artifacts). Not run:
+`tests/netns` (root, real nft), the native parity tier (extension not
+built), and anything on the Pi.
+
+**Operational findings on the Pi (`pi-live`).**
+
+1. **Nothing arms the data plane at boot** (KNOWN_ISSUES #28). After a
+   reboot all three services were `active` while `nft list tables` showed
+   only `nm-shared-wlan0`. Core was running against an empty ruleset and
+   nothing said so.
+2. **The uplink dropped and the dongle was lost to a driver unbind.** The
+   hotspot stopped broadcasting (`nmcli` reported "the Wi-Fi network could
+   not be found"); an attempt to reset the radio by unbinding `rtl8xxxu`
+   took the dongle off the USB bus, and neither a hub reset nor toggling
+   `authorized` recovered it — it needed a physical replug. Recorded in
+   RESUME_PI §6 as a thing not to do.
+3. **`iw` was reported absent when it is installed** — it lives in
+   `/usr/sbin`, which a non-interactive SSH shell's `PATH` omits.
+4. **A gateway mismatch warns, it does not refuse** — an earlier claim in
+   this session that it would block `pirewall-start` was wrong.
+
+**Deviations.** The slow-connection change edits `pirewall/flow/aggregator.py`,
+`pirewall/flow/native.py`, `pirewall/runtime/core.py` (one call site),
+`native/src/flow.rs`, `native/src/lib.rs` and the config models — files owned
+by earlier phases. The human directed this work as the priority before the
+soak. No detector threshold value, policy table, guard default or contract
+type was changed; the only new config key is additive with a default.
+
+**Not done this session** (asked for, still outstanding): the one-command
+boot/automation scripts for Pi and Admin PC, the systemd boot unit the human
+approved, the dashboard UI overhaul (multi-page + vertical nav + logo), and
+the captive-portal auto-open work. Portal *gating* stays off until after the
+soak, by the human's decision; turn it on when they ask.
+
 ### Phase 11 details
 
 **Scope.** Contracts, documents, typed stubs and additive config only. No

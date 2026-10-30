@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 from ipaddress import IPv4Address, IPv4Network
+from typing import Final, TypedDict
 
 from pirewall.config.models import FlowConfig
 from pirewall.core.enums import AddressFamily, Protocol
@@ -181,28 +182,105 @@ def test_on_new_flow_fires_again_for_a_genuinely_new_flow_from_the_same_ports() 
     assert len(signals) == 2
 
 
+class _SlowArgs(TypedDict):
+    """The B2 knobs `snapshot_slow_connection_clusters` takes, so `**SLOW_ARGS` keeps its types."""
+
+    min_duration_seconds: float
+    max_bytes_per_second: float
+    concurrent_threshold: int
+    max_idle_seconds: float
+
+
+SLOW_ARGS: Final[_SlowArgs] = {
+    "min_duration_seconds": 15.0,
+    "max_bytes_per_second": 5.0,
+    "concurrent_threshold": 8,
+    "max_idle_seconds": 15.0,
+}
+
+
+def _open_trickling_connections(
+    aggregator: FlowAggregator,
+    *,
+    source_ip: str,
+    destination_ip: str,
+    count: int = 8,
+    opened: datetime,
+    last_activity: datetime,
+    packet_bytes: int = 10,
+    protocol: Protocol = Protocol.TCP,
+    answered: bool = True,
+    closing: bool = False,
+) -> None:
+    """Open `count` connections that trickle from `opened` to `last_activity`.
+
+    The shape a slow-rate (slowloris-class) attack actually has: established
+    TCP connections, held open, still sending a little. The keyword switches
+    produce the benign look-alikes each regression below pins down.
+    """
+    for offset in range(count):
+        source_port = 40000 + offset
+        syn = TcpFlags(syn=True) if protocol is Protocol.TCP else None
+        aggregator.process_packet(
+            make_packet(
+                source_ip=source_ip,
+                destination_ip=destination_ip,
+                source_port=source_port,
+                destination_port=80,
+                protocol=protocol,
+                timestamp=opened,
+                total_length=packet_bytes,
+                tcp_flags=syn,
+            )
+        )
+        if answered:
+            # The peer replies, so the connection is established rather than
+            # an unanswered attempt.
+            aggregator.process_packet(
+                make_packet(
+                    source_ip=destination_ip,
+                    destination_ip=source_ip,
+                    source_port=80,
+                    destination_port=source_port,
+                    protocol=protocol,
+                    timestamp=opened + timedelta(milliseconds=100),
+                    total_length=packet_bytes,
+                    tcp_flags=TcpFlags(syn=True, ack=True) if protocol is Protocol.TCP else None,
+                )
+            )
+        # The trickle that keeps the connection alive.
+        aggregator.process_packet(
+            make_packet(
+                source_ip=source_ip,
+                destination_ip=destination_ip,
+                source_port=source_port,
+                destination_port=80,
+                protocol=protocol,
+                timestamp=last_activity,
+                total_length=packet_bytes,
+                tcp_flags=(
+                    TcpFlags(fin=True) if closing else TcpFlags(ack=True, psh=True)
+                )
+                if protocol is Protocol.TCP
+                else None,
+            )
+        )
+
+
 def test_snapshot_slow_connection_clusters_finds_a_qualifying_cluster_without_closing_flows() -> None:
     """ADDENDUM_2.md B2: read-only — the connections stay open, nothing is popped from the table."""
     aggregator = _aggregator(active_timeout_seconds=3600, inactive_timeout_seconds=3600)
-    for source_port in range(40000, 40008):
-        aggregator.process_packet(
-            make_packet(
-                source_ip="203.0.113.80",
-                destination_ip="10.0.0.60",
-                source_port=source_port,
-                destination_port=80,
-                timestamp=T0,
-                total_length=10,
-            )
-        )
+    now = T0 + timedelta(seconds=30)
+    _open_trickling_connections(
+        aggregator,
+        source_ip="203.0.113.80",
+        destination_ip="10.0.0.60",
+        opened=T0,
+        last_activity=now - timedelta(seconds=2),
+    )
     assert len(aggregator) == 8
 
-    clusters = aggregator.snapshot_slow_connection_clusters(
-        now=T0 + timedelta(seconds=20),
-        min_duration_seconds=15.0,
-        max_bytes_per_second=5.0,
-        concurrent_threshold=8,
-    )
+    clusters = aggregator.snapshot_slow_connection_clusters(now=now, **SLOW_ARGS)
 
     assert len(clusters) == 1
     cluster = clusters[0]
@@ -215,73 +293,124 @@ def test_snapshot_slow_connection_clusters_finds_a_qualifying_cluster_without_cl
 
 def test_snapshot_slow_connection_clusters_ignores_a_single_slow_connection() -> None:
     aggregator = _aggregator(active_timeout_seconds=3600, inactive_timeout_seconds=3600)
-    aggregator.process_packet(
-        make_packet(
-            source_ip="203.0.113.81",
-            destination_ip="10.0.0.61",
-            destination_port=80,
-            timestamp=T0,
-            total_length=10,
-        )
+    now = T0 + timedelta(seconds=30)
+    _open_trickling_connections(
+        aggregator,
+        source_ip="203.0.113.81",
+        destination_ip="10.0.0.61",
+        count=1,
+        opened=T0,
+        last_activity=now - timedelta(seconds=2),
     )
 
-    clusters = aggregator.snapshot_slow_connection_clusters(
-        now=T0 + timedelta(seconds=20),
-        min_duration_seconds=15.0,
-        max_bytes_per_second=5.0,
-        concurrent_threshold=8,
-    )
-
-    assert clusters == []
+    assert aggregator.snapshot_slow_connection_clusters(now=now, **SLOW_ARGS) == []
 
 
 def test_snapshot_slow_connection_clusters_ignores_flows_below_the_duration_floor() -> None:
     aggregator = _aggregator(active_timeout_seconds=3600, inactive_timeout_seconds=3600)
-    for source_port in range(40000, 40008):
-        aggregator.process_packet(
-            make_packet(
-                source_ip="203.0.113.82",
-                destination_ip="10.0.0.62",
-                source_port=source_port,
-                destination_port=80,
-                timestamp=T0,
-                total_length=10,
-            )
-        )
-
-    clusters = aggregator.snapshot_slow_connection_clusters(
-        now=T0 + timedelta(seconds=5),  # below min_duration_seconds
-        min_duration_seconds=15.0,
-        max_bytes_per_second=5.0,
-        concurrent_threshold=8,
+    now = T0 + timedelta(seconds=5)  # below min_duration_seconds
+    _open_trickling_connections(
+        aggregator,
+        source_ip="203.0.113.82",
+        destination_ip="10.0.0.62",
+        opened=T0,
+        last_activity=now - timedelta(seconds=1),
     )
 
-    assert clusters == []
+    assert aggregator.snapshot_slow_connection_clusters(now=now, **SLOW_ARGS) == []
 
 
 def test_snapshot_slow_connection_clusters_ignores_flows_above_the_rate_ceiling() -> None:
     """A fast, ordinary connection held open a while must not be mistaken for a slow one."""
     aggregator = _aggregator(active_timeout_seconds=3600, inactive_timeout_seconds=3600)
-    for source_port in range(40000, 40008):
-        aggregator.process_packet(
-            make_packet(
-                source_ip="203.0.113.83",
-                destination_ip="10.0.0.63",
-                source_port=source_port,
-                destination_port=80,
-                timestamp=T0,
-                total_length=10_000,  # far above the rate ceiling once divided by duration
-            )
-        )
-
-    clusters = aggregator.snapshot_slow_connection_clusters(
-        now=T0 + timedelta(seconds=20),
-        min_duration_seconds=15.0,
-        max_bytes_per_second=5.0,
-        concurrent_threshold=8,
+    now = T0 + timedelta(seconds=30)
+    _open_trickling_connections(
+        aggregator,
+        source_ip="203.0.113.83",
+        destination_ip="10.0.0.63",
+        opened=T0,
+        last_activity=now - timedelta(seconds=2),
+        packet_bytes=10_000,  # far above the rate ceiling
     )
 
-    assert clusters == []
+    assert aggregator.snapshot_slow_connection_clusters(now=now, **SLOW_ARGS) == []
+
+
+def test_snapshot_slow_connection_clusters_ignores_flows_that_merely_went_quiet() -> None:
+    """The measured `pi-live` false positive (2026-10-30), pinned down.
+
+    Every one of 45 shadow decisions against the first real LAN client was
+    SLOW_RATE_DOS on a phone's ordinary traffic. Cause: the rate test divided
+    bytes by *elapsed* time, so a finished exchange drifted into the slow band
+    as its idle time grew — 500 bytes in two seconds reads as 4 B/s once two
+    minutes have passed. These connections are established and un-torn-down,
+    exactly like a keepalive, and must not cluster.
+    """
+    aggregator = _aggregator(active_timeout_seconds=3600, inactive_timeout_seconds=3600)
+    _open_trickling_connections(
+        aggregator,
+        source_ip="192.168.100.64",
+        destination_ip="17.188.178.34",
+        opened=T0,
+        last_activity=T0 + timedelta(seconds=2),  # then silence
+        packet_bytes=170,
+    )
+    now = T0 + timedelta(seconds=120)
+
+    # Each flow carried three 170-byte packets, so bytes-over-elapsed — the
+    # reading that produced the false positive — is inside the slow band...
+    bytes_over_elapsed = (3 * 170) / 120
+    assert bytes_over_elapsed <= SLOW_ARGS["max_bytes_per_second"]
+    # ...but they stopped talking two minutes ago, so they are not trickling.
+    assert aggregator.snapshot_slow_connection_clusters(now=now, **SLOW_ARGS) == []
+
+
+def test_snapshot_slow_connection_clusters_ignores_udp_flows() -> None:
+    """Slowloris holds a TCP connection slot; a DNS lookup or QUIC probe has none to hold."""
+    aggregator = _aggregator(active_timeout_seconds=3600, inactive_timeout_seconds=3600)
+    now = T0 + timedelta(seconds=30)
+    _open_trickling_connections(
+        aggregator,
+        source_ip="192.168.100.64",
+        destination_ip="1.1.1.1",
+        opened=T0,
+        last_activity=now - timedelta(seconds=2),
+        protocol=Protocol.UDP,
+    )
+
+    assert aggregator.snapshot_slow_connection_clusters(now=now, **SLOW_ARGS) == []
+
+
+def test_snapshot_slow_connection_clusters_ignores_unanswered_attempts() -> None:
+    """Unanswered SYNs are a scan's shape; SCANNING/REPEATED_FAILURES own that, not B2."""
+    aggregator = _aggregator(active_timeout_seconds=3600, inactive_timeout_seconds=3600)
+    now = T0 + timedelta(seconds=30)
+    _open_trickling_connections(
+        aggregator,
+        source_ip="203.0.113.84",
+        destination_ip="10.0.0.64",
+        opened=T0,
+        last_activity=now - timedelta(seconds=2),
+        answered=False,
+    )
+
+    assert aggregator.snapshot_slow_connection_clusters(now=now, **SLOW_ARGS) == []
+
+
+def test_snapshot_slow_connection_clusters_ignores_connections_being_torn_down() -> None:
+    """A connection that has seen FIN is closing, not holding a slot open."""
+    aggregator = _aggregator(active_timeout_seconds=3600, inactive_timeout_seconds=3600)
+    now = T0 + timedelta(seconds=30)
+    _open_trickling_connections(
+        aggregator,
+        source_ip="203.0.113.85",
+        destination_ip="10.0.0.65",
+        opened=T0,
+        last_activity=now - timedelta(seconds=2),
+        closing=True,
+    )
+
+    assert aggregator.snapshot_slow_connection_clusters(now=now, **SLOW_ARGS) == []
 
 
 def test_udp_flow_produces_expected_protocol_on_finalization() -> None:

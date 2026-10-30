@@ -70,8 +70,23 @@ def _repo_paths(markdown: str) -> list[str]:
     return found
 
 
+#: Paths the file map may name although the tree never contains them: they are
+#: written at deploy time and deliberately gitignored, so requiring them would
+#: fail on every clean checkout while saying nothing about documentation drift.
+#: Each is named in `.gitignore`, which is what the test checks instead.
+RUNTIME_GENERATED: Final = frozenset({"config/local_config.toml"})
+
+
 def _names_something(path: str) -> bool:
-    """True when `path` exists, or — for a glob — matches at least one tracked file."""
+    """True when `path` exists, or — for a glob — matches at least one tracked file.
+
+    A deploy-time path from `RUNTIME_GENERATED` counts as named when
+    `.gitignore` still excludes it, so the documentation and the ignore rules
+    cannot drift apart unnoticed.
+    """
+    if path in RUNTIME_GENERATED:
+        gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        return any(line.strip().strip("/") == path for line in gitignore.splitlines())
     if "*" in path:
         return any(REPO_ROOT.glob(path))
     return (REPO_ROOT / path).exists()

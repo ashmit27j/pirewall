@@ -276,6 +276,7 @@ class NativeFlowAggregator:
         min_duration_seconds: float,
         max_bytes_per_second: float,
         concurrent_threshold: int,
+        max_idle_seconds: float,
     ) -> list[SlowConnectionCluster]:
         """Same contract as `FlowAggregator.snapshot_slow_connection_clusters`."""
         return [
@@ -287,7 +288,11 @@ class NativeFlowAggregator:
             )
             for source, destination, count, record in _call(
                 lambda: self._engine.slow_clusters(
-                    to_microseconds(now), min_duration_seconds, max_bytes_per_second, concurrent_threshold
+                    to_microseconds(now),
+                    min_duration_seconds,
+                    max_bytes_per_second,
+                    concurrent_threshold,
+                    max_idle_seconds,
                 )
             )
         ]

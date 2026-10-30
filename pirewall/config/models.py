@@ -175,6 +175,12 @@ class DetectionConfig(PirewallModel):
     slow_connection_min_duration_seconds: float = Field(default=15.0, gt=0.0)
     slow_connection_max_bytes_per_second: float = Field(default=5.0, gt=0.0)
     concurrent_slow_connections_threshold: int = Field(default=8, gt=0)
+    # A slowloris connection must keep trickling or the server reaps it, so a
+    # candidate has to have been active within this long. Without it, a flow
+    # that simply went quiet drifts *into* the rate band as its idle time
+    # grows (bytes/elapsed falls), which is how ordinary push-notification
+    # and keepalive traffic was scoring SLOW_RATE_DOS on a benign phone.
+    slow_connection_max_idle_seconds: float = Field(default=15.0, gt=0.0)
 
     # ADDENDUM_2.md B5 — seed list of known-attack-tool JA3 fingerprints
     # (pirewall.detection.tls_fingerprint). A missing/malformed file

@@ -14,7 +14,7 @@ Last reviewed: **2026-09-10**, after the first real client session and the
 move to a new uplink network. Items 1, 2 and 23 updated 2026-10-28 (v2
 phase 14b). Items 12, 18, 19 and 21 updated 2026-10-28 (final pass).
 Items 1, 2, V6 and V15 updated 2026-10-30 (v2 phase 19).
-"v2 open items" added 2026-10-29 (after phase 17).
+"v2 open items" added 2026-10-29 (after phase 17). Items 27-29 added 2026-10-31.
 
 ---
 
@@ -1244,3 +1244,90 @@ sudo setfacl -m u:pirewall-core:r-- /var/lib/NetworkManager/dnsmasq-wlan0.leases
 `chmod o+rx` on the directory would also work and is worse: it exposes NM's
 `secret_key` and saved connection state. This belongs in `install` tooling
 or SETUP.md, not in a human's memory.
+
+## 27. `SLOW_RATE_DOS` fired on every benign client flow
+
+**Status: fixed 2026-10-31 (`pirewall/flow/aggregator.py`, `native/src/flow.rs`); measured on `pi-live`, re-measurement needs the soak.**
+
+The first real LAN client produced **45 of 45** shadow decisions against
+itself over six minutes of ordinary browsing — `slow_rate_dos` on 45,
+`repeated_connections` on 42, `destination_diversity` on 42, the anomaly
+detector on 9.
+
+Scored: `slow_rate_dos` 45 + `repeated_connections` 5 +
+`destination_diversity` 5 = **55.0 → MEDIUM**, and **70** with the anomaly
+flag, against `high_threshold = 75` (RATE_LIMIT). A benign phone sat five
+points from being throttled, and one more pattern would have crossed it.
+
+**Cause: the definition, not the threshold.** A "slow connection" candidate
+was any open flow ≥ `min_duration_seconds` whose `byte_count / elapsed` was
+≤ `max_bytes_per_second`. That test has no protocol, liveness or teardown
+condition, and because it divides by *elapsed* time, a flow that goes quiet
+drifts **into** the band as its idle time grows — 500 bytes in two seconds
+reads as 8 B/s after a minute and 4 B/s after two. Push-notification and
+keepalive traffic qualified by simply existing; eight such flows to one
+endpoint is routine for a phone (Apple's APNs is in the captured data).
+
+Same bug class as #3/#4 (2026-09-10): counting the wrong thing, then
+blaming the threshold.
+
+**Fixed** by narrowing the candidate to the shape a slow-rate attack has —
+TCP only (nothing else holds a server connection slot), established (an
+unanswered SYN is `SCANNING`/`REPEATED_FAILURES`' business), not already
+torn down (FIN/RST means closing), and still trickling within
+`detection.slow_connection_max_idle_seconds` (new, default 15 s). A real
+slowloris cannot go quiet — the server reaps it — so the liveness condition
+costs no detection.
+
+Effect on the measured case: **55.0 MEDIUM → 10.0 LOW**, below
+`low_threshold`, so the device draws no decision at all. Headroom to
+RATE_LIMIT goes from 20 points to 65.
+
+Verified: eight unit regressions (idle-but-established, UDP, unanswered,
+closing, plus the qualifying case), one integration regression, and a
+replay of the observed shape through the real aggregator and scoring engine.
+**Not yet re-measured on live traffic** — that is the soak.
+
+## 28. Nothing loads the kernel tables at boot
+
+**Status: open (2026-10-31).**
+
+`pirewall-core`, `-api` and `-portal` are `enabled`, so a power-on starts
+all three. Nothing runs `pirewall-start`, which is what loads
+`pirewall_base`, `pirewall_static`, `arp pirewall_static_arp`,
+`pirewall_adaptive` and `pirewall_portal`.
+
+After the 2026-10-31 reboot the three services were `active` and the control
+panel served normally, while `nft list tables` showed only NetworkManager's
+`nm-shared-wlan0`: **core was running against an empty ruleset** — no
+guards, no adaptive sets, no portal table — and nothing in the UI said so.
+
+A healthy-looking deployment that enforces nothing is worse than one that
+fails loudly. Two things are needed: a boot unit that arms the data plane
+(ordered after `network-online.target`, honouring the same preflight), and a
+panel indicator for "core is up but its tables are absent".
+
+Until then, `docs/v2/RESUME_PI.md` §0 is the manual step after every reboot.
+
+## 29. `--set-gateway` exists now; the drift is still silent
+
+**Status: partly fixed 2026-10-31 (`scripts/deployment/configure.py`).**
+
+`network.upstream_gateway` is one of the addresses safety validation refuses
+to let an adaptive rule block. An uplink that hands out a different subnet
+each session — a phone hotspot, a borrowed network — leaves it stale, so the
+protection guards an address that is no longer the uplink while the real
+gateway is unprotected.
+
+`pirewall-start` warns and does not refuse, and the fix it recommended
+(`configure.py --detect`) only *reports*: it writes nothing. There was no
+targeted way to re-pin the value, and a bare `configure.py` run re-prompts
+for the Admin PC and password.
+
+`configure.py --set-gateway` now does it as a targeted edit, from the live
+default route or an explicit `--gateway`, refreshing `wan_interface`
+alongside it. Deliberately not automatic: an address that silently followed
+the kernel's default route would move whenever the route did.
+
+Still open: nothing *notices* the drift except a preflight line a human has
+to read. The real fix is a stable uplink.

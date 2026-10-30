@@ -193,7 +193,15 @@ def test_native_engine_matches_the_python_path_exactly(seed: int) -> None:
         if py_snapshot is not None and native_snapshot is not None:
             assert _comparable(native_snapshot) == _comparable(py_snapshot)
 
-    for args in [(end, 0.5, 1e9, 1), (end, 5.0, 50.0, 2), (end + timedelta(seconds=30), 15.0, 5.0, 3)]:
+    # (now, min_duration_s, max_bytes_per_s, concurrent_threshold, max_idle_s).
+    # The last tuple's wide idle bound keeps the pre-`max_idle_seconds`
+    # coverage of a table snapshotted well after its traffic stopped.
+    slow_args: list[tuple[datetime, float, float, int, float]] = [
+        (end, 0.5, 1e9, 1, 15.0),
+        (end, 5.0, 50.0, 2, 15.0),
+        (end + timedelta(seconds=30), 15.0, 5.0, 3, 1e9),
+    ]
+    for args in slow_args:
         py_clusters = python_aggregator.snapshot_slow_connection_clusters(*args)
         native_clusters = native.snapshot_slow_connection_clusters(*args)
         assert [(c.source_ip, c.destination_ip, c.concurrent_count, _comparable(c.representative_flow))

@@ -1979,6 +1979,7 @@ class CoreDaemon:
                 detection.slow_connection_min_duration_seconds,
                 detection.slow_connection_max_bytes_per_second,
                 detection.concurrent_slow_connections_threshold,
+                detection.slow_connection_max_idle_seconds,
             )
         self._counters.add(flows_expired=len(completed))
         self._enqueue(completed)

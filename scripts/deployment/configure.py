@@ -62,7 +62,12 @@ from pirewall.config.models import lease_file_for
 from pirewall.core.bindings import MAX_LEASE_FILE_BYTES, parse_leases
 from pirewall.core.exceptions import ConfigurationError
 from pirewall.core.models.common import UnicastMacAddress
-from scripts.deployment.discovery import DiscoveredNetwork, DiscoveryError, discover
+from scripts.deployment.discovery import (
+    DiscoveredNetwork,
+    DiscoveryError,
+    discover,
+    discover_default_route,
+)
 
 DEFAULT_CONFIG_PATH = Path("config/local_config.toml")
 
@@ -861,6 +866,56 @@ def run_set_admin_pc(
     return EXIT_OK
 
 
+def run_set_gateway(path: Path, requested: str | None) -> int:
+    """Refresh only `network.upstream_gateway` (and `wan_interface`) from the live default route.
+
+    `upstream_gateway` is one of the addresses safety validation refuses to
+    let an adaptive rule block (`pirewall.firewall.validator`), so a stale
+    value is not cosmetic: the protection guards an address that is no
+    longer the uplink, while the real gateway goes unprotected. An uplink
+    that hands out a different subnet each session — a phone hotspot, a
+    borrowed network — makes that drift routine.
+
+    Deliberately *not* automatic. A safety-critical address that silently
+    followed the kernel's default route would move whenever the route did,
+    so whoever can change the route could change what is protected. This is
+    the one-command way to re-pin it on purpose, after reading the drift
+    warning `pirewall-start` prints.
+
+    Both values come from the same default route, so both are refreshed
+    together: a gateway on a different interface than `wan_interface` names
+    would leave the config describing a network that does not exist.
+    """
+    if requested is not None:
+        wan_interface, gateway = None, ipaddress.IPv4Address(requested)
+    else:
+        try:
+            wan_interface, gateway = discover_default_route()
+        except DiscoveryError as exc:
+            print(f"Could not read the live default route ({exc})", file=sys.stderr)
+            print("Pass the address directly: --set-gateway --gateway <address>", file=sys.stderr)
+            return EXIT_FAILURE
+
+    current = load_config(path)
+    previous = current.network.upstream_gateway
+    previous_interface = current.network.wan_interface
+    if gateway == previous and wan_interface in (None, previous_interface):
+        print(f"network.upstream_gateway is already {gateway} on {previous_interface}; nothing to do.")
+        return EXIT_OK
+
+    text = replace_scalar(path.read_text(encoding="utf-8"), "network", "upstream_gateway", str(gateway))
+    if wan_interface is not None and wan_interface != previous_interface:
+        text = replace_scalar(text, "network", "wan_interface", wan_interface)
+    write_validated(path, text)
+
+    print(f"\nupstream_gateway: {previous} -> {gateway}")
+    if wan_interface is not None and wan_interface != previous_interface:
+        print(f"wan_interface:    {previous_interface} -> {wan_interface}")
+    print("This address is what safety validation protects. Re-run pirewall-start so the")
+    print("rendered ruleset matches:  sudo scripts/deployment/pirewall-start --data-mode live")
+    return EXIT_OK
+
+
 def run_set_password(path: Path) -> int:
     text = replace_scalar(
         path.read_text(encoding="utf-8"),
@@ -920,6 +975,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--set-admin-pc", action="store_true", help="change only the Admin PC in an existing config"
     )
     mode.add_argument(
+        "--set-gateway",
+        action="store_true",
+        help="re-pin network.upstream_gateway (and wan_interface) from the live default route",
+    )
+    mode.add_argument(
         "--set-password", action="store_true", help="rotate only the admin password hash"
     )
     mode.add_argument(
@@ -942,6 +1002,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="with --set-admin-pc --admin-pc-ip, also set network.admin_interface",
     )
+    parser.add_argument(
+        "--gateway",
+        help="with --set-gateway, set this address instead of reading the live default route",
+    )
     return parser
 
 
@@ -952,13 +1016,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.detect:
             print(describe(discover()))
             return EXIT_OK
-        if args.set_admin_pc or args.set_password or args.static_bindings:
+        if args.set_admin_pc or args.set_password or args.static_bindings or args.set_gateway:
             if not path.is_file():
                 print(
                     f"{path} does not exist — run `python -m scripts.deployment.configure` first.",
                     file=sys.stderr,
                 )
                 return EXIT_FAILURE
+            if args.set_gateway:
+                return run_set_gateway(path, args.gateway)
             if args.set_admin_pc:
                 return run_set_admin_pc(path, args.admin_pc_ip, args.admin_pc_mac, args.admin_interface)
             if args.static_bindings:

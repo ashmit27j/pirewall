@@ -92,6 +92,46 @@ class NewFlowSignal:
 type NewFlowSink = Callable[[NewFlowSignal], None]
 
 
+def _is_slow_connection_candidate(
+    state: FlowState,
+    now: datetime,
+    min_duration_seconds: float,
+    max_bytes_per_second: float,
+    max_idle_seconds: float,
+) -> bool:
+    """Whether one open flow has the shape of a held-open, trickling connection.
+
+    The single definition of a "slow connection" candidate (ADDENDUM_2.md
+    B2). `native/src/flow.rs`'s `slow_clusters` mirrors it condition for
+    condition; the parity tests compare the two on the same flow table, so
+    any change here has to be made there in the same commit.
+
+    See `FlowAggregator.snapshot_slow_connection_clusters` for why each
+    condition is here and which false positive it removes.
+    """
+    # Slowloris-class attacks hold a server's connection slots open. Only
+    # TCP has a slot to hold.
+    if state.protocol is not Protocol.TCP:
+        return False
+    # Unanswered attempts are a scan's shape, not a held connection's.
+    if state.backward_packet_count < 1:
+        return False
+    # Already closing: it occupies the table, not the server.
+    if state.saw_fin_forward or state.saw_fin_backward or state.saw_rst:
+        return False
+
+    duration = (now - state.first_seen).total_seconds()
+    if duration < min_duration_seconds:
+        return False
+    # A connection that has gone quiet is not trickling, and its
+    # bytes-over-elapsed rate only falls further into the band the longer it
+    # stays quiet. Checked before the rate so the reason is unambiguous.
+    if (now - state.last_seen).total_seconds() > max_idle_seconds:
+        return False
+
+    return state.byte_count / duration <= max_bytes_per_second
+
+
 def is_routable_unicast(address: IPv4Address, protected_network: IPv4Network | None = None) -> bool:
     """True if `address` is a host address a flow (and therefore a rule) could sensibly name.
 
@@ -231,15 +271,41 @@ class FlowAggregator:
         min_duration_seconds: float,
         max_bytes_per_second: float,
         concurrent_threshold: int,
+        max_idle_seconds: float,
     ) -> list[SlowConnectionCluster]:
         """Group currently-open flows by (source, destination) and report any qualifying cluster.
 
         A flow qualifies as a "slow connection" candidate once it has been
         open at least `min_duration_seconds` while averaging at most
         `max_bytes_per_second`. A (source, destination) pair is only
-        reported once at least `concurrent_threshold` of its currently-open
-        flows qualify simultaneously — a single slow connection never
-        qualifies on its own, by construction (ADDENDUM_2.md B2).
+        reported once at least
+        `concurrent_threshold` of its currently-open flows qualify
+        simultaneously — a single slow connection never qualifies on its
+        own, by construction (ADDENDUM_2.md B2).
+
+        Four further conditions narrow "slow connection" to the shape a
+        slow-rate attack actually has. Each exists because the broader test
+        matched ordinary client traffic: on the first real LAN client
+        (`pi-live`, 2026-10-30) every one of 45 shadow decisions was this
+        pattern firing on a phone's normal browsing.
+
+        * **TCP only.** Slowloris-class attacks work by holding a server's
+          connection slots open; UDP and ICMP have no such slot to hold, so
+          a DNS lookup or a QUIC probe can never be one.
+        * **Established.** The peer must have answered at least once. A
+          lone unanswered SYN is a scan or a dead host, and is already
+          `REPEATED_FAILURES`/`SCANNING`'s business.
+        * **Not being torn down.** A connection that has seen FIN or RST is
+          closing, not being held open; it lingers in the table only until
+          eviction.
+        * **Still trickling** (`max_idle_seconds`). This is the decisive
+          one. The rate test divides bytes by *elapsed* time, so a flow
+          that goes quiet drifts into the band as its idle time grows: a
+          500-byte exchange that finished in two seconds reads as 8 B/s
+          after a minute and 4 B/s after two, so every idle keepalive on
+          the network eventually qualified. A real slowloris cannot go quiet —
+          the server would reap it — so requiring recent activity costs no
+          detection and removes the whole benign population.
 
         Read-only: this never closes, pops, or otherwise mutates a flow —
         every connection keeps running exactly as it was. Meant to be
@@ -248,11 +314,9 @@ class FlowAggregator:
         """
         by_pair: dict[tuple[IPv4Address, IPv4Address], list[FlowState]] = {}
         for state in self._table.values():
-            duration = (now - state.first_seen).total_seconds()
-            if duration < min_duration_seconds:
-                continue
-            rate = state.byte_count / duration
-            if rate > max_bytes_per_second:
+            if not _is_slow_connection_candidate(
+                state, now, min_duration_seconds, max_bytes_per_second, max_idle_seconds
+            ):
                 continue
             key = (state.forward_source_ip, state.forward_destination_ip)
             by_pair.setdefault(key, []).append(state)

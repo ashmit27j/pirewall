@@ -440,14 +440,23 @@ def test_slow_rate_dos_detected_without_waiting_for_connections_to_close_or_time
 ) -> None:
     """ADDENDUM_2.md B2, end to end: many concurrent slow connections, none of which ever close.
 
-    Every one of the "slow" connections here is a bare, never-acknowledged
-    SYN — no FIN, no timeout reached during the test (timeouts are left at
-    generous defaults). The only way `SLOW_RATE_DOS` can show up in a
-    `ThreatAssessment` here is via the sweep loop's periodic snapshot of
+    Each connection here is established (the peer answers the SYN) and then
+    held open — the shape a slow-rate attack has. None of them ever closes:
+    no FIN, no RST, and no timeout is reached during the test (timeouts are
+    left at generous defaults). The only way `SLOW_RATE_DOS` can show up in
+    a `ThreatAssessment` here is via the sweep loop's periodic snapshot of
     still-open flows, not via any flow actually completing.
+
+    The connections must be *answered*: an unacknowledged SYN is a scan's
+    shape, which `SCANNING`/`REPEATED_FAILURES` own, and which B2
+    deliberately no longer counts (see
+    `pirewall.flow.aggregator._is_slow_connection_candidate`).
     """
     src, dst = "203.0.113.90", "192.168.1.20"
-    packets = [_tcp_packet(45000 + port, 80, _SYN, src, dst) for port in range(6)]
+    packets: list[bytes] = []
+    for port in range(6):
+        packets.append(_tcp_packet(45000 + port, 80, _SYN, src, dst))
+        packets.append(_tcp_packet(80, 45000 + port, _SYN | 0x10, dst, src))
 
     config = make_config(
         api={"rpc_socket_path": socket_path, "history_size": 50},

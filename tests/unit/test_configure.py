@@ -228,3 +228,73 @@ class TestReplaceScalar:
         """Appending a duplicate key would make the file's meaning depend on parse order."""
         with pytest.raises(ConfigurationError):
             configure.replace_scalar('[a]\nhost = "one"\n', "a", "port", "8443")
+
+
+class TestSetGateway:
+    """`--set-gateway`: re-pin the address safety validation protects, after the uplink moved."""
+
+    def test_refreshes_the_gateway_from_an_explicit_address(self, tmp_path: Path) -> None:
+        path = _written_config(tmp_path)
+
+        assert configure.run_set_gateway(path, "10.36.207.147") == configure.EXIT_OK
+
+        assert str(load_config(path).network.upstream_gateway) == "10.36.207.147"
+
+    def test_reads_the_live_default_route_when_no_address_is_given(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = _written_config(tmp_path)
+        monkeypatch.setattr(
+            configure,
+            "discover_default_route",
+            lambda: ("wlan1", ipaddress.IPv4Address("10.36.207.147")),
+        )
+
+        assert configure.run_set_gateway(path, None) == configure.EXIT_OK
+
+        config = load_config(path)
+        assert str(config.network.upstream_gateway) == "10.36.207.147"
+        # Both come from the same route: a gateway reachable only via another
+        # interface would leave the config describing a network that is not there.
+        assert config.network.wan_interface == "wlan1"
+
+    def test_it_is_a_targeted_edit_not_a_regenerate(self, tmp_path: Path) -> None:
+        path = _written_config(tmp_path)
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "max_active_rules = 500", "max_active_rules = 12  # tuned by hand"
+            ),
+            encoding="utf-8",
+        )
+
+        configure.run_set_gateway(path, "10.36.207.147")
+
+        updated = path.read_text(encoding="utf-8")
+        assert "max_active_rules = 12  # tuned by hand" in updated
+        # The password hash is the value a full regenerate would re-prompt for.
+        assert load_config(path).authentication.admin_password_hash
+        assert "# ADDENDUM.md A1" in updated
+
+    def test_an_unchanged_gateway_writes_nothing(self, tmp_path: Path) -> None:
+        path = _written_config(tmp_path)
+        before = path.read_text(encoding="utf-8")
+        current = str(load_config(path).network.upstream_gateway)
+
+        assert configure.run_set_gateway(path, current) == configure.EXIT_OK
+
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_an_unreadable_route_reports_instead_of_writing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No uplink must not corrupt the pinned address — it is what protects the real one."""
+        path = _written_config(tmp_path)
+        before = path.read_text(encoding="utf-8")
+
+        def _no_route() -> tuple[str, ipaddress.IPv4Address]:
+            raise configure.DiscoveryError("no IPv4 default route found")
+
+        monkeypatch.setattr(configure, "discover_default_route", _no_route)
+
+        assert configure.run_set_gateway(path, None) == configure.EXIT_FAILURE
+        assert path.read_text(encoding="utf-8") == before

@@ -21,7 +21,7 @@ from pirewall.config.models import FlowConfig
 from pirewall.core.enums import EnvTag
 from pirewall.core.models.flow import Flow
 from pirewall.features.extractor import extract_features
-from pirewall.features.schema import FEATURE_NAMES
+from pirewall.features.schema import FEATURE_NAMES, LEGACY_SCHEMA_VERSION, SCHEMA_VERSION, feature_names
 from pirewall.flow.connection_start import ConnectionStartTracker
 from pirewall.flow.native import (
     NativeFlowAggregator,
@@ -80,6 +80,7 @@ def _convert(
     engine: pcap_to_flows.EngineChoice = "auto",
     ground_truth: Path | None = None,
     strict: bool = False,
+    schema_version: str = SCHEMA_VERSION,
 ) -> dict[str, object]:
     return pcap_to_flows.convert(
         inputs=captures,
@@ -90,6 +91,7 @@ def _convert(
         engine=engine,
         ground_truth=ground_truth,
         strict=strict,
+        schema_version=schema_version,
     )
 
 
@@ -106,14 +108,18 @@ def _force_csv(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: ignore[repo
 
 @needs_native
 @pytest.mark.parametrize(("seed", "nanosecond"), [(21, False), (22, True), (23, False)])
+@pytest.mark.parametrize("schema_version", [SCHEMA_VERSION, LEGACY_SCHEMA_VERSION])
 def test_pcap_to_flows_rows_equal_live_path_feature_vectors(
-    tmp_path: Path, seed: int, nanosecond: bool
+    tmp_path: Path, seed: int, nanosecond: bool, schema_version: str
 ) -> None:
     frames = mixed_stream(seed, sessions=1_200)
     capture = _pcap(tmp_path / "capture.pcap", frames, nanosecond=nanosecond)
-    manifest = _convert([capture], tmp_path / "out", engine="native")
+    manifest = _convert(
+        [capture], tmp_path / "out", engine="native", schema_version=schema_version
+    )
     rows = _rows(tmp_path / "out")
     live = _live_path(frames)
+    names = feature_names(schema_version)
 
     assert len(rows) == len(live) > 200
     assert manifest["rows"] == {
@@ -122,8 +128,8 @@ def test_pcap_to_flows_rows_equal_live_path_feature_vectors(
         "by_label": None,
     }
     for row, (flow, start) in zip(rows, live, strict=True):
-        vector = extract_features(flow)
-        assert tuple(float(row[name]) for name in FEATURE_NAMES) == vector.values
+        vector = extract_features(flow, schema_version=schema_version)
+        assert tuple(float(row[name]) for name in names) == vector.values
         assert row["connection_start"] == str(start)
         assert (row["source_ip"], row["destination_ip"]) == (str(flow.source_ip), str(flow.destination_ip))
         assert row["source_mac"] == str(flow.source_mac)
@@ -146,6 +152,7 @@ def test_the_manifest_records_inputs_engine_config_and_counts(tmp_path: Path) ->
     written = json.loads((tmp_path / "out" / "manifest.json").read_text(encoding="utf-8"))
     assert written == manifest
     assert written["env_tag"] == "mock"
+    assert written["feature_schema_version"] == SCHEMA_VERSION
     assert written["feature_names"] == list(FEATURE_NAMES)
     assert [i["path"] for i in written["inputs"]] == [str(first), str(second)]
     assert all(len(i["sha256"]) == 64 for i in written["inputs"])
@@ -165,6 +172,22 @@ def test_the_manifest_records_inputs_engine_config_and_counts(tmp_path: Path) ->
         flow_config=CONFIG.model_copy(update={"inactive_timeout_seconds": 30}),
     )
     assert again["config_sha256"] == written["config_sha256"] != other["config_sha256"]
+
+
+def test_the_legacy_schema_is_selectable_and_manifested(tmp_path: Path) -> None:
+    capture = _pcap(tmp_path / "capture.pcap", mixed_stream(43, sessions=100))
+    manifest = _convert([capture], tmp_path / "out", schema_version=LEGACY_SCHEMA_VERSION)
+    assert manifest["feature_schema_version"] == LEGACY_SCHEMA_VERSION
+    assert manifest["feature_names"] == list(feature_names(LEGACY_SCHEMA_VERSION))
+    row = _rows(tmp_path / "out")[0]
+    assert "destination_port" in row
+    assert "destination_port_category" not in row
+
+
+def test_an_unknown_schema_is_refused(tmp_path: Path) -> None:
+    capture = _pcap(tmp_path / "capture.pcap", mixed_stream(44, sessions=20))
+    with pytest.raises(ValueError, match="unknown feature schema"):
+        _convert([capture], tmp_path / "out", schema_version="1.0.0")
 
 
 def test_ground_truth_labels_flows_by_mac_and_time_window(tmp_path: Path) -> None:

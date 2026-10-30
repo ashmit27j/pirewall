@@ -1,7 +1,8 @@
 """Replay pcaps through the runtime flow engine and write one row per flow record.
 
     uv run python -m scripts.dataset.pcap_to_flows CAPTURE [CAPTURE ...] --out DIR \\
-        [--config config/local_config.toml] [--ground-truth ground_truth.jsonl [--strict]] \\
+        [--config config/local_config.toml] [--schema 3.0.0|2.0.0] \\
+        [--ground-truth ground_truth.jsonl [--strict]] \\
         [--engine auto|native|python] [--continuous] [--env-tag mock|sandbox|pi-live|pi-scripted]
 
 Why this exists (ADDENDUM_4.md D6, audit v1 #4): training features used to
@@ -13,8 +14,9 @@ table bound, protected network, sweep cadence), and from
 model trained on this output sees the features it will see live, byte for
 byte (`tests/integration/test_pcap_to_flows_parity.py`).
 
-**Rows.** One per completed flow record, in completion order: the schema
-features (`pirewall.features.schema.FEATURE_NAMES`), flow metadata (the
+**Rows.** One per completed flow record, in completion order: the requested
+schema version's features (`--schema`, default 3.0.0; 2.0.0 remains for
+reproducing v1 vectors), flow metadata (the
 capture file being read when it completed, MACs, 5-tuple, first/last seen in Unix microseconds) and a
 `connection_start` flag (`ConnectionStartTracker`, V2_CONTRACTS §11, the
 same class phase 17 counts with live). MACs are metadata for labelling and
@@ -60,7 +62,11 @@ from pirewall.core.enums import EnvTag
 from pirewall.core.exceptions import PirewallError
 from pirewall.core.models.flow import Flow
 from pirewall.features.extractor import extract_features
-from pirewall.features.schema import FEATURE_NAMES, SCHEMA_VERSION
+from pirewall.features.schema import (
+    SCHEMA_VERSION,
+    SUPPORTED_SCHEMA_VERSIONS,
+    feature_names,
+)
 from pirewall.flow.connection_start import ConnectionStartTracker
 from pirewall.flow.fallback import FallbackFlowEngine
 from pirewall.flow.native import from_microseconds, native_engine_available, to_microseconds
@@ -144,8 +150,8 @@ def label_for(flow: Flow, windows: Sequence[GroundTruthWindow], strict: bool) ->
     return UNLABELLED if strict else BENIGN
 
 
-def _row(flow: Flow, source: str, connection_start: bool) -> Row:
-    vector = extract_features(flow)
+def _row(flow: Flow, source: str, connection_start: bool, schema_version: str) -> Row:
+    vector = extract_features(flow, schema_version=schema_version)
     row: Row = {
         "source_pcap": source,
         "source_mac": None if flow.source_mac is None else str(flow.source_mac),
@@ -243,7 +249,10 @@ def _sha256(path: Path) -> str:
 
 
 def runtime_config_fingerprint(
-    flow_config: FlowConfig, protected: IPv4Network | None, max_panics_per_minute: int
+    flow_config: FlowConfig,
+    protected: IPv4Network | None,
+    max_panics_per_minute: int,
+    schema_version: str = SCHEMA_VERSION,
 ) -> dict[str, object]:
     """Every setting that shapes a row: hashed into the manifest."""
     return {
@@ -251,7 +260,7 @@ def runtime_config_fingerprint(
         "protected_network": None if protected is None else str(protected),
         "native_max_panics_per_minute": max_panics_per_minute,
         "drain_every_frames": _DRAIN_EVERY,
-        "feature_schema_version": SCHEMA_VERSION,
+        "feature_schema_version": schema_version,
     }
 
 
@@ -290,8 +299,14 @@ def convert(
     ground_truth: Path | None = None,
     strict: bool = False,
     max_panics_per_minute: int = 5,
+    schema_version: str = SCHEMA_VERSION,
 ) -> dict[str, object]:
     """Convert `inputs` (files or directories) into `out_dir`; returns the manifest written there."""
+    if schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+        raise ValueError(
+            f"unknown feature schema {schema_version!r}; expected one of {SUPPORTED_SCHEMA_VERSIONS}"
+        )
+    names = feature_names(schema_version)
     captures = [path for source in inputs for path in capture_files(source)]
     windows = load_ground_truth(ground_truth) if ground_truth is not None else None
     stats = RunStats()
@@ -301,17 +316,19 @@ def convert(
     for flow, source, connection_start in flows_from_captures(
         captures, flow_config, protected, engine, continuous, max_panics_per_minute, stats
     ):
-        row = _row(flow, source, connection_start)
+        row = _row(flow, source, connection_start, schema_version)
         if windows is not None:
             row["label"] = label_for(flow, windows, strict)
             labels[str(row["label"])] += 1
         starts += connection_start
         rows.append(row)
 
-    columns = [*METADATA_COLUMNS, *(["label"] if windows is not None else []), *FEATURE_NAMES]
+    columns = [*METADATA_COLUMNS, *(["label"] if windows is not None else []), *names]
     out_dir.mkdir(parents=True, exist_ok=True)
     output, output_format = _write_rows(rows, columns, out_dir)
-    fingerprint = runtime_config_fingerprint(flow_config, protected, max_panics_per_minute)
+    fingerprint = runtime_config_fingerprint(
+        flow_config, protected, max_panics_per_minute, schema_version
+    )
     manifest: dict[str, object] = {
         "tool": TOOL,
         "env_tag": env_tag.value,
@@ -324,8 +341,8 @@ def convert(
             "fell_back_to_python": stats.fell_back,
             "flows_lost_to_panics": stats.flows_lost_to_panics,
         },
-        "feature_schema_version": SCHEMA_VERSION,
-        "feature_names": list(FEATURE_NAMES),
+        "feature_schema_version": schema_version,
+        "feature_names": list(names),
         "config": fingerprint,
         "config_sha256": hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest(),
         "continuous": continuous,
@@ -371,6 +388,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="pirewall config (flow settings)")
     parser.add_argument("--ground-truth", type=Path, help="ground_truth.jsonl (attacker MAC + time window)")
     parser.add_argument("--strict", action="store_true", help="unmatched flows are 'unlabelled', not benign")
+    parser.add_argument(
+        "--schema",
+        dest="schema_version",
+        choices=SUPPORTED_SCHEMA_VERSIONS,
+        default=SCHEMA_VERSION,
+        help="feature schema version to emit (default: current 3.0.0; 2.0.0 for v1 parity)",
+    )
     parser.add_argument("--engine", choices=("auto", "native", "python"), default="auto")
     parser.add_argument("--continuous", action="store_true", help="treat all inputs as one capture")
     parser.add_argument(
@@ -394,6 +418,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ground_truth=args.ground_truth,
             strict=args.strict,
             max_panics_per_minute=config.capture.native_max_panics_per_minute,
+            schema_version=args.schema_version,
         )
     except (PirewallError, OSError, ValueError) as exc:
         print(f"pcap_to_flows: {exc}", file=sys.stderr)

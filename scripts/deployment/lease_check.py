@@ -129,7 +129,20 @@ def check_lease_file(
     """Check that `path` exists, is readable, and is what a running dnsmasq writes."""
     writers = dnsmasq_lease_files(cmdlines)
     lease_path = Path(path)
-    if not lease_path.exists():
+    try:
+        exists = lease_path.exists()
+    except OSError as exc:
+        # A parent directory this process cannot stat is not "missing": the
+        # operator needs to know the path may exist but the check cannot see
+        # it (e.g. /var/lib/NetworkManager is root-only for a non-root run).
+        return LeaseFileCheck(
+            LeaseFileState.UNREADABLE,
+            path,
+            writers,
+            0,
+            f"lease file {path} cannot be inspected ({exc.strerror or type(exc).__name__})",
+        )
+    if not exists:
         return LeaseFileCheck(
             LeaseFileState.MISSING,
             path,

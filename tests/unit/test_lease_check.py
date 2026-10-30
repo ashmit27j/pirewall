@@ -138,6 +138,25 @@ def test_read_cmdlines_splits_on_nul_and_skips_non_pids(tmp_path: Path) -> None:
     assert lease_check.read_cmdlines(tmp_path) == [["dnsmasq", "--dhcp-leasefile=/x.leases"]]
 
 
+def test_a_parent_directory_this_process_cannot_stat_is_unreadable_not_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lease_file = tmp_path / "dnsmasq-wlan0.leases"
+    original_exists = Path.exists
+
+    def deny_lease_path(self: Path) -> bool:
+        if self == lease_file:
+            raise PermissionError(13, "Permission denied", str(self))
+        return original_exists(self)
+
+    monkeypatch.setattr(Path, "exists", deny_lease_path)
+
+    result = check_lease_file(str(lease_file), [], LAN)
+
+    assert result.state is LeaseFileState.UNREADABLE
+    assert "cannot be inspected" in result.message
+
+
 def test_shell_output_is_quoted_for_eval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
